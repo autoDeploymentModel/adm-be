@@ -609,14 +609,85 @@
     }
 
     // ===== 全局事件监听（不随视图切换释放，保证切页后状态不丢） =====
-    // model-pull-progress：保存拉取进度到全局状态，视图渲染时读取
-    window.__adm_state.pullProgress = {};
+    // 所有事件只更新 __adm_state，视图模块的 handleTauriEvent 只做 DOM 更新
+    var st = window.__adm_state;
+    st.pullProgress = {};
+    st.downloadingModels = st.downloadingModels || {};
+    st.downloadingMmproj = st.downloadingMmproj || {};
+    st.downloadingDiffusion = st.downloadingDiffusion || {};
+    st.downloadingVae = st.downloadingVae || {};
+
     if (typeof listen === "function") {
-      listen("model-pull-progress", function(event) {
-        var p = event.payload || {};
-        if (p.model_id) {
-          window.__adm_state.pullProgress[p.model_id] = p.progress || 0;
-        }
+      var globalEvents = ["download-progress", "download-complete", "download-error", "model-pull-progress", "model-started", "model-stopped", "model-error"];
+      globalEvents.forEach(function(ev) {
+        listen(ev, function(event) {
+          var p = event.payload || {};
+          var mid = p.model_id;
+          switch (ev) {
+            case "download-progress": {
+              var dt = p.type || "model";
+              if (dt === "mmproj") st.downloadingMmproj[mid] = true;
+              else if (dt === "diffusion") st.downloadingDiffusion[mid] = p.progress;
+              else if (dt === "vae") st.downloadingVae[mid] = p.progress;
+              else st.downloadingModels[mid] = p.progress;
+              break;
+            }
+            case "download-complete": {
+              var ct = p.type || "model";
+              if (ct === "mmproj") { delete st.downloadingMmproj[mid]; delete st.downloadingModels[mid]; }
+              else if (ct === "diffusion") { delete st.downloadingDiffusion[mid]; }
+              else if (ct === "vae") { delete st.downloadingVae[mid]; }
+              else {
+                delete st.downloadingModels[mid];
+                if (p.all) {
+                  // 多文件目录模型全部完成
+                  var model = (st.modelList || []).find(function(m) { return m.model_id === mid; });
+                  var local = (st.localModels || []).find(function(m) { return m.model_id === mid; });
+                  if (model && model.model_download_files) {
+                    var names = model.model_download_files.map(function(u) { return u.split('/').pop(); }).filter(Boolean);
+                    if (local) names.forEach(function(n) { if (!local.files.includes(n)) local.files.push(n); });
+                    else st.localModels.push({ model_id: mid, files: names });
+                  }
+                } else {
+                  var model2 = (st.modelList || []).find(function(m) { return m.model_id === mid; });
+                  if (model2 && model2.model_type === "视觉多模态理解" && model2.model_mmproj) {
+                    st.downloadingMmproj[mid] = true;
+                  }
+                }
+                delete st.partFiles[mid];
+              }
+              break;
+            }
+            case "download-error": {
+              delete st.downloadingModels[mid];
+              break;
+            }
+            case "model-pull-progress": {
+              if (mid) { st.startingModelId = mid; st.pullProgress[mid] = p.progress || 0; }
+              break;
+            }
+            case "model-started": {
+              st.runningModelId = mid;
+              st.runningModelPort = p.port;
+              st.startingModelId = null;
+              break;
+            }
+            case "model-stopped": {
+              st.runningModelId = null;
+              st.runningModelPort = null;
+              st.startingModelId = null;
+              break;
+            }
+            case "model-error": {
+              st.startingModelId = null;
+              break;
+            }
+          }
+          // 转发给当前视图的 handleTauriEvent（做 DOM 更新）
+          if (currentView && currentView.handleTauriEvent) {
+            try { currentView.handleTauriEvent(ev, p); } catch (_) {}
+          }
+        });
       });
     }
 

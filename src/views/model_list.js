@@ -445,7 +445,7 @@ const template = `
 </div>
 `;
 
-let unlisteners = [];
+let unlisteners = []; // kept for compat, no longer used (events handled globally)
 
 // 模型日志批量写入（避免每行 stdout 一次 invoke）
 let pendingLogLines = [];
@@ -919,129 +919,33 @@ function updateProgressBar(modelId, progress) {
 }
 
 function handleTauriEvent(type, payload) {
-  console.log("[model_list] 事件:", type, "payload:", JSON.stringify(payload).substring(0, 200));
+  // 状态已在 index.html 全局监听中更新，这里只做 DOM 更新
   const st = S();
   const { model_id, progress, error, port } = payload || {};
 
   switch (type) {
     case "download-progress": {
-      const t = payload.type || "model";
-      if (t === "mmproj") {
-        st.downloadingMmproj[model_id] = true;
-        const btn = document.querySelector('[data-model-id="' + model_id + '"]');
-        if (btn) btn.textContent = "mmproj " + progress + "%";
-      } else if (t === "diffusion") {
-        st.downloadingDiffusion[model_id] = progress;
-        const btn = document.querySelector('[data-model-id="' + model_id + '"]');
-        if (btn) btn.textContent = "diffusion " + progress + "%";
-      } else if (t === "vae") {
-        st.downloadingVae[model_id] = progress;
-        const btn = document.querySelector('[data-model-id="' + model_id + '"]');
-        if (btn) btn.textContent = "vae " + progress + "%";
-      } else {
-        st.downloadingModels[model_id] = progress;
-        const btn = document.querySelector('[data-model-id="' + model_id + '"]');
-        if (btn) btn.textContent = progress + "%";
+      const btn = document.querySelector('[data-model-id="' + model_id + '"]');
+      if (btn) {
+        const t = payload.type || "model";
+        if (t === "mmproj") btn.textContent = "mmproj " + progress + "%";
+        else if (t === "diffusion") btn.textContent = "diffusion " + progress + "%";
+        else if (t === "vae") btn.textContent = "vae " + progress + "%";
+        else btn.textContent = progress + "%";
       }
       updateProgressBar(model_id, progress);
       break;
     }
     case "download-complete": {
-      const t = payload.type || "model";
-      if (t === "mmproj") {
-        delete st.downloadingMmproj[model_id];
-        delete st.downloadingModels[model_id];
-        const local = st.localModels.find(m => m.model_id === model_id);
-        if (local) {
-          if (!local.files.some(f => f.startsWith("mmproj"))) local.files.push("mmproj-downloaded.gguf");
-        } else {
-          st.localModels.push({ model_id: model_id, files: ["mmproj-downloaded.gguf"] });
-        }
-        delete st.partFiles[model_id];
-        renderModelTable();
-      } else if (t === "diffusion") {
-        delete st.downloadingDiffusion[model_id];
-        const model = st.modelList.find(m => m.model_id === model_id);
-        const local = st.localModels.find(m => m.model_id === model_id);
-        const filename = model ? getUrlFilename(model.model_diffusion) : null;
-        if (local && filename) {
-          if (!local.files.includes(filename)) local.files.push(filename);
-        } else if (filename) {
-          st.localModels.push({ model_id: model_id, files: [filename] });
-        }
-        delete st.partFiles[model_id];
-        renderModelTable();
-      } else if (t === "vae") {
-        delete st.downloadingVae[model_id];
-        const model = st.modelList.find(m => m.model_id === model_id);
-        const local = st.localModels.find(m => m.model_id === model_id);
-        const filename = model ? getUrlFilename(model.model_vae) : null;
-        if (local && filename) {
-          if (!local.files.includes(filename)) local.files.push(filename);
-        } else if (filename) {
-          st.localModels.push({ model_id: model_id, files: [filename] });
-        }
-        delete st.partFiles[model_id];
-        renderModelTable();
-      } else {
-        delete st.downloadingModels[model_id];
-        const model = st.modelList.find(m => m.model_id === model_id);
-        const local = st.localModels.find(m => m.model_id === model_id);
-        // 新格式（多文件目录模型）：全部完成事件带 all=true，直接把所有文件名写入本地列表
-        if (payload.all && model && model.model_download_files && model.model_download_files.length > 0) {
-          const names = model.model_download_files.map(function(url) { return getUrlFilename(url); }).filter(Boolean);
-          if (local) {
-            names.forEach(function(n) { if (!local.files.includes(n)) local.files.push(n); });
-          } else {
-            st.localModels.push({ model_id: model_id, files: names });
-          }
-          delete st.partFiles[model_id];
-          renderModelTable();
-          break;
-        }
-        const mainFile = model ? getUrlFilename(model.model_url) : null;
-        if (model && model.model_type === "视觉多模态理解" && model.model_mmproj) {
-          if (local && mainFile) {
-            if (!local.files.includes(mainFile)) local.files.push(mainFile);
-          } else if (mainFile) {
-            st.localModels.push({ model_id: model_id, files: [mainFile] });
-          }
-          st.downloadingMmproj[model_id] = true;
-          const btn = document.querySelector('[data-model-id="' + model_id + '"]');
-          if (btn) { btn.textContent = _t("下载 mmproj..."); btn.disabled = true; }
-          updateProgressBar(model_id, 0);
-        } else if (model && model.model_type === "文本生成图片") {
-          if (local && mainFile) {
-            if (!local.files.includes(mainFile)) local.files.push(mainFile);
-          } else if (mainFile) {
-            st.localModels.push({ model_id: model_id, files: [mainFile] });
-          }
-          delete st.partFiles[model_id];
-          const btn = document.querySelector('[data-model-id="' + model_id + '"]');
-          if (btn) { btn.textContent = _t("下载 diffusion..."); btn.disabled = true; }
-          updateProgressBar(model_id, 0);
-        } else {
-          if (local && mainFile) {
-            if (!local.files.includes(mainFile)) local.files.push(mainFile);
-          } else if (mainFile) {
-            st.localModels.push({ model_id: model_id, files: [mainFile] });
-          }
-          delete st.partFiles[model_id];
-          renderModelTable();
-        }
-      }
+      renderModelTable();
       break;
     }
     case "download-error": {
-      delete st.downloadingModels[model_id];
       showToast(_t("下载失败 [") + model_id + _t("]: ") + error);
       renderModelTable();
       break;
     }
     case "model-pull-progress": {
-      // 推理引擎镜像拉取进度：启动按钮显示百分比 + 卡片进度条；
-      // 进度回跳（超时切源后重新从 0 拉）时提示"正在切换镜像源重试"
-      st.startingModelId = model_id;
       const startBtn = document.getElementById("start-" + model_id);
       if (startBtn) {
         const prev = parseInt(startBtn.dataset.pullPct || "-1", 10);
@@ -1056,7 +960,6 @@ function handleTauriEvent(type, payload) {
       break;
     }
     case "model-log": {
-      // 模型日志写入本地日志文件（批量合并避免高频 invoke）
       if (payload && payload.line) {
         pendingLogLines.push({ level: payload.source === "stderr" ? "WARN" : "INFO", line: payload.line });
         if (!logFlushTimer) {
@@ -1065,23 +968,9 @@ function handleTauriEvent(type, payload) {
       }
       break;
     }
-case "model-started": {
-      st.runningModelId = model_id;
-      st.runningModelPort = port;
-      st.startingModelId = null;
-      renderModelTable();
-      break;
-    }
-    case "model-stopped": {
-      st.runningModelId = null;
-      st.runningModelPort = null;
-      st.startingModelId = null;
-      renderModelTable();
-      break;
-    }
+    case "model-started":
+    case "model-stopped":
     case "model-error": {
-      st.startingModelId = null;
-      showToast(_t("模型错误 [") + model_id + _t("]: ") + error);
       renderModelTable();
       break;
     }
@@ -1155,20 +1044,11 @@ if (status.running) {
   console.log("[model_list] init() 完成, 模型数量:", st.modelList.length);
 }
 
-function setupListeners() {
-  const L = listen();
-  const events = ["download-progress", "download-complete", "download-error", "model-pull-progress", "model-log", "model-started", "model-stopped", "model-error"];
-  events.forEach(function(ev) {
-    try {
-      L(ev, function(event) { handleTauriEvent(ev, event.payload); })
-        .then(function(u) { unlisteners.push(u); })
-        .catch(function() {});
-    } catch (_) {}
-  });
-}
+/* setupListeners removed — events handled globally in index.html */
 
 export default {
   template,
+  handleTauriEvent: handleTauriEvent,
   mount(root) {
     console.log("[model_list] mount()");
     root.innerHTML = template;
@@ -1179,7 +1059,6 @@ export default {
     var listRoot = document.getElementById("model-list-root");
     if (listRoot) listRoot.addEventListener("contextmenu", function(e) { e.preventDefault(); });
 
-  setupListeners();
     init();
 
     document.getElementById("delete-modal-cancel").addEventListener("click", hideDeleteConfirm);
@@ -1195,7 +1074,5 @@ export default {
   },
   unmount() {
     console.log("[model_list] unmount()");
-    unlisteners.forEach(function(u) { try { if (typeof u === 'function') u(); } catch (_) {} });
-    unlisteners = [];
   }
 };
