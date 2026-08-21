@@ -506,23 +506,22 @@ async fn check_docker_env(
         return Ok(image.to_string());
     }
 
-    // 4. 镜像不存在 → 拉取。直接拉；失败依次回退国内镜像源前缀。
-    //    仅当镜像名第一段含 "." 或 ":"（如 ghcr.io/...、docker.1ms.run/...）才视为
-    //    已带 registry 域名，不再套前缀；`org/repo:tag` 两段式默认名不算。
+    // 4. 镜像不存在 → 拉取。国内镜像源优先，Docker Hub 直连兜底。
     let has_registry_prefix = image
         .split('/')
         .next()
         .map(|first| first.contains('.') || first.contains(':'))
         .unwrap_or(false);
-    let mut attempts: Vec<String> = vec![image.to_string()];
+    let mut attempts: Vec<String> = vec![];
     if !has_registry_prefix {
         for mirror in ["docker.1ms.run", "docker.m.daocloud.io", "docker.xuanyuan.me", "hub.rat.dev"] {
             attempts.push(format!("{}/{}", mirror, image));
         }
     }
+    attempts.push(image.to_string());
 
     for (idx, candidate) in attempts.iter().enumerate() {
-        let label = if idx == 0 { "直接拉取" } else { &format!("镜像源 {}", attempts[idx].split('/').next().unwrap_or("")) };
+        let label = if idx == attempts.len() - 1 { "Docker Hub 直连" } else { &format!("镜像源 {}", attempts[idx].split('/').next().unwrap_or("")) };
         log(format!(
             "[Docker] 镜像 {} 不存在（{}），开始{}（首次可能需数分钟）...",
             image, candidate, label
