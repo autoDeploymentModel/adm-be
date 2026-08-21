@@ -648,7 +648,12 @@ function renderModelTable() {
 actionsHtml = '<button class="btn btn-view" id="view-' + safeModelId + '">' + _t("查看模型") + '</button>';
       actionsHtml += '<button class="btn btn-stop" data-stop-btn="' + safeModelId + '" id="stop-' + safeModelId + '">' + _t("关闭模型") + '</button>';
     } else if (isStarting) {
-      actionsHtml = '<button class="btn btn-start" disabled id="start-' + safeModelId + '">' + _t("启动中...") + '</button>';
+      // 启动中：从全局 pullProgress 恢复拉取进度显示（切页回来不丢）
+      var pullPct = st.pullProgress && st.pullProgress[model.model_id];
+      var startBtnText = (pullPct !== undefined && pullPct > 0)
+        ? _t("拉取镜像 ") + pullPct + "%"
+        : _t("启动中...");
+      actionsHtml = '<button class="btn btn-start" disabled id="start-' + safeModelId + '" data-pull-pct="' + (pullPct || 0) + '">' + startBtnText + '</button>';
     } else if (model.model_type === "文本生成图片" && downloaded) {
       actionsHtml = '<button class="btn btn-start" id="img-' + safeModelId + '">' + _t("生成图片") + '</button>';
     } else if (downloaded && available) {

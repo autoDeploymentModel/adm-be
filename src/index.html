@@ -608,6 +608,18 @@
       console.log("[index] init() 完成");
     }
 
+    // ===== 全局事件监听（不随视图切换释放，保证切页后状态不丢） =====
+    // model-pull-progress：保存拉取进度到全局状态，视图渲染时读取
+    window.__adm_state.pullProgress = {};
+    if (typeof listen === "function") {
+      listen("model-pull-progress", function(event) {
+        var p = event.payload || {};
+        if (p.model_id) {
+          window.__adm_state.pullProgress[p.model_id] = p.progress || 0;
+        }
+      });
+    }
+
     setTimeout(() => { checkForUpdate(true); }, 3000);
 
     init();

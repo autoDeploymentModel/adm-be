@@ -15,6 +15,7 @@ declare global {
       runningModelId: string | null;
       runningModelPort: number | null;
       startingModelId: string | null;
+      pullProgress: Record<string, number>;
       localModels: any[];
       partFiles: Record<string, any>;
       downloadingModels: Record<string, any>;
