@@ -83,7 +83,7 @@ pub fn kill_process_by_name(name: &str) {
 
 pub fn get_gpu_info() -> (u64, u64, bool) {
     let mut total_vram: u64 = 0;
-    let used_vram: u64 = 0;
+    let mut used_vram: u64 = 0;
     let mut has_gpu = false;
 
     #[cfg(target_os = "windows")]
