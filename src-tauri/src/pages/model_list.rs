@@ -604,6 +604,7 @@ async fn pull_image(
                         let raw = String::from_utf8_lossy(&buf).into_owned();
                         let trimmed = raw.trim();
                         if !trimmed.is_empty() {
+                            crate::common::utils::logger::write_log("INFO", "DOCKER", &format!("[{}] {}", mid2, trimmed));
                             app_c2
                                 .emit(
                                     "model-log",
@@ -639,25 +640,54 @@ async fn pull_image(
         });
     }
 
-    // stderr：逐行转发（拉取报错多走这里）
+    // stderr：逐段读取（\r 分隔），解析百分比并转发日志
+    // docker pull 的下载进度输出走 stderr（非 stdout），每段以 \r 结束覆盖刷新
     if let Some(stderr) = child.stderr.take() {
-        let mut reader = BufReader::new(stderr).lines();
+        let mut reader = BufReader::new(stderr);
         let app_c3 = app_c.clone();
         let mid3 = mid.clone();
+        let img3 = img.clone();
+        let mut last_pct_stderr: i32 = -1;
         tokio::spawn(async move {
-            while let Ok(Some(line)) = reader.next_line().await {
-                let t = line.trim();
-                if !t.is_empty() {
-                    app_c3
-                        .emit(
-                            "model-log",
-                            serde_json::json!({
-                                "model_id": &mid3,
-                                "line": format!("[docker pull] {}", t),
-                                "source": "stderr",
-                            }),
-                        )
-                        .ok();
+            let mut buf = Vec::with_capacity(512);
+            loop {
+                buf.clear();
+                match reader.read_until(b'\r', &mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let raw = String::from_utf8_lossy(&buf).into_owned();
+                        let trimmed = raw.trim();
+                        if !trimmed.is_empty() {
+                            crate::common::utils::logger::write_log("INFO", "DOCKER", &format!("[{}] {}", mid3, trimmed));
+                            app_c3
+                                .emit(
+                                    "model-log",
+                                    serde_json::json!({
+                                        "model_id": &mid3,
+                                        "line": format!("[docker pull] {}", trimmed),
+                                        "source": "stderr",
+                                    }),
+                                )
+                                .ok();
+                            if let Some(pct) = parse_pull_percent(&raw) {
+                                let pct_i = pct as i32;
+                                if pct_i != last_pct_stderr {
+                                    last_pct_stderr = pct_i;
+                                    app_c3
+                                        .emit(
+                                            "model-pull-progress",
+                                            serde_json::json!({
+                                                "model_id": &mid3,
+                                                "image": &img3,
+                                                "progress": pct_i,
+                                            }),
+                                        )
+                                        .ok();
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => break,
                 }
             }
         });
