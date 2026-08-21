@@ -10,11 +10,22 @@ pub fn get_exe_dir() -> Result<PathBuf, AppError> {
 }
 
 pub fn get_data_dir(app: Option<&tauri::AppHandle>) -> Result<PathBuf, AppError> {
+    // Linux: ~/.local/share/com.adm.admapp/（用户目录，有写权限）
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(dir) = dirs::data_local_dir() {
+            let data_dir = dir.join("com.adm.admapp");
+            std::fs::create_dir_all(&data_dir)
+                .map_err(|e| AppError::msg(format!("创建数据目录失败: {}", e)))?;
+            return Ok(data_dir);
+        }
+    }
+
+    // Windows / 兜底：可执行文件同目录
     let _ = app;
     get_exe_dir()
 }
 
 pub fn get_base_dir(app: Option<&tauri::AppHandle>) -> Result<PathBuf, AppError> {
-    let _ = app;
-    get_exe_dir()
+    get_data_dir(app)
 }
