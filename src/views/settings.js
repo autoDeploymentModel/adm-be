@@ -704,8 +704,6 @@ function goBack() { location.hash = "#/list"; }
 
 // ===== 运行日志 =====
 
-let _logDateLoaded = false;
-
 async function loadLogDates() {
   try {
     const dates = await invoke()("list_log_dates");
@@ -795,9 +793,7 @@ export default {
     // 运行日志
     var navLogs = document.getElementById("nav-logs");
     if (navLogs) {
-      navLogs.addEventListener("click", function() {
-        if (!_logDateLoaded) { _logDateLoaded = true; loadLogDates(); }
-      });
+      navLogs.addEventListener("click", function() { loadLogDates(); });
     }
     var logRefresh = document.getElementById("log-refresh-btn");
     if (logRefresh) logRefresh.addEventListener("click", function() {
