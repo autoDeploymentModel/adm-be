@@ -1,6 +1,6 @@
 #!/bin/bash
 
-APP_NAME="ADM"
+APP_NAME="ADM-BE"
 APP_PATH="src-tauri/target/release/bundle/macos/$APP_NAME.app"
 ENTITLEMENTS_PATH="src-tauri/entitlements.plist"
 

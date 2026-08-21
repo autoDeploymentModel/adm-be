@@ -2,7 +2,6 @@
 
 use crate::common::*;
 use crate::common::config;
-use crate::common::utils::platform;
 use crate::dbg_log;
 use crate::app_state::AppState;
 use tauri::Manager;
@@ -12,7 +11,7 @@ use tauri::Manager;
 #[tauri::command]
 pub async fn save_settings(app: tauri::AppHandle, settings: Settings) -> Result<(), AppError> {
     dbg_log!("[DEBUG] save_settings called with: {:?}", settings);
-    // 持有 config 写锁：防止与 agent.rs / ilink.rs 的 read-modify-write 并发互相覆盖
+    // 持有 config 写锁：防止 read-modify-write 并发互相覆盖
     let state = app.state::<AppState>();
     let _lock = state.config_write_lock.lock().map_err(|e| e.to_string())?;
     let data_dir = config::get_data_dir(Some(&app))?;
@@ -29,13 +28,6 @@ pub async fn save_settings(app: tauri::AppHandle, settings: Settings) -> Result<
     if let Ok(file) = std::fs::File::open(&config_path) {
         let _ = file.sync_all();
     }
-
-    // 同步「多模态模型」到 admAgent.json 顶层 agent_vision_model（vision 子命令读取），
-    // 值变化时触发服务端重载；失败静默（vision 缺省回退内置 admImage-model）
-    crate::pages::agent::sync_agent_vision_model(&app, &settings.agent_vision_model);
-
-    // 同步「代理配置」到 admAgent.json 顶层 agent_proxy，失败静默
-    crate::pages::agent::sync_agent_proxy(&app, &settings.agent_proxy);
 
     dbg_log!("[DEBUG] Config saved successfully to: {:?}", config_path);
     Ok(())
@@ -67,67 +59,72 @@ pub async fn get_app_version(app: tauri::AppHandle) -> Result<String, AppError> 
 }
 
 #[tauri::command]
-pub async fn get_llamacpp_version(app: tauri::AppHandle) -> Result<String, AppError> {
-    let server_path = config::get_llama_server_path(Some(&app))?;
-
-    let mut cmd = platform::create_hidden_command(&server_path);
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(llamacpp_dir) = config::get_llamacpp_dir(Some(&app)) {
-            cmd.env("DYLD_LIBRARY_PATH", llamacpp_dir.to_string_lossy().to_string());
-        }
-    }
-    let output = cmd
-        .arg("--version")
-        .output()
-        .map_err(|e| AppError::msg(format!("执行 llama-server --version 失败: {}", e)))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    let version_info = if stdout.is_empty() {
-        stderr.to_string()
-    } else {
-        stdout.to_string()
-    };
-
-    for line in version_info.lines() {
-        let line_trimmed = line.trim();
-        let lower = line_trimmed.to_lowercase();
-        if lower.contains("version") {
-            if let Some(pos) = lower.find("version") {
-                let start = pos + 7;
-                if start < line_trimmed.len() {
-                    let after_version = line_trimmed[start..].trim();
-                    let clean_part = if let Some(pos) = after_version.find(':') {
-                        after_version[pos + 1..].trim()
-                    } else {
-                        after_version
-                    };
-                    if !clean_part.is_empty() {
-                        // 只提取 semver 部分（如 "0.1.0"），去掉 "(build ...)" 后缀
-                        let semver = clean_part.split_whitespace().next().unwrap_or(clean_part);
-                        return Ok(semver.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    Err(AppError::msg("无法解析版本号"))
+pub async fn read_log(date: Option<String>) -> Result<String, AppError> {
+    let d = date.unwrap_or_else(|| crate::common::utils::logger::today_str());
+    crate::common::utils::logger::read_log(&d)
 }
 
 #[tauri::command]
-pub async fn delete_llamacpp(app: tauri::AppHandle) -> Result<(), AppError> {
-    let llamacpp_dir = config::get_llamacpp_dir(Some(&app))?;
+pub async fn list_log_dates() -> Result<Vec<String>, AppError> {
+    crate::common::utils::logger::list_log_dates()
+}
 
-    if !llamacpp_dir.exists() {
-        return Err(AppError::msg("llamacpp 目录不存在"));
+#[tauri::command]
+pub async fn open_log_dir() -> Result<(), AppError> {
+    let dir = crate::common::utils::logger::get_log_dir()?;
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
+    }
+    Ok(())
+}
+
+/// 将当前用户加入 docker 组（Linux 权限修复）。
+/// 优先用 pkexec 弹出系统原生 GUI 密码框；pkexec 不可用时回退到终端命令提示。
+#[tauri::command]
+pub async fn fix_docker_permission() -> Result<String, AppError> {
+    #[cfg(target_os = "windows")]
+    {
+        return Err(AppError::msg("Windows 无需此操作".to_string()));
     }
 
-    std::fs::remove_dir_all(&llamacpp_dir)
-        .map_err(|e| AppError::msg(format!("删除 llamacpp 目录失败: {}", e)))?;
+    #[cfg(not(target_os = "windows"))]
+    {
+        let user = std::env::var("USER")
+            .or_else(|_| std::env::var("LOGNAME"))
+            .map_err(|_| AppError::msg("无法获取当前用户名".to_string()))?;
 
-    dbg_log!("[DEBUG] llamacpp directory deleted: {:?}", llamacpp_dir);
-    Ok(())
+        // 方案 1：pkexec 弹出 GUI 密码框（GNOME/KDE 桌面默认有 polkit 认证代理）
+        let pkexec_result = tokio::process::Command::new("pkexec")
+            .args(["usermod", "-aG", "docker", &user])
+            .output()
+            .await;
+
+        match pkexec_result {
+            Ok(output) if output.status.success() => {
+                return Ok(format!("已将用户 {} 加入 docker 组，请重启 ADM-BE 后生效", user));
+            }
+            Ok(output) => {
+                // pkexec 执行了但失败（用户取消密码框 / 认证失败）
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                if stderr.contains("Not authorized") || stderr.contains("Request dismissed") || stderr.contains("cancelled") {
+                    return Err(AppError::msg("PKEXEC_CANCELLED".to_string()));
+                }
+                // 其他失败：回退到方案 2
+            }
+            Err(_) => {
+                // pkexec 不存在（headless / 无 polkit），回退到方案 2
+            }
+        }
+
+        // 方案 2：回退提示——用户在终端手动执行
+        Err(AppError::msg(format!(
+            "FALLBACK_TERMINAL|{}|请在终端执行以下命令，然后重新登录（注销再登录）后重启 ADM-BE：\n  sudo usermod -aG docker {}\n  sudo systemctl restart docker",
+            user, user
+        )))
+    }
 }

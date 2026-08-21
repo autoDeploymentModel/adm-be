@@ -1,4 +1,0 @@
-User-agent: *
-Allow: /
-
-Sitemap: https://adm.tuduoduo.top/sitemap.xml

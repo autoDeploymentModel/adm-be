@@ -151,19 +151,6 @@ const template = `
   }
   .btn-reset:hover { background: var(--c-overlay-strong); }
 
-  .btn-delete-llamacpp {
-    background: #d32f2f;
-    color: #fff;
-    border: none;
-    padding: 3px 12px;
-    border-radius: 4px;
-    font-size: 12px;
-    cursor: pointer;
-    transition: background 0.2s;
-    vertical-align: middle;
-  }
-  .btn-delete-llamacpp:hover { background: #b71c1c; }
-
   .version-table { width: 100%; max-width: 500px; }
   .version-table tr { border-bottom: 1px solid var(--c-border-soft); }
   .version-table td { padding: 12px 0; font-size: 14px; }
@@ -245,20 +232,19 @@ const template = `
     <nav id="settings-nav">
       <div class="nav-item active" data-panel="launch-params" id="nav-launch-params">${_t("模型启动参数")}</div>
       <div class="nav-item" data-panel="appearance" id="nav-appearance">${_t("外观主题")}</div>
-      <div class="nav-item" data-panel="wxbot" id="nav-wxbot">${_t("微信 Bot")}</div>
-      <div class="nav-item" data-panel="proxy" id="nav-proxy">${_t("网络代理")}</div>
+      <div class="nav-item" data-panel="logs" id="nav-logs">${_t("运行日志")}</div>
       <div class="nav-item" data-panel="version" id="nav-version">${_t("系统版本号")}</div>
       <div class="nav-item" data-panel="about" id="nav-about">${_t("关于")}</div>
     </nav>
     <div id="settings-content">
       <div id="panel-launch-params" class="panel active">
-        <div class="panel-title">${_t("模型启动参数")}</div>
+        <div class="panel-title">${_t("模型启动参数")}（${_t("推理引擎")}）</div>
 
         <div class="param-group">
           <div class="param-group-title">${_t("基础参数")}</div>
           <div class="param-row">
-            <div class="param-label">${_t("上下文大小")}<div class="param-key">-c, --ctx-size</div></div>
-            <div class="param-input"><input type="number" id="ctx_size" value="25600" min="0"><div class="param-desc">${_t("仅修改此参数；其它参数已固定为 llama-server 默认值，留 0 表示使用模型自带上下文")}</div></div>
+            <div class="param-label">${_t("上下文大小")}<div class="param-key">--context-length</div></div>
+            <div class="param-input"><input type="number" id="ctx_size" value="25600" min="0"><div class="param-desc">${_t("模型最大上下文长度，留 0 表示使用模型自带默认值")}</div></div>
           </div>
         </div>
 
@@ -266,22 +252,183 @@ const template = `
           <div class="param-group-title">${_t("服务参数")}</div>
           <div class="param-row">
             <div class="param-label">${_t("监听端口")}<div class="param-key">--port</div></div>
-            <div class="param-input"><input type="number" id="port" value="5678" min="1" max="65535"></div>
+            <div class="param-input"><input type="number" id="port" value="5678" min="1" max="65535"><div class="param-desc">${_t("Docker 端口映射（容器内始终监听 0.0.0.0）")}</div></div>
+          </div>
+        </div>
+
+        <div class="param-group">
+          <div class="param-group-title">${_t("Docker 部署")}</div>
+          <div class="param-row">
+            <div class="param-label">${_t("镜像")}<div class="param-key">sglang_image</div></div>
+            <div class="param-input"><input type="text" id="sglang_image" placeholder="lmsysorg/sglang:v0.5.17" style="max-width:400px;"><div class="param-desc">${_t("固定版本 tag，DGX Spark 推荐 lmsysorg/sglang:v0.5.17（多架构自动含 arm64）")}</div></div>
           </div>
           <div class="param-row">
-            <div class="param-label">${_t("监听地址")}<div class="param-key">--host</div></div>
+            <div class="param-label">${_t("共享内存")}<div class="param-key">--shm-size</div></div>
+            <div class="param-input"><input type="text" id="sglang_shm" placeholder="64g" style="max-width:200px;"><div class="param-desc">${_t("DGX Spark 建议 64g，其他机型 32g")}</div></div>
+          </div>
+        </div>
+
+        <div class="param-group">
+          <div class="param-group-title">${_t("推理参数")}</div>
+          <div class="param-row">
+            <div class="param-label">${_t("张量并行")}<div class="param-key">--tensor-parallel-size</div></div>
+            <div class="param-input"><input type="number" id="sg_tp" value="1" min="1"><div class="param-desc">${_t("单机多卡时拆分模型权重到多张 GPU（如 2 张卡填 2）；单卡填 1。2 台 Spark 跨机部署需要多节点模式，当前版本暂不支持")}</div></div>
+          </div>
+          <div class="param-row">
+            <div class="param-label">${_t("静态内存占比")}<div class="param-key">--mem-fraction-static</div></div>
+            <div class="param-input"><input type="number" id="sg_mem_frac" value="0" min="0" max="1" step="0.01"><div class="param-desc">${_t("0 = 自动；KV 缓存池/权重内存占比，OOM 时调小")}</div></div>
+          </div>
+          <div class="param-row">
+            <div class="param-label">${_t("数据类型")}<div class="param-key">--dtype</div></div>
             <div class="param-input">
-              <select id="host">
-                <option value="127.0.0.1">${_t("127.0.0.1 (本地)")}</option>
-                <option value="0.0.0.0">${_t("0.0.0.0 (所有接口)")}</option>
+              <select id="sg_dtype">
+                <option value="">${_t("auto（默认）")}</option>
+                <option value="half">half (FP16)</option>
+                <option value="float16">float16</option>
+                <option value="bfloat16">bfloat16</option>
+                <option value="float">float (FP32)</option>
+                <option value="float32">float32</option>
               </select>
+            </div>
+          </div>
+          <div class="param-row">
+            <div class="param-label">${_t("量化方法")}<div class="param-key">--quantization</div></div>
+            <div class="param-input">
+              <select id="sg_quant">
+                <option value="">${_t("不指定（NVFP4/FP8 模型自动从 config 解析）")}</option>
+                <option value="fp8">fp8</option>
+                <option value="mxfp8">mxfp8</option>
+                <option value="modelopt_fp8">modelopt_fp8</option>
+                <option value="modelopt_fp4">modelopt_fp4（NVFP4）</option>
+                <option value="nvfp4_online">nvfp4_online（在线量化）</option>
+                <option value="modelopt">modelopt</option>
+                <option value="modelopt_mixed">modelopt_mixed</option>
+                <option value="petit_nvfp4">petit_nvfp4</option>
+                <option value="awq">awq</option>
+                <option value="gptq">gptq</option>
+                <option value="marlin">marlin</option>
+                <option value="gptq_marlin">gptq_marlin</option>
+                <option value="awq_marlin">awq_marlin</option>
+                <option value="w8a8_fp8">w8a8_fp8</option>
+                <option value="w8a8_int8">w8a8_int8</option>
+                <option value="w4afp8">w4afp8</option>
+                <option value="moe_wna16">moe_wna16</option>
+                <option value="mxfp4">mxfp4</option>
+                <option value="bitsandbytes">bitsandbytes</option>
+                <option value="gguf">gguf</option>
+                <option value="compressed-tensors">compressed-tensors</option>
+              </select>
+              <div class="param-desc">${_t("预量化模型（如 unsloth NVFP4）无需指定，加载时自动识别")}</div>
             </div>
           </div>
         </div>
 
-        <div class="param-row" style="margin-top:16px;">
-          <div class="param-label"></div>
-          <div class="param-input"><span style="font-size:12px;color:var(--c-text-3);">${_t("其余启动参数（GPU 层、线程、采样、KV 缓存、推理等）已固定为 llama-server 默认值，如需调整请直接修改 doc/llamacpp.txt 列出的参数。")}</span></div>
+        <div class="param-group">
+          <div class="param-group-title">${_t("KV Cache 与调度")}</div>
+          <div class="param-row">
+            <div class="param-label">${_t("KV Cache 类型")}<div class="param-key">--kv-cache-dtype</div></div>
+            <div class="param-input">
+              <select id="sg_kv_dtype">
+                <option value="">${_t("auto（默认）")}</option>
+                <option value="fp8_e5m2">fp8_e5m2</option>
+                <option value="fp8_e4m3">fp8_e4m3</option>
+                <option value="bf16">bf16</option>
+                <option value="bfloat16">bfloat16</option>
+                <option value="nvfp4">nvfp4（需 CUDA 12.8+）</option>
+                <option value="fp4_mx_block16">fp4_mx_block16（需 CUDA 12.8+）</option>
+              </select>
+            </div>
+          </div>
+          <div class="param-row">
+            <div class="param-label">${_t("调度策略")}<div class="param-key">--schedule-policy</div></div>
+            <div class="param-input">
+              <select id="sg_sched">
+                <option value="">${_t("fcfs（默认）")}</option>
+                <option value="lpm">lpm</option>
+                <option value="random">random</option>
+                <option value="dfs-weight">dfs-weight</option>
+                <option value="lof">lof</option>
+                <option value="priority">priority</option>
+                <option value="routing-key">routing-key</option>
+              </select>
+            </div>
+          </div>
+          <div class="param-row">
+            <div class="param-label">${_t("最大运行请求数")}<div class="param-key">--max-running-requests</div></div>
+            <div class="param-input"><input type="number" id="sg_max_run" value="0" min="0"><div class="param-desc">${_t("0 = 自动")}</div></div>
+          </div>
+          <div class="param-row">
+            <div class="param-label">${_t("最大排队请求数")}<div class="param-key">--max-queued-requests</div></div>
+            <div class="param-input"><input type="number" id="sg_max_queue" value="0" min="0"><div class="param-desc">${_t("0 = 自动")}</div></div>
+          </div>
+          <div class="param-row">
+            <div class="param-label">${_t("Chunked Prefill")}<div class="param-key">--chunked-prefill-size</div></div>
+            <div class="param-input"><input type="number" id="sg_chunk" value="0" min="-1"><div class="param-desc">${_t("0 = 自动，-1 = 禁用；长提示词 OOM 时调小（如 4096）")}</div></div>
+          </div>
+        </div>
+
+        <div class="param-group">
+          <div class="param-group-title">${_t("模型解析与日志")}</div>
+          <div class="param-row">
+            <div class="param-label">${_t("推理解析器")}<div class="param-key">--reasoning-parser</div></div>
+            <div class="param-input">
+              <select id="sg_reasoning">
+                <option value="">${_t("无")}</option>
+                <option value="deepseek-r1">deepseek-r1</option>
+                <option value="deepseek-v3">deepseek-v3</option>
+                <option value="glm45">glm45</option>
+                <option value="gpt-oss">gpt-oss</option>
+                <option value="kimi">kimi</option>
+                <option value="qwen3">qwen3</option>
+                <option value="qwen3-thinking">qwen3-thinking</option>
+                <option value="step3">step3</option>
+              </select>
+              <div class="param-desc">${_t("推理模型（DeepSeek/Qwen3 等）专用，分离思考内容")}</div>
+            </div>
+          </div>
+          <div class="param-row">
+            <div class="param-label">${_t("工具调用解析器")}<div class="param-key">--tool-call-parser</div></div>
+            <div class="param-input">
+              <select id="sg_tool">
+                <option value="">${_t("无")}</option>
+                <option value="qwen">qwen</option>
+                <option value="qwen25">qwen25</option>
+                <option value="qwen3_coder">qwen3_coder</option>
+                <option value="deepseekv3">deepseekv3</option>
+                <option value="deepseekv31">deepseekv31</option>
+                <option value="glm">glm</option>
+                <option value="glm45">glm45</option>
+                <option value="glm47">glm47</option>
+                <option value="gpt-oss">gpt-oss</option>
+                <option value="kimi_k2">kimi_k2</option>
+                <option value="llama3">llama3</option>
+                <option value="mistral">mistral</option>
+                <option value="pythonic">pythonic</option>
+                <option value="step3">step3</option>
+                <option value="gigachat3">gigachat3</option>
+              </select>
+            </div>
+          </div>
+          <div class="param-row">
+            <div class="param-label">${_t("日志级别")}<div class="param-key">--log-level</div></div>
+            <div class="param-input">
+              <select id="sg_log_level">
+                <option value="">${_t("info（默认）")}</option>
+                <option value="debug">debug</option>
+                <option value="warning">warning</option>
+                <option value="error">error</option>
+                <option value="critical">critical</option>
+              </select>
+            </div>
+          </div>
+          <div class="param-row">
+            <div class="param-label">${_t("请求日志")}<div class="param-key">--log-requests</div></div>
+            <div class="param-input"><div class="checkbox-wrap"><input type="checkbox" id="sg_log_requests"><span>${_t("记录所有请求的元数据/输入/输出")}</span></div></div>
+          </div>
+          <div class="param-row">
+            <div class="param-label">${_t("监控指标")}<div class="param-key">--enable-metrics</div></div>
+            <div class="param-input"><div class="checkbox-wrap"><input type="checkbox" id="sg_metrics"><span>${_t("启动 Prometheus metrics")}</span></div></div>
+          </div>
         </div>
 
         <button class="btn-reset" id="reset-btn">${_t("恢复默认")}</button>
@@ -307,83 +454,10 @@ const template = `
         </div>
       </div>
 
-      <div id="panel-wxbot" class="panel">
-        <div class="panel-title">${_t("微信 Bot（iLink）")}</div>
-
-        <div class="param-group">
-          <div class="param-group-title">${_t("绑定状态")}</div>
-          <div class="param-row">
-            <div class="param-label">${_t("状态")}</div>
-            <div class="param-input"><span id="wxbot-state" style="font-size:13px;color:var(--c-text-2);">${_t("加载中…")}</span></div>
-          </div>
-          <div class="param-row">
-            <div class="param-label">Bot ID</div>
-            <div class="param-input"><span id="wxbot-botid" style="font-size:13px;color:var(--c-text-2);">-</span></div>
-          </div>
-          <div class="param-row">
-            <div class="param-label">${_t("主人微信")}</div>
-            <div class="param-input">
-              <span id="wxbot-owner" style="font-size:13px;color:var(--c-text-2);">-</span>
-              <div class="param-desc">${_t("首个给 Bot 发消息的微信号自动成为主人，其余人消息忽略")}</div>
-            </div>
-          </div>
-          <div class="param-row">
-            <div class="param-label">${_t("消息统计")}</div>
-            <div class="param-input"><span id="wxbot-stats" style="font-size:13px;color:var(--c-text-2);">${_t("收 ")}0 ${_t(" / 发 ")}0</span></div>
-          </div>
-          <div class="param-row">
-            <div class="param-label"></div>
-            <div class="param-input" style="display:flex;gap:10px;max-width:none;">
-              <button id="wxbot-bind-btn" style="background:var(--c-accent);color:#fff;border:none;padding:8px 20px;border-radius:8px;font-size:13px;cursor:pointer;">${_t("绑定微信")}</button>
-              <button id="wxbot-toggle-btn" style="display:none;background:var(--c-overlay);color:var(--c-text);border:none;padding:8px 20px;border-radius:8px;font-size:13px;cursor:pointer;">${_t("暂停")}</button>
-              <button id="wxbot-unbind-btn" class="btn-delete-llamacpp" style="display:none;padding:8px 20px;border-radius:8px;font-size:13px;">${_t("解绑")}</button>
-            </div>
-          </div>
-        </div>
-
-        <div class="param-group">
-          <div class="param-group-title">${_t("Bot 行为")}</div>
-          <div class="param-row">
-            <div class="param-label">${_t("工作目录")}</div>
-            <div class="param-input"><span style="font-size:13px;color:var(--c-text-2);">${_t("跟随 Agent 页工作目录")}</span><div class="param-desc">${_t("微信 Bot 与 Agent 页使用同一工作目录，在 Agent 页修改")}</div></div>
-          </div>
-          <div class="param-row">
-            <div class="param-label">${_t("模式")}</div>
-            <div class="param-input"><span style="font-size:13px;color:var(--c-text-2);">${_t("跟随 Agent 页模式设置")}</span><div class="param-desc">${_t("执行模式直接执行修改；Plan 模式只读调研并产出计划，不修改任何文件")}</div></div>
-          </div>
-        </div>
-
-        <div class="param-group">
-          <div class="param-group-title">${_t("最近活动")}</div>
-          <div id="wxbot-activity" style="font-size:12px;color:var(--c-text-3);line-height:1.8;max-height:200px;overflow-y:auto;background:var(--c-panel-2);border:1px solid var(--c-border);border-radius:6px;padding:10px 12px;">${_t("暂无活动")}</div>
-        </div>
-      </div>
-
-      <div id="panel-proxy" class="panel">
-        <div class="panel-title">${_t("网络代理")}</div>
-        <div class="param-group">
-          <div class="param-group-title">${_t("代理设置")}</div>
-          <div class="param-row">
-            <div class="param-label">${_t("启用代理")}<div class="param-key">agent_proxy.enabled</div></div>
-            <div class="param-input">
-              <div class="checkbox-wrap"><input type="checkbox" id="proxy_enabled"><span>${_t("为 admAgent 的 LLM 请求启用代理")}</span></div>
-              <div class="param-desc">${_t("仅影响 admAgent 跟大模型交互的请求，桌面端下载等不走代理")}</div>
-            </div>
-          </div>
-          <div class="param-row">
-            <div class="param-label">${_t("代理地址")}<div class="param-key">agent_proxy.url</div></div>
-            <div class="param-input">
-              <input type="text" id="proxy_url" placeholder="http://127.0.0.1:7890" style="max-width:400px;">
-              <div class="param-desc">${_t("支持 http / https / socks5 协议，如 http://127.0.0.1:7890")}</div>
-            </div>
-          </div>
-        </div>
-      </div>
-
       <div id="panel-version" class="panel">
         <div class="panel-title">${_t("系统版本号")}</div>
         <table class="version-table">
-          <tr><td>${_t("ADM 版本")}</td><td id="v-adm">${_t("检测中...")} <span id="update-badge" style="display:none;color:#4caf50;font-size:12px;margin-left:6px;">${_t("✓ 最新")}</span></td></tr>
+          <tr><td>${_t("ADM-BE 版本")}</td><td id="v-adm">${_t("检测中...")} <span id="update-badge" style="display:none;color:#4caf50;font-size:12px;margin-left:6px;">${_t("✓ 最新")}</span></td></tr>
           <tr>
             <td style="padding-top:20px;" colspan="2">
               <button class="btn-save" id="check-update-btn" style="margin-top:0;font-size:13px;padding:8px 20px;">${_t("检查新版本")}</button>
@@ -391,11 +465,6 @@ const template = `
             </td>
           </tr>
           <tr><td>${_t("Tauri 版本")}</td><td>2.11.2</td></tr>
-          <tr>
-            <td>${_t("llama.cpp 版本")}</td>
-            <td><span id="v-llamacpp" style="margin-right:8px;">${_t("检测中...")}</span><button class="btn-delete-llamacpp" id="delete-llamacpp-btn">${_t("删除")}</button></td>
-          </tr>
-          <tr><td>${_t("admAgent 版本")}</td><td id="v-admagent">${_t("检测中...")}</td></tr>
           <tr><td>${_t("操作系统")}</td><td id="v-os">${_t("检测中...")}</td></tr>
         </table>
       </div>
@@ -403,11 +472,26 @@ const template = `
       <div id="panel-about" class="panel">
         <div class="panel-title">${_t("关于")}</div>
         <div class="about-content">
-          <h3>ADM</h3>
+          <h3>ADM-BE</h3>
           <div class="about-subtitle">Automatic Deployment Model</div>
-          <p>${_t("ADM 是一个大模型部署图形化管理工具，让用户能够便捷地在本地部署和运行大语言模型。")}</p>
+          <p>${_t("ADM-BE 是一个大模型部署图形化管理工具，让用户能够便捷地在本地部署和运行大语言模型。")}</p>
           <p>${_t("如需定制服务 联系方式：微信: litai686")}</p>
           <p>${_t("项目官网：")}<a href="https://adm.tuduoduo.top/" target="_blank">https://adm.tuduoduo.top/</a></p>
+        </div>
+      </div>
+
+      <div id="panel-logs" class="panel">
+        <div class="panel-title">${_t("运行日志")}</div>
+        <div class="param-group">
+          <div class="param-row" style="margin-bottom:16px;align-items:center;">
+            <div class="param-label">${_t("选择日期")}</div>
+            <div class="param-input" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+              <select id="log-date-select" style="min-width:160px;width:auto;"></select>
+              <button class="btn-reset" id="log-refresh-btn" style="margin:0;padding:6px 16px;font-size:13px;">${_t("刷新")}</button>
+              <button class="btn-reset" id="log-open-dir-btn" style="margin:0;padding:6px 16px;font-size:13px;">${_t("打开日志目录")}</button>
+            </div>
+          </div>
+          <pre id="log-content" style="background:var(--c-bg-deep);color:var(--c-text-2);font-family:'SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace;font-size:12px;line-height:1.6;padding:12px 16px;border-radius:8px;border:1px solid var(--c-border);overflow-y:auto;max-height:60vh;white-space:pre-wrap;word-break:break-all;margin:0;">${_t("暂无日志")}</pre>
         </div>
       </div>
     </div>
@@ -421,31 +505,6 @@ const template = `
     <div class="confirm-buttons">
       <button class="btn-cancel" id="confirm-cancel-btn">${_t("取消")}</button>
       <button class="btn-confirm" id="confirm-ok-btn">${_t("确定")}</button>
-    </div>
-  </div>
-</div>
-
-<div class="confirm-overlay" id="wxbot-qr-overlay">
-  <div class="confirm-dialog">
-    <div class="confirm-title">${_t("微信扫码绑定")}</div>
-    <div id="wxbot-qr-box" style="display:flex;justify-content:center;align-items:center;min-height:220px;width:220px;background:#fff;border-radius:8px;margin:0 auto 16px;">
-      <span style="color:#333;font-size:13px;">${_t("二维码加载中…")}</span>
-    </div>
-    <div class="confirm-message">${_t("使用微信「扫一扫」确认开启 Bot 功能")}</div>
-    <div class="confirm-buttons">
-      <button class="btn-cancel" id="wxbot-qr-cancel-btn">${_t("取消")}</button>
-    </div>
-  </div>
-</div>
-
-<div class="confirm-overlay" id="wxbot-code-overlay">
-  <div class="confirm-dialog">
-    <div class="confirm-title">${_t("输入配对码")}</div>
-    <div class="confirm-message" id="wxbot-code-hint">${_t("请输入微信手机端显示的配对数字：")}</div>
-    <input id="wxbot-code-input" type="text" inputmode="numeric" autocomplete="off" style="width:100%;box-sizing:border-box;padding:10px 12px;border-radius:8px;border:1px solid var(--c-overlay-strong);background:rgba(255,255,255,0.06);color:#fff;font-size:16px;letter-spacing:2px;text-align:center;margin-bottom:16px;">
-    <div class="confirm-buttons">
-      <button class="btn-cancel" id="wxbot-code-cancel-btn">${_t("取消")}</button>
-      <button class="btn-confirm" id="wxbot-code-ok-btn">${_t("确定")}</button>
     </div>
   </div>
 </div>
@@ -479,14 +538,61 @@ function showToast(message, isError) {
   setTimeout(() => toast.remove(), 3000);
 }
 
+function getSglangArgsFromForm() {
+  const num = function (id) { return parseInt(document.getElementById(id).value) || 0; };
+  const str = function (id) { const el = document.getElementById(id); return el ? el.value.trim() : ""; };
+  const bool = function (id) { const el = document.getElementById(id); return el ? el.checked : false; };
+  return {
+    image: str("sglang_image"),
+    shm_size: str("sglang_shm"),
+    context_length: 0,
+    tensor_parallel_size: num("sg_tp") || 1,
+    mem_fraction_static: parseFloat(document.getElementById("sg_mem_frac").value) || 0,
+    dtype: str("sg_dtype"),
+    quantization: str("sg_quant"),
+    kv_cache_dtype: str("sg_kv_dtype"),
+    schedule_policy: str("sg_sched"),
+    max_running_requests: num("sg_max_run"),
+    max_queued_requests: num("sg_max_queue"),
+    chunked_prefill_size: parseInt(document.getElementById("sg_chunk").value) || 0,
+    log_level: str("sg_log_level"),
+    log_requests: bool("sg_log_requests"),
+    enable_metrics: bool("sg_metrics"),
+    reasoning_parser: str("sg_reasoning"),
+    tool_call_parser: str("sg_tool"),
+    extra_args: "",
+  };
+}
+
+function fillSglangArgsForm(a) {
+  const v = a || {};
+  const set = function (id, val) { const el = document.getElementById(id); if (el) el.value = val; };
+  const setB = function (id, val) { const el = document.getElementById(id); if (el) el.checked = !!val; };
+  set("sglang_image", v.image || "");
+  set("sglang_shm", v.shm_size || "");
+  set("sg_tp", v.tensor_parallel_size || 1);
+  set("sg_mem_frac", v.mem_fraction_static || 0);
+  set("sg_dtype", v.dtype || "");
+  set("sg_quant", v.quantization || "");
+  set("sg_kv_dtype", v.kv_cache_dtype || "");
+  set("sg_sched", v.schedule_policy || "");
+  set("sg_max_run", v.max_running_requests || 0);
+  set("sg_max_queue", v.max_queued_requests || 0);
+  set("sg_chunk", v.chunked_prefill_size || 0);
+  set("sg_log_level", v.log_level || "");
+  setB("sg_log_requests", v.log_requests);
+  setB("sg_metrics", v.enable_metrics);
+  set("sg_reasoning", v.reasoning_parser || "");
+  set("sg_tool", v.tool_call_parser || "");
+}
+
 function getParamsFromForm() {
   const ctxVal = parseInt(document.getElementById("ctx_size").value) || 0;
   const portEl = document.getElementById("port");
-  const hostEl = document.getElementById("host");
   return {
     ctx_size: ctxVal,
     port: portEl ? (parseInt(portEl.value) || 5678) : 5678,
-    host: hostEl ? hostEl.value : "127.0.0.1",
+    host: "127.0.0.1",
   };
 }
 
@@ -495,17 +601,16 @@ function fillFormFromParams(params) {
   document.getElementById("ctx_size").value = p.ctx_size ?? p.ctxSize ?? DEFAULT_CTX_SIZE;
   const portEl = document.getElementById("port");
   if (portEl) portEl.value = p.port ?? 5678;
-  const hostEl = document.getElementById("host");
-  if (hostEl) hostEl.value = p.host ?? "127.0.0.1";
 }
 
 async function saveParams() {
   const params = getParamsFromForm();
   console.log("[settings] 保存参数:", JSON.stringify(params));
   try {
-    // 加载完整设置，仅替换 launch_params，保留 agent_workdirs 等所有其他字段
+    // 加载完整设置，仅替换 launch_params 与 sglang_args
     let s = await invoke()("load_settings");
     s.launch_params = params;
+    s.sglang_args = getSglangArgsFromForm();
     await invoke()("save_settings", { settings: s });
     console.log("[settings] 保存成功");
     showToast(_t("设置已保存，重启模型后生效"));
@@ -517,50 +622,17 @@ async function saveParams() {
 
 function resetParams() {
   fillFormFromParams({ ctx_size: DEFAULT_CTX_SIZE });
+  fillSglangArgsForm(null);
   autoSave();
 }
 
 function autoSave() { saveParams(); }
 
 function setupAutoSave() {
-  ["ctx_size", "port", "host"].forEach(function (id) {
+  ["ctx_size", "port", "host", "sglang_image", "sglang_shm", "sg_tp", "sg_mem_frac", "sg_dtype", "sg_quant", "sg_kv_dtype", "sg_sched", "sg_max_run", "sg_max_queue", "sg_chunk", "sg_log_level", "sg_reasoning", "sg_tool", "sg_log_requests", "sg_metrics"].forEach(function (id) {
     var el = document.getElementById(id);
     if (el) el.addEventListener("change", autoSave);
   });
-}
-
-async function saveProxy() {
-  const proxy = {
-    enabled: document.getElementById("proxy_enabled").checked,
-    url: document.getElementById("proxy_url").value.trim(),
-  };
-  if (proxy.enabled) {
-    if (!proxy.url) {
-      showToast(_t("启用代理时请填写代理地址"), true);
-      return;
-    }
-    if (!/^(https?|socks5):\/\//i.test(proxy.url)) {
-      showToast(_t("代理地址需以 http://、https:// 或 socks5:// 开头"), true);
-      return;
-    }
-  }
-  try {
-    let s = await invoke()("load_settings");
-    s.agent_proxy = proxy;
-    await invoke()("save_settings", { settings: s });
-    showToast(_t("代理设置已保存"));
-  } catch (e) {
-    console.error("[settings] 保存代理设置失败:", e);
-    showToast(_t("保存失败: ") + e, true);
-  }
-}
-
-function setupProxyPanel() {
-  var ids = ["proxy_enabled", "proxy_url"];
-  for (var i = 0; i < ids.length; i++) {
-    var el = document.getElementById(ids[i]);
-    if (el) el.addEventListener("change", saveProxy);
-  }
 }
 
 async function loadVersionInfo() {
@@ -569,18 +641,6 @@ async function loadVersionInfo() {
     document.getElementById("v-adm").innerHTML = admVersion + ' <span id="update-badge" style="display:none;color:#4caf50;font-size:12px;margin-left:6px;">' + _t("✓ 最新") + '</span>';
   } catch (e) {
     document.getElementById("v-adm").textContent = _t("未知");
-  }
-  try {
-    const version = await invoke()("get_llamacpp_version");
-    document.getElementById("v-llamacpp").textContent = version || _t("未知");
-  } catch (e) {
-    document.getElementById("v-llamacpp").textContent = _t("未安装或无法检测");
-  }
-  try {
-    const agentVersion = await invoke()("get_adm_agent_version");
-    document.getElementById("v-admagent").textContent = agentVersion || _t("未知");
-  } catch (e) {
-    document.getElementById("v-admagent").textContent = _t("未知");
   }
   const platform = navigator.platform || navigator.userAgent;
   let osName = _t("未知");
@@ -602,18 +662,6 @@ function showConfirmDialog(message) {
 function closeConfirmDialog(result) {
   document.getElementById("confirm-overlay").classList.remove("show");
   if (_confirmResolve) { _confirmResolve(result); _confirmResolve = null; }
-}
-
-async function deleteLlamacpp() {
-  const confirmed = await showConfirmDialog(_t("确定要删除 llamacpp 文件夹吗？\n删除后需要重新下载才能使用 llama.cpp 相关功能。"));
-  if (!confirmed) return;
-  try {
-    await invoke()("delete_llamacpp");
-    document.getElementById("v-llamacpp").textContent = _t("未安装");
-    showToast(_t("llamacpp 文件夹已删除"), false);
-  } catch (e) {
-    showToast(_t("删除失败: ") + e, true);
-  }
 }
 
 async function checkUpdateNow() {
@@ -653,6 +701,47 @@ async function checkUpdateNow() {
 
 function goBack() { location.hash = "#/list"; }
 
+// ===== 运行日志 =====
+
+let _logDateLoaded = false;
+
+async function loadLogDates() {
+  try {
+    const dates = await invoke()("list_log_dates");
+    const select = document.getElementById("log-date-select");
+    if (!select) return;
+    select.innerHTML = "";
+    if (dates.length === 0) {
+      select.innerHTML = '<option value="">' + _t("暂无日志") + '</option>';
+      document.getElementById("log-content").textContent = _t("暂无日志");
+      return;
+    }
+    dates.forEach(function(d) {
+      var opt = document.createElement("option");
+      opt.value = d;
+      opt.textContent = d;
+      select.appendChild(opt);
+    });
+    loadLogContent(dates[0]);
+  } catch (e) {
+    console.error("[settings] 加载日志日期失败:", e);
+    document.getElementById("log-content").textContent = _t("加载失败: ") + e;
+  }
+}
+
+async function loadLogContent(date) {
+  const pre = document.getElementById("log-content");
+  if (!pre) return;
+  pre.textContent = _t("加载中...");
+  try {
+    const content = await invoke()("read_log", { date: date });
+    pre.textContent = content || _t("暂无日志");
+    pre.scrollTop = pre.scrollHeight;
+  } catch (e) {
+    pre.textContent = _t("加载失败: ") + e;
+  }
+}
+
 // ===== 外观主题 =====
 
 function renderThemeGrid() {
@@ -681,195 +770,14 @@ function renderThemeGrid() {
   });
 }
 
-// ===== 微信 Bot（iLink） =====
-
-let wxbotUnlistens = [];
-let wxbotActivities = [];
-
-function renderWxbotStatus(s) {
-  const stateEl = document.getElementById("wxbot-state");
-  if (!stateEl) return;
-  const map = {
-    stopped: s.bound ? _t("已暂停") : _t("未绑定"),
-    waiting_scan: _t("等待扫码…"),
-    running: _t("运行中"),
-    error: _t("错误"),
-  };
-  stateEl.textContent = (map[s.state] || s.state) + (s.error ? "：" + s.error : "");
-  stateEl.style.color = s.state === "running" ? "#4caf50" : (s.state === "error" ? "#f44336" : "var(--c-text-2)");
-  document.getElementById("wxbot-botid").textContent = s.bot_id || "-";
-  document.getElementById("wxbot-owner").textContent = s.owner || "-";
-  document.getElementById("wxbot-stats").textContent = _t("收 ") + (s.msg_in || 0) + _t(" / 发 ") + (s.msg_out || 0);
-  const bindBtn = document.getElementById("wxbot-bind-btn");
-  const toggleBtn = document.getElementById("wxbot-toggle-btn");
-  const unbindBtn = document.getElementById("wxbot-unbind-btn");
-  bindBtn.textContent = s.bound ? _t("重新扫码") : _t("绑定微信");
-  toggleBtn.style.display = s.bound ? "" : "none";
-  toggleBtn.textContent = s.state === "running" ? _t("暂停") : _t("启动");
-  toggleBtn.dataset.running = s.state === "running" ? "1" : "0";
-  unbindBtn.style.display = s.bound ? "" : "none";
-}
-
-async function refreshWxbotStatus() {
-  try {
-    const s = await invoke()("get_ilink_status");
-    renderWxbotStatus(s);
-  } catch (e) {
-    console.error("[settings] 获取微信 Bot 状态失败:", e);
-  }
-}
-
-function showWxbotQr(payload) {
-  const overlay = document.getElementById("wxbot-qr-overlay");
-  const box = document.getElementById("wxbot-qr-box");
-  overlay.classList.add("show");
-  const img = payload && payload.qrcode_img ? String(payload.qrcode_img) : "";
-  const url = payload && payload.qrcode_url ? String(payload.qrcode_url) : "";
-  if (img) {
-    // qrcode_img_content 可能是 data URL / 图片地址 / 裸 base64
-    const src = img.startsWith("data:") ? img : (img.startsWith("http") ? img : "data:image/png;base64," + img);
-    box.innerHTML = '<img alt="二维码" style="width:200px;height:200px;" src="' + escHtml(src) + '">';
-  } else if (url) {
-    box.innerHTML = '<span style="color:#333;font-size:12px;word-break:break-all;padding:8px;">' + escHtml(url) + "</span>";
-  } else {
-    box.innerHTML = '<span style="color:#333;font-size:13px;">' + _t("二维码加载中…") + '</span>';
-  }
-}
-
-function hideWxbotQr() {
-  const overlay = document.getElementById("wxbot-qr-overlay");
-  if (overlay) overlay.classList.remove("show");
-}
-
-function showWxbotCode(retry) {
-  hideWxbotQr();
-  const overlay = document.getElementById("wxbot-code-overlay");
-  if (!overlay) return;
-  const hint = document.getElementById("wxbot-code-hint");
-  if (hint) hint.textContent = retry ? _t("配对码错误，请重新输入微信手机端显示的数字：") : _t("请输入微信手机端显示的配对数字：");
-  const input = document.getElementById("wxbot-code-input");
-  if (input) input.value = "";
-  overlay.classList.add("show");
-  if (input) setTimeout(function () { input.focus(); }, 50);
-}
-
-function hideWxbotCode() {
-  const overlay = document.getElementById("wxbot-code-overlay");
-  if (overlay) overlay.classList.remove("show");
-}
-
-async function submitWxbotCode() {
-  const input = document.getElementById("wxbot-code-input");
-  const code = input ? String(input.value || "").trim() : "";
-  if (!code) {
-    showToast(_t("请先输入配对码"), true);
-    return;
-  }
-  try {
-    await invoke()("submit_ilink_verify_code", { code: code });
-    hideWxbotCode();
-  } catch (e) {
-    showToast(_t("提交配对码失败: ") + e, true);
-  }
-}
-
-function pushWxbotActivity(p) {
-  wxbotActivities.unshift(p);
-  if (wxbotActivities.length > 50) wxbotActivities.pop();
-  const el = document.getElementById("wxbot-activity");
-  if (!el) return;
-  el.innerHTML = wxbotActivities.map(function (a) {
-    const t = new Date(a.ts || Date.now());
-    const hh = ("0" + t.getHours()).slice(-2) + ":" + ("0" + t.getMinutes()).slice(-2) + ":" + ("0" + t.getSeconds()).slice(-2);
-    const dir = a.direction === "in" ? _t("⬅️ 收") : (a.direction === "out" ? _t("➡️ 发") : "⚠️");
-    return "<div>[" + hh + "] " + dir + " " + escHtml(a.summary || "") + "</div>";
-  }).join("");
-}
-
-async function setupWxbotPanel() {
-  document.getElementById("wxbot-bind-btn").addEventListener("click", async function () {
-    try {
-      showWxbotQr(null);
-      await invoke()("start_ilink_login");
-    } catch (e) {
-      hideWxbotQr();
-      showToast(_t("启动绑定失败: ") + e, true);
-    }
-  });
-  document.getElementById("wxbot-qr-cancel-btn").addEventListener("click", async function () {
-    hideWxbotQr();
-    try { await invoke()("cancel_ilink_login"); } catch (_) {}
-  });
-  document.getElementById("wxbot-code-ok-btn").addEventListener("click", submitWxbotCode);
-  document.getElementById("wxbot-code-input").addEventListener("keydown", function (e) {
-    if (e.key === "Enter") submitWxbotCode();
-  });
-  document.getElementById("wxbot-code-cancel-btn").addEventListener("click", async function () {
-    hideWxbotCode();
-    try { await invoke()("cancel_ilink_login"); } catch (_) {}
-  });
-  document.getElementById("wxbot-toggle-btn").addEventListener("click", async function () {
-    const running = this.dataset.running === "1";
-    try {
-      if (running) {
-        await invoke()("stop_ilink_bridge");
-        showToast(_t("微信 Bot 已暂停"));
-      } else {
-        await invoke()("start_ilink_bridge");
-        showToast(_t("微信 Bot 已启动"));
-      }
-    } catch (e) {
-      showToast(_t("操作失败: ") + e, true);
-    }
-    refreshWxbotStatus();
-  });
-  document.getElementById("wxbot-unbind-btn").addEventListener("click", async function () {
-    const ok = await showConfirmDialog(_t("确定要解绑微信 Bot 吗？\n解绑将删除登录凭据与会话映射，需重新扫码才能使用。"));
-    if (!ok) return;
-    try {
-      await invoke()("unbind_ilink");
-      showToast(_t("已解绑微信 Bot"));
-    } catch (e) {
-      showToast(_t("解绑失败: ") + e, true);
-    }
-    refreshWxbotStatus();
-  });
-
-  // 事件订阅（unmount 时统一释放，防重复绑定）
-  try {
-    const un1 = await window.__adm_listen("ilink-status", function (ev) {
-      const p = ev.payload || {};
-      if (p.state === "waiting_scan") {
-        showWxbotQr(p);
-      } else if (p.state === "waiting_verify_code") {
-        showWxbotCode(!!p.retry);
-      } else {
-        hideWxbotQr();
-        hideWxbotCode();
-        if (p.state === "running") showToast(_t("微信 Bot 已连接"));
-        if (p.state === "error" && p.error) showToast(_t("微信 Bot: ") + p.error, true);
-      }
-      refreshWxbotStatus();
-    });
-    wxbotUnlistens.push(un1);
-    const un2 = await window.__adm_listen("ilink-activity", function (ev) {
-      pushWxbotActivity(ev.payload || {});
-    });
-    wxbotUnlistens.push(un2);
-  } catch (e) {
-    console.error("[settings] 订阅微信 Bot 事件失败:", e);
-  }
-  refreshWxbotStatus();
-}
-
 export default {
   template,
   mount(root) {
     console.log("[settings] mount()");
     root.innerHTML = template;
 
-    // 禁用页面右键（屏蔽浏览器默认菜单；#confirm-overlay / #wxbot-qr-overlay 是 #settings-app 的兄弟节点，需各自绑定）
-    ["settings-app", "confirm-overlay", "wxbot-qr-overlay", "wxbot-code-overlay"].forEach(function(id) {
+    // 禁用页面右键（屏蔽浏览器默认菜单；#confirm-overlay 是 #settings-app 的兄弟节点，需各自绑定）
+    ["settings-app", "confirm-overlay"].forEach(function(id) {
       var el = document.getElementById(id);
       if (el) el.addEventListener("contextmenu", function(e) { e.preventDefault(); });
     });
@@ -880,9 +788,27 @@ export default {
     });
     document.getElementById("reset-btn").addEventListener("click", resetParams);
     document.getElementById("check-update-btn").addEventListener("click", checkUpdateNow);
-    document.getElementById("delete-llamacpp-btn").addEventListener("click", deleteLlamacpp);
     document.getElementById("confirm-cancel-btn").addEventListener("click", function() { closeConfirmDialog(false); });
     document.getElementById("confirm-ok-btn").addEventListener("click", function() { closeConfirmDialog(true); });
+
+    // 运行日志
+    var navLogs = document.getElementById("nav-logs");
+    if (navLogs) {
+      navLogs.addEventListener("click", function() {
+        if (!_logDateLoaded) { _logDateLoaded = true; loadLogDates(); }
+      });
+    }
+    var logRefresh = document.getElementById("log-refresh-btn");
+    if (logRefresh) logRefresh.addEventListener("click", function() {
+      var sel = document.getElementById("log-date-select");
+      loadLogContent(sel ? sel.value : null);
+    });
+    var logOpenDir = document.getElementById("log-open-dir-btn");
+    if (logOpenDir) logOpenDir.addEventListener("click", async function() {
+      try { await invoke()("open_log_dir"); } catch (e) { showToast(_t("打开失败: ") + e, true); }
+    });
+    var logDateSel = document.getElementById("log-date-select");
+    if (logDateSel) logDateSel.addEventListener("change", function() { loadLogContent(this.value); });
 
     // 语言切换：保存到 Settings.language + localStorage，并立即重建当前视图生效
     const langSelect = document.getElementById("ui-lang-select");
@@ -901,8 +827,6 @@ export default {
     }
 
     setupAutoSave();
-    setupProxyPanel();
-    setupWxbotPanel();
     renderThemeGrid();
 
     (async function() {
@@ -911,10 +835,8 @@ export default {
         console.log("[settings] 加载设置成功, keys:", Object.keys(settings));
         const params = settings.launch_params || settings.launchParams;
         if (settings && params) fillFormFromParams(params);
-        // 代理设置回填
-        const proxy = settings.agent_proxy || {};
-        document.getElementById("proxy_enabled").checked = !!proxy.enabled;
-        document.getElementById("proxy_url").value = proxy.url || "";
+        // SGLang 详细参数回填
+        if (settings && settings.sglang_args) fillSglangArgsForm(settings.sglang_args);
       } catch (e) {
         console.error("加载设置失败:", e);
       }
@@ -923,11 +845,5 @@ export default {
   },
   unmount() {
     console.log("[settings] unmount()");
-    // 释放微信 Bot 事件监听，防止重复绑定泄漏
-    wxbotUnlistens.forEach(function (un) {
-      try { un(); } catch (_) {}
-    });
-    wxbotUnlistens = [];
-    wxbotActivities = [];
   }
 };

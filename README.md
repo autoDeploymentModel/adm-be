@@ -1,8 +1,8 @@
 <div align="center">
 
-# ADM
+# ADM-BE
 
-**Automatic Deployment Model — llama.cpp 图形化管理桌面应用**
+**Automatic Deployment Model — 大模型部署图形化管理桌面应用**
 
 基于 Tauri 2.x 构建，将 llama.cpp 复杂的命令行启动指令通过简洁的图形界面呈现，让你在本地轻松部署、运行大语言模型，并内置 **Agent 终端** 把本地模型接入智能体工作流。
 

@@ -416,21 +416,14 @@ const template = `
   }
 
   .filter-bar .model-desc-text {
-    font-size: 13px;
-    color: var(--c-text-3);
-    padding: 6px 0;
-    flex: 1;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    display: none;
   }
 </style>
 <div id="model-list-root">
 <div class="page-title">${_t("模型列表")}</div>
 <div class="filter-bar">
-  <label for="model-type-select">${_t("模型类型")}</label>
-  <select id="model-type-select"></select>
-  <span class="model-desc-text" id="model-desc-text"></span>
+  <label for="device-select">${_t("适配机型")}</label>
+  <select id="device-select"></select>
 </div>
 <main>
   <div class="card-grid" id="model-grid">
@@ -481,23 +474,24 @@ function escapeHtml(s) {
     .replace(/'/g, "&#39;");
 }
 
-function isModelAvailable(needRam) {
-  const systemInfo = S().systemInfo;
-  if (!systemInfo) return false;
-  let totalMemory;
-  if (systemInfo.total_vram === systemInfo.total_ram) {
-    totalMemory = systemInfo.total_ram;
-  } else {
-    totalMemory = systemInfo.total_ram + systemInfo.total_vram;
-  }
-  const ramc = totalMemory / (1024 * 1024 * 1024);
-  return ramc >= parseInt(needRam);
+function isModelAvailable(model) {
+  const dev = S().currentDeviceFilter;
+  if (!dev || dev === "all") return true;
+  const devices = model.model_support_devices || [];
+  return devices.length === 0 || devices.includes(dev);
 }
 
 function isModelDownloaded(modelId) {
   const local = S().localModels.find(m => m.model_id === modelId);
   if (!local) return false;
   const model = S().modelList.find(m => m.model_id === modelId);
+  // 新格式（多文件目录模型）：所有文件齐全才算下载完成
+  if (model && model.model_download_files && model.model_download_files.length > 0) {
+    return model.model_download_files.every(function(url) {
+      const fname = getUrlFilename(url);
+      return fname && local.files.includes(fname);
+    });
+  }
   if (model && model.model_type === "文本生成图片") {
     const mainFile = getUrlFilename(model.model_url);
     if (mainFile && !local.files.includes(mainFile)) return false;
@@ -527,44 +521,54 @@ function showToast(message) {
   setTimeout(() => toast.remove(), 3000);
 }
 
-function updateModelDesc() {
-  const descSpan = document.getElementById("model-desc-text");
-  if (S().currentTypeFilter === "all") {
-    descSpan.textContent = "";
-    return;
-  }
-  const match = S().modelList.find(function(m) { return m.model_type === S().currentTypeFilter; });
-  descSpan.textContent = match && match.model_description ? match.model_description : "";
-}
-
 function getFilteredModelList() {
-  if (S().currentTypeFilter === "all") return S().modelList;
-  return S().modelList.filter(function(m) { return m.model_type === S().currentTypeFilter; });
+  let list = S().modelList;
+  // 机型过滤：model_support_devices 为空 = 全机型可用
+  const dev = S().currentDeviceFilter;
+  if (dev && dev !== "all") {
+    list = list.filter(function(m) {
+      const devices = m.model_support_devices || [];
+      return devices.length === 0 || devices.includes(dev);
+    });
+  }
+  return list;
 }
 
-async function populateTypeFilter() {
-  try {
-    const resp = await fetch("model_types.json");
-    S().modelTypes = await resp.json();
-  } catch (e) {
-    console.error("加载模型类型列表失败:", e);
-    S().modelTypes = [];
-  }
-
-  var select = document.getElementById("model-type-select");
+async function populateDeviceFilter() {
+  var select = document.getElementById("device-select");
   select.innerHTML = "";
-  S().modelTypes.forEach(function(item) {
+
+  // 从远端模型配置收集机型集合（保持出现顺序去重），保证新机型接入后自动出现
+  const devices = [];
+  (S().modelList || []).forEach(function(m) {
+    (m.model_support_devices || []).forEach(function(d) {
+      if (!devices.includes(d)) devices.push(d);
+    });
+  });
+
+  var optAll = document.createElement("option");
+  optAll.value = "all";
+  optAll.textContent = _t("全部机型");
+  select.appendChild(optAll);
+  devices.forEach(function(d) {
     var opt = document.createElement("option");
-    opt.value = item.type === "全部模型" ? "all" : item.type;
-    opt.textContent = item.type === "全部模型" ? _t("全部模型") : item.type;
+    opt.value = d;
+    opt.textContent = d;
     select.appendChild(opt);
   });
+
+  // 恢复上次选择（localStorage 记住，仅当机型仍存在时有效）
+  var saved = "all";
+  try { saved = localStorage.getItem("adm_device_filter") || "all"; } catch (_) {}
+  if (saved !== "all" && !devices.includes(saved)) saved = "all";
+  select.value = saved;
+  S().currentDeviceFilter = saved;
+
   select.addEventListener("change", function() {
-    S().currentTypeFilter = this.value;
-    updateModelDesc();
+    S().currentDeviceFilter = this.value;
+    try { localStorage.setItem("adm_device_filter", this.value); } catch (_) {}
     renderModelTable();
   });
-  updateModelDesc();
 }
 
 function renderModelTable() {
@@ -580,7 +584,7 @@ function renderModelTable() {
   grid.innerHTML = "";
 
   filteredList.forEach((model) => {
-    const available = isModelAvailable(model.need_ram);
+    const available = isModelAvailable(model);
     const downloaded = isModelDownloaded(model.model_id);
     const isRunning = st.runningModelId === model.model_id;
 
@@ -602,6 +606,9 @@ function renderModelTable() {
     const isDownloadingDiffusion = st.downloadingDiffusion[model.model_id];
     const isDownloadingVae = st.downloadingVae[model.model_id];
     const safeModelId = escapeHtml(model.model_id);
+    const modelFilesAttr = model.model_download_files && model.model_download_files.length > 0
+      ? ' data-model-files="' + escapeHtml(JSON.stringify(model.model_download_files)) + '"'
+      : '';
     let downloadBtnHtml = "";
     if (downloaded) {
       downloadBtnHtml = '';
@@ -614,9 +621,9 @@ function renderModelTable() {
     } else if (downloadingProgress !== undefined) {
       downloadBtnHtml = '<button class="btn btn-download" data-model-id="' + safeModelId + '" disabled>' + downloadingProgress + '%</button>';
     } else if (partSize && partSize > 0) {
-      downloadBtnHtml = '<button class="btn btn-download" data-model-id="' + safeModelId + '" data-model-url="' + escapeHtml(model.model_url) + '" data-model-mmproj="' + escapeHtml(model.model_mmproj || '') + '" data-model-diffusion="' + escapeHtml(model.model_diffusion || '') + '" data-model-vae="' + escapeHtml(model.model_vae || '') + '" data-model-type="' + escapeHtml(model.model_type || '') + '" id="dl-' + safeModelId + '">' + _t("继续下载") + '</button>';
+      downloadBtnHtml = '<button class="btn btn-download" data-model-id="' + safeModelId + '" data-model-url="' + escapeHtml(model.model_url) + '" data-model-mmproj="' + escapeHtml(model.model_mmproj || '') + '" data-model-diffusion="' + escapeHtml(model.model_diffusion || '') + '" data-model-vae="' + escapeHtml(model.model_vae || '') + '" data-model-type="' + escapeHtml(model.model_type || '') + '"' + modelFilesAttr + ' id="dl-' + safeModelId + '">' + _t("继续下载") + '</button>';
     } else if (available) {
-      downloadBtnHtml = '<button class="btn btn-download" data-model-id="' + safeModelId + '" data-model-url="' + escapeHtml(model.model_url) + '" data-model-mmproj="' + escapeHtml(model.model_mmproj || '') + '" data-model-diffusion="' + escapeHtml(model.model_diffusion || '') + '" data-model-vae="' + escapeHtml(model.model_vae || '') + '" data-model-type="' + escapeHtml(model.model_type || '') + '" id="dl-' + safeModelId + '">' + _t("下载") + '</button>';
+      downloadBtnHtml = '<button class="btn btn-download" data-model-id="' + safeModelId + '" data-model-url="' + escapeHtml(model.model_url) + '" data-model-mmproj="' + escapeHtml(model.model_mmproj || '') + '" data-model-diffusion="' + escapeHtml(model.model_diffusion || '') + '" data-model-vae="' + escapeHtml(model.model_vae || '') + '" data-model-type="' + escapeHtml(model.model_type || '') + '"' + modelFilesAttr + ' id="dl-' + safeModelId + '">' + _t("下载") + '</button>';
     } else {
       downloadBtnHtml = '<button class="btn btn-download" disabled>' + _t("下载") + '</button>';
     }
@@ -650,7 +657,7 @@ actionsHtml = '<button class="btn btn-view" id="view-' + safeModelId + '">' + _t
 
     card.innerHTML =
       '<div class="card-header"><span class="model-name" title="' + safeModelId + '">' + escapeHtml(model.model_id) + '</span>' + statusHtml + '</div>' +
-      '<div class="card-meta">' + escapeHtml(model.model_type || '-') + ' · ' + escapeHtml(model.model_size) + ' · ' + _t("需内存 ") + escapeHtml(model.need_ram) + _t(" GB") + '</div>' +
+      '<div class="card-meta">' + escapeHtml(model.model_type || '-') + ' · ' + escapeHtml(model.model_size) + '</div>' +
       featuresHtml +
       '<div class="card-actions">' + downloadBtnHtml + actionsHtml + '</div>' +
       '<div class="card-progress" data-progress-wrap="' + safeModelId + '" style="display:' + (progressVisible ? 'block' : 'none') + ';">' +
@@ -708,6 +715,10 @@ async function handleDownload(btn) {
   const modelDiffusion = btn.dataset.modelDiffusion || null;
   const modelVae = btn.dataset.modelVae || null;
   const modelType = btn.dataset.modelType || '';
+  let modelFiles = null;
+  if (btn.dataset.modelFiles) {
+    try { modelFiles = JSON.parse(btn.dataset.modelFiles); } catch (_) { modelFiles = null; }
+  }
   if (btn) {
     const hasPart = S().partFiles[modelId] && S().partFiles[modelId] > 0;
     btn.textContent = hasPart ? _t("继续下载中...") : "0%";
@@ -715,7 +726,7 @@ async function handleDownload(btn) {
   }
 
   try {
-    await invoke()("download_model", { modelId: modelId, modelUrl: modelUrl, modelMmproj: modelMmproj, modelDiffusion: modelDiffusion, modelVae: modelVae, modelType: modelType });
+    await invoke()("download_model", { modelId: modelId, modelUrl: modelUrl, modelMmproj: modelMmproj, modelDiffusion: modelDiffusion, modelVae: modelVae, modelType: modelType, modelFiles: modelFiles });
     console.log("[model_list] 下载模型 invoke 完成:", modelId);
   } catch (e) {
     console.error("[model_list] 下载失败:", e);
@@ -725,6 +736,72 @@ async function handleDownload(btn) {
       btn.disabled = false;
     }
   }
+}
+
+// Docker 权限修复弹窗
+function showDockerPermissionDialog() {
+  // 移除已有弹窗
+  var existing = document.getElementById("docker-perm-overlay");
+  if (existing) existing.remove();
+
+  var overlay = document.createElement("div");
+  overlay.id = "docker-perm-overlay";
+  overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:9999;display:flex;justify-content:center;align-items:center;";
+  overlay.innerHTML =
+    '<div style="background:var(--c-panel);border:1px solid var(--c-border);border-radius:12px;padding:28px 32px;max-width:440px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.5);text-align:center;">' +
+      '<div style="font-size:36px;margin-bottom:12px;">🔑</div>' +
+      '<div style="font-size:18px;font-weight:600;color:var(--c-text-hi);margin-bottom:12px;">' + _t("Docker 权限不足") + '</div>' +
+      '<div id="docker-perm-msg" style="font-size:14px;color:var(--c-text-2);line-height:1.7;margin-bottom:24px;">' +
+        _t("当前用户不在 docker 组，无法启动模型。点击下方按钮，系统会弹出密码框自动修复权限，修复后需重启 ADM-BE 生效。") +
+      '</div>' +
+      '<div style="display:flex;gap:12px;justify-content:center;">' +
+        '<button id="docker-perm-fix-btn" style="background:var(--c-accent);color:#fff;border:none;padding:10px 28px;border-radius:8px;font-size:14px;font-weight:500;cursor:pointer;">' + _t("一键修复") + '</button>' +
+        '<button id="docker-perm-cancel-btn" style="background:var(--c-overlay);color:var(--c-text);border:none;padding:10px 28px;border-radius:8px;font-size:14px;cursor:pointer;">' + _t("取消") + '</button>' +
+      '</div>' +
+      '<div id="docker-perm-status" style="margin-top:16px;font-size:13px;color:var(--c-text-3);"></div>' +
+    '</div>';
+  document.body.appendChild(overlay);
+
+  overlay.querySelector("#docker-perm-cancel-btn").addEventListener("click", function() { overlay.remove(); });
+  overlay.querySelector("#docker-perm-fix-btn").addEventListener("click", async function() {
+    var statusEl = overlay.querySelector("#docker-perm-status");
+    var fixBtn = overlay.querySelector("#docker-perm-fix-btn");
+    var msgEl = overlay.querySelector("#docker-perm-msg");
+    fixBtn.disabled = true;
+    fixBtn.textContent = _t("修复中...");
+    statusEl.textContent = "";
+    try {
+      var msg = await invoke()("fix_docker_permission");
+      statusEl.style.color = "#4caf50";
+      statusEl.textContent = msg;
+      fixBtn.textContent = _t("已修复，请重启");
+      fixBtn.disabled = false;
+      fixBtn.onclick = function() { overlay.remove(); };
+    } catch (err) {
+      var errStr = String(err);
+      if (errStr.indexOf("PKEXEC_CANCELLED") !== -1) {
+        // 用户取消了密码框
+        statusEl.style.color = "var(--c-text-3)";
+        statusEl.textContent = _t("已取消，可重新点击修复");
+        fixBtn.disabled = false;
+        fixBtn.textContent = _t("一键修复");
+      } else if (errStr.indexOf("FALLBACK_TERMINAL") !== -1) {
+        // pkexec 不可用，切换为终端命令提示
+        var parts = errStr.split("|");
+        var user = parts[1] || "";
+        var cmd = parts.slice(2).join("|");
+        msgEl.innerHTML = _t("系统不支持自动修复，请在终端手动执行以下命令，然后重新登录后重启 ADM-BE：");
+        statusEl.style.color = "var(--c-text-2)";
+        statusEl.innerHTML = '<code style="display:block;background:var(--c-bg-deep);padding:12px 16px;border-radius:6px;font-family:monospace;font-size:13px;text-align:left;white-space:pre-wrap;margin-top:8px;">' + escapeHtml(cmd) + '</code>';
+        fixBtn.style.display = "none";
+      } else {
+        statusEl.style.color = "#f44336";
+        statusEl.textContent = _t("修复失败: ") + err;
+        fixBtn.disabled = false;
+        fixBtn.textContent = _t("一键修复");
+      }
+    }
+  });
 }
 
 async function handleStart(btn) {
@@ -738,18 +815,21 @@ async function handleStart(btn) {
       console.error("[DEBUG] params is undefined! settings keys:", Object.keys(settings));
     }
 
-    const model = S().modelList.find(m => m.model_id === modelId);
-    const supportImages = model ? model.support_images : false;
-    const modelFilename = model ? getUrlFilename(model.model_url) : null;
+    const device = S().currentDeviceFilter && S().currentDeviceFilter !== "all" ? S().currentDeviceFilter : null;
 
     btn.textContent = _t("启动中...");
     btn.disabled = true;
 
-    await invoke()("start_model", { modelId: modelId, params: params, supportImages: supportImages, modelFilename: modelFilename });
+    await invoke()("start_model", { modelId: modelId, params: params, device: device });
     console.log("[model_list] 启动模型 invoke 完成:", modelId);
   } catch (e) {
     console.error("[model_list] 启动失败:", e);
-    showToast(_t("启动失败: ") + e);
+    var errMsg = String(e);
+    if (errMsg.indexOf("DOCKER_PERMISSION_DENIED") !== -1) {
+      showDockerPermissionDialog();
+    } else {
+      showToast(_t("启动失败: ") + e);
+    }
     renderModelTable();
   }
 }
@@ -875,6 +955,18 @@ function handleTauriEvent(type, payload) {
         delete st.downloadingModels[model_id];
         const model = st.modelList.find(m => m.model_id === model_id);
         const local = st.localModels.find(m => m.model_id === model_id);
+        // 新格式（多文件目录模型）：全部完成事件带 all=true，直接把所有文件名写入本地列表
+        if (payload.all && model && model.model_download_files && model.model_download_files.length > 0) {
+          const names = model.model_download_files.map(function(url) { return getUrlFilename(url); }).filter(Boolean);
+          if (local) {
+            names.forEach(function(n) { if (!local.files.includes(n)) local.files.push(n); });
+          } else {
+            st.localModels.push({ model_id: model_id, files: names });
+          }
+          delete st.partFiles[model_id];
+          renderModelTable();
+          break;
+        }
         const mainFile = model ? getUrlFilename(model.model_url) : null;
         if (model && model.model_type === "视觉多模态理解" && model.model_mmproj) {
           if (local && mainFile) {
@@ -912,6 +1004,22 @@ function handleTauriEvent(type, payload) {
       delete st.downloadingModels[model_id];
       showToast(_t("下载失败 [") + model_id + _t("]: ") + error);
       renderModelTable();
+      break;
+    }
+    case "model-pull-progress": {
+      // 推理引擎镜像拉取进度：启动按钮显示百分比 + 卡片进度条；
+      // 进度回跳（超时切源后重新从 0 拉）时提示"正在切换镜像源重试"
+      const startBtn = document.getElementById("start-" + model_id);
+      if (startBtn) {
+        const prev = parseInt(startBtn.dataset.pullPct || "-1", 10);
+        if (prev >= 0 && progress < prev) {
+          startBtn.textContent = _t("切换镜像源重试中...");
+        } else {
+          startBtn.textContent = _t("拉取镜像 ") + progress + "%";
+        }
+        startBtn.dataset.pullPct = progress;
+      }
+      updateProgressBar(model_id, progress);
       break;
     }
     case "model-log": {
@@ -993,14 +1101,14 @@ if (status.running) {
     showToast(_t("获取模型列表失败: ") + e);
   }
 
-  await populateTypeFilter();
+  await populateDeviceFilter();
   renderModelTable();
   console.log("[model_list] init() 完成, 模型数量:", st.modelList.length);
 }
 
 function setupListeners() {
   const L = listen();
-  const events = ["download-progress", "download-complete", "download-error", "model-started", "model-stopped", "model-error"];
+  const events = ["download-progress", "download-complete", "download-error", "model-pull-progress", "model-started", "model-stopped", "model-error"];
   events.forEach(function(ev) {
     try {
       L(ev, function(event) { handleTauriEvent(ev, event.payload); })
@@ -1015,7 +1123,7 @@ export default {
   mount(root) {
     console.log("[model_list] mount()");
     root.innerHTML = template;
-S().currentTypeFilter = "all";
+  S().currentDeviceFilter = "all";
 
     // 禁用页面右键（屏蔽浏览器默认菜单，删除弹窗在根容器内一并覆盖）
     var listRoot = document.getElementById("model-list-root");

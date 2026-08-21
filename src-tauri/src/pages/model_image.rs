@@ -88,10 +88,8 @@ fn get_download_url() -> Result<String, AppError> {
                 Ok("https://adm.tuduoduo.top/sd/sd-vulkan.zip".to_string())
             }
         }
-    } else if cfg!(target_os = "macos") {
-        Ok("https://adm.tuduoduo.top/sd/sd-macos.zip".to_string())
     } else {
-        bail!("不支持的操作系统，当前仅支持 Windows 和 macOS")
+        bail!("不支持的操作系统，当前仅支持 Windows")
     }
 }
 
@@ -421,12 +419,6 @@ pub async fn start_sd_generation(
     dbg_log!("[DEBUG] sd-cli args: {:?}", args);
 
     let mut cmd = platform::create_hidden_command(&sd_cli_path);
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(sd_dir) = config::get_base_dir(Some(&app)).map(|d| d.join("sd")) {
-            cmd.env("DYLD_LIBRARY_PATH", sd_dir.to_string_lossy().to_string());
-        }
-    }
     cmd.current_dir(&sd_dir);
 
     #[cfg(target_os = "windows")]

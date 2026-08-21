@@ -3,10 +3,10 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ADM</title>
+  <title>ADM-BE</title>
   <style>
     /* ===== 主题变量：默认「暗夜紫」，其余主题通过 <html data-theme> 覆盖 =====
-       全部前端视图内联在同一文档中，故 :root 变量对所有视图（含 agent）生效 */
+       全部前端视图内联在同一文档中，故 :root 变量对所有视图生效 */
     :root {
       --c-bg: #1a1a2e;
       --c-bg-deep: #0d1117;
@@ -114,9 +114,7 @@
     }
 
     #home-btn,
-    #settings-btn,
-    #agent-btn,
-    #skills-btn {
+    #settings-btn {
       cursor: pointer;
       font-size: 13px;
       padding: 2px 10px;
@@ -140,25 +138,19 @@
     }
 
     #home-btn:hover,
-    #settings-btn:hover,
-    #agent-btn:hover,
-    #skills-btn:hover {
+    #settings-btn:hover {
       color: var(--c-accent);
     }
 
     #home-btn.active,
-    #settings-btn.active,
-    #agent-btn.active,
-    #skills-btn.active {
+    #settings-btn.active {
       background: rgba(var(--c-accent-rgb), 0.20);
       color: var(--c-text-hi);
       border-radius: 6px;
       border-right-color: transparent;
     }
     #home-btn.active .btn-icon,
-    #settings-btn.active .btn-icon,
-    #agent-btn.active .btn-icon,
-    #skills-btn.active .btn-icon {
+    #settings-btn.active .btn-icon {
       color: var(--c-accent);
     }
 
@@ -233,9 +225,6 @@
     #update-dialog .checking-text { text-align: center; color: var(--c-text-3); font-size: 14px; padding: 20px 0; }
     #update-dialog .checking-text .spinner { display: inline-block; width: 20px; height: 20px; border: 2px solid var(--c-border); border-top-color: var(--c-accent); border-radius: 50%; animation: spin 0.8s linear infinite; margin-right: 8px; vertical-align: middle; }
     @keyframes spin { to { transform: rotate(360deg); } }
-    .llamacpp-progress-bar { width: 100%; height: 6px; background: var(--c-border); border-radius: 3px; margin-top: 12px; overflow: hidden; }
-    .llamacpp-progress-fill { height: 100%; background: var(--c-accent); border-radius: 3px; transition: width 0.3s ease; }
-    .llamacpp-status-text { font-size: 12px; color: var(--c-text-3); margin-top: 6px; text-align: center; }
 
     /* 视图切换 loading 动画（模块加载超时才显示，避免瞬时切换时 spinner 闪烁） */
     .view-loading { flex: 1; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 14px; }
@@ -304,14 +293,6 @@
         <span class="btn-icon">&#9881;</span>
         <span class="btn-text" data-i18n="设置">设置</span>
       </div>
-      <div id="agent-btn" onclick="goAgent()">
-        <span class="btn-icon">&#129302;</span>
-        <span class="btn-text" data-i18n="Agent">Agent</span>
-      </div>
-      <div id="skills-btn" onclick="location.hash='#/skills'">
-        <span class="btn-icon">🧩</span>
-        <span class="btn-text" data-i18n="技能管理">技能管理</span>
-      </div>
       <div id="hw-items">
         <div class="hw-item">
           <span class="hw-label" data-i18n="内存">内存</span>
@@ -369,7 +350,6 @@
 
     let systemInfo = null;
     let hwinfo = { cpu: null, ram: null, gpu: null, os: null };
-    let llamacppIsMandatory = false;
 
     function formatBytes(bytes) {
       if (bytes === 0) return "0 B";
@@ -389,7 +369,7 @@
 
     // ===== 导航激活态 =====
     function setActiveNav(id) {
-      ["home-btn", "settings-btn", "agent-btn", "skills-btn"].forEach(function (b) {
+      ["home-btn", "settings-btn"].forEach(function (b) {
         const el = document.getElementById(b);
         if (el) el.classList.toggle("active", b === id);
       });
@@ -402,7 +382,6 @@
     }
 
     function hideUpdateDialog() {
-      if (llamacppIsMandatory || vcRedistMandatory) return;
       document.getElementById("update-overlay").classList.remove("show");
     }
 
@@ -421,9 +400,6 @@
       }
     }
 
-    let pendingLlamacppResult = null;
-    let vcRedistMandatory = false;
-
     async function checkForUpdate(silent) {
       silent = silent || false;
       try {
@@ -433,7 +409,6 @@
         const result = await invoke("check_update");
 
         if (result.has_update) {
-          pendingLlamacppResult = result;
           const html = `
             <div class="update-icon">📥</div>
             <div class="update-title">${t("发现新版本")}</div>
@@ -444,20 +419,9 @@
             </div>
             <div class="update-buttons">
               <button class="update-btn-primary" onclick="openUrl('${escHtml(result.download_url)}')">${t("下载更新")}</button>
-              <button class="update-btn-secondary" onclick="onSystemUpdateDismiss()">${t("稍后再说")}</button>
+              <button class="update-btn-secondary" onclick="hideUpdateDialog()">${t("稍后再说")}</button>
             </div>`;
           showUpdateDialog(html);
-          return;
-        }
-
-        if (!result.vc_redist_installed) {
-          pendingLlamacppResult = result.llamacpp_needs_update ? result : null;
-          showVcRedistInstallDialog();
-          return;
-        }
-
-        if (result.llamacpp_needs_update) {
-          startLlamacppUpdate(result);
           return;
         }
 
@@ -483,185 +447,6 @@
       }
     }
 
-    function showVcRedistInstallDialog() {
-      vcRedistMandatory = true;
-      const html = `
-        <div class="update-icon">📦</div>
-        <div class="update-title">${t("需要安装 VC++ 运行库")}</div>
-        <div class="update-desc">${t("检测到系统未安装 Visual C++ 2015-2022 运行库，这是运行 llama-server 的必要组件。")}</div>
-        <div class="update-buttons" style="margin-top:16px;">
-          <button class="update-btn-primary" onclick="downloadVcRedist()">${t("下载安装")}</button>
-        </div>`;
-      showUpdateDialog(html);
-    }
-
-    function downloadVcRedist() {
-      openUrl('https://aka.ms/vs/17/release/vc_redist.x64.exe');
-      showUpdateDialog(`
-        <div class="update-icon">📋</div>
-        <div class="update-title">${t("请完成安装")}</div>
-        <div class="update-desc">${t("下载已开始，请运行安装程序完成 VC++ 运行库的安装，安装完成后点击下方按钮继续。")}</div>
-        <div class="update-buttons" style="margin-top:16px;">
-          <button class="update-btn-primary" onclick="onVcRedistInstalled()">${t("安装完成")}</button>
-        </div>`);
-    }
-
-    function onVcRedistInstalled() {
-      vcRedistMandatory = false;
-      hideUpdateDialog();
-      if (pendingLlamacppResult && pendingLlamacppResult.llamacpp_needs_update) {
-        setTimeout(function() { startLlamacppUpdate(pendingLlamacppResult); pendingLlamacppResult = null; }, 300);
-      }
-    }
-
-    function onSystemUpdateDismiss() {
-      hideUpdateDialog();
-      if (pendingLlamacppResult) {
-        const result = pendingLlamacppResult;
-        pendingLlamacppResult = null;
-        setTimeout(function() {
-          if (!result.vc_redist_installed) {
-            pendingLlamacppResult = result.llamacpp_needs_update ? result : null;
-            showVcRedistInstallDialog();
-          } else if (result.llamacpp_needs_update) {
-            startLlamacppUpdate(result);
-          }
-        }, 300);
-      }
-    }
-
-    async function startLlamacppUpdate(result) {
-      const isNotInstalled = !result.llamacpp_local_version || result.llamacpp_local_version === "未安装"; // 未安装: 后端返回固定值，不参与翻译
-      llamacppIsMandatory = isNotInstalled;
-
-      const localVer = escHtml(result.llamacpp_local_version || "未安装"); // 同上
-      const remoteVer = escHtml(result.llamacpp_remote_version || "");
-      const downloadUrl = result.llamacpp_download_url;
-
-      if (!downloadUrl) {
-        showUpdateDialog(`
-          <div class="update-icon">⚠️</div>
-          <div class="update-title">${t("无法获取下载地址")}</div>
-          <div class="update-desc">${t("未检测到支持的 NVIDIA/AMD/Intel 显卡，无法下载对应版本的 llamacpp。")}</div>
-          <div class="update-buttons" style="margin-top:16px;"><button class="update-btn-secondary" onclick="hideUpdateDialog()">${t("关闭")}</button></div>`);
-        return;
-      }
-
-      let buttonsHtml;
-      if (isNotInstalled) {
-        buttonsHtml = `<div class="update-buttons" style="margin-top:16px;"><button class="update-btn-primary" id="llamacpp-start-btn" onclick="doLlamacppDownload()">${t("开始下载")}</button></div>`;
-      } else {
-        buttonsHtml = `<div class="update-buttons" style="margin-top:16px;"><button class="update-btn-primary" id="llamacpp-start-btn" onclick="doLlamacppDownload()">${t("开始下载")}</button><button class="update-btn-secondary" onclick="hideUpdateDialog()">${t("稍后再说")}</button></div>`;
-      }
-
-      const html = `
-        <div class="update-icon">🔧</div>
-        <div class="update-title">${isNotInstalled ? t("需要安装 LLamaCPP") : t("LLamaCPP 需要更新")}</div>
-        <div class="update-desc">${isNotInstalled ? t("首次使用需要安装 LLamaCPP 运行库") : t("检测到 LLamaCPP 运行库需要更新")}</div>
-        <div class="update-info-row">
-          <div class="info-item"><div class="info-label">${t("当前版本")}</div><div class="info-value">${localVer}</div></div>
-          <div class="info-item"><div class="info-label">${t("最新版本")}</div><div class="info-value">${remoteVer}</div></div>
-        </div>
-        <div class="llamacpp-progress-bar"><div class="llamacpp-progress-fill" id="llamacpp-progress-fill" style="width: 0%"></div></div>
-        <div class="llamacpp-status-text" id="llamacpp-status-text">${t("准备下载...")}</div>
-        ${buttonsHtml}`;
-      showUpdateDialog(html);
-
-      pendingLlamacppUrl = downloadUrl;
-      if (isNotInstalled) setTimeout(function() { doLlamacppDownload(); }, 500);
-    }
-
-    let pendingLlamacppUrl = null;
-
-    async function doLlamacppDownload() {
-      var startBtn = document.getElementById("llamacpp-start-btn");
-      if (startBtn) startBtn.style.display = "none";
-      var statusText = document.getElementById("llamacpp-status-text");
-      var progressFill = document.getElementById("llamacpp-progress-fill");
-      if (!pendingLlamacppUrl) {
-        if (statusText) statusText.textContent = t("下载失败: 缺少下载地址");
-        if (startBtn) { startBtn.style.display = ""; startBtn.textContent = t("重试"); }
-        return;
-      }
-      try {
-        await invoke("download_and_extract_llamacpp", { url: pendingLlamacppUrl });
-      } catch (e) {
-        if (statusText) statusText.textContent = t("下载失败: ") + e;
-        if (progressFill) progressFill.style.width = "0%";
-        if (startBtn) { startBtn.style.display = ""; startBtn.textContent = t("重试"); }
-      }
-    }
-
-    function setupLlamacppProgressListener() {
-      if (typeof listen !== "function") return;
-      try {
-        listen("llamacpp-download-progress", function (event) {
-          var payload = event.payload;
-          var statusText = document.getElementById("llamacpp-status-text");
-          var progressFill = document.getElementById("llamacpp-progress-fill");
-          if (payload.status === "downloading") {
-            if (statusText) statusText.textContent = t("正在下载... ") + payload.progress + "%";
-            if (progressFill) progressFill.style.width = payload.progress + "%";
-          } else if (payload.status === "extracting") {
-            if (statusText) statusText.textContent = t("正在解压安装...");
-            if (progressFill) progressFill.style.width = "95%";
-          } else if (payload.status === "done") {
-            if (statusText) statusText.textContent = t("安装完成！");
-            if (progressFill) progressFill.style.width = "100%";
-            llamacppIsMandatory = false;
-            setTimeout(function () { hideUpdateDialog(); }, 1500);
-          }
-        });
-      } catch (_) {}
-    }
-
-    // ===== Agent 入口 =====
-    async function goAgent() {
-      try {
-        const osName = String(await invoke("get_platform_os")).toLowerCase();
-        const supported = osName === "windows" || osName === "macos";
-        if (!supported) { showComingSoon(); return; }
-        if (osName === "macos") {
-          const arch = String(await invoke("get_platform_arch")).toLowerCase();
-          if (arch !== "aarch64" && arch !== "arm64") {
-            showComingSoon(t("当前仅支持 Apple Silicon (M 系列) Mac"));
-            return;
-          }
-        }
-        const running = await invoke("is_model_running");
-        if (!running) {
-          const ok = await showShellConfirm(t("当前未启动本地模型，进入 Agent 后可能无法使用本地模型对话。\n是否继续进入？"));
-          if (!ok) return;
-        }
-        location.hash = "#/agent";
-      } catch (e) {
-        showComingSoon(t("操作失败: ") + e);
-      }
-    }
-
-    // 应用内确认弹窗（Tauri WebView 中原生 confirm() 非阻塞，不可用）
-    function showShellConfirm(message) {
-      return new Promise(function (resolve) {
-        const overlay = document.createElement("div");
-        overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:9999;display:flex;justify-content:center;align-items:center;";
-        overlay.innerHTML =
-          '<div style="background:var(--c-panel);border:1px solid var(--c-border);border-radius:12px;padding:28px 32px;max-width:420px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.5);text-align:center;">' +
-            '<div style="font-size:36px;margin-bottom:12px;">⚠️</div>' +
-            '<div class="sc-msg" style="font-size:14px;color:var(--c-text);line-height:1.7;margin-bottom:20px;white-space:pre-line;"></div>' +
-            '<div style="display:flex;gap:12px;justify-content:center;">' +
-              '<button data-act="cancel" style="background:var(--c-overlay);color:var(--c-text);border:none;padding:10px 28px;border-radius:8px;font-size:14px;cursor:pointer;">' + t("取消") + '</button>' +
-              '<button data-act="ok" style="background:var(--c-accent);color:#fff;border:none;padding:10px 28px;border-radius:8px;font-size:14px;font-weight:500;cursor:pointer;">' + t("确定") + '</button>' +
-            '</div>' +
-          '</div>';
-        overlay.querySelector(".sc-msg").textContent = message;
-        function close(result) { overlay.remove(); resolve(result); }
-        overlay.querySelector('[data-act="cancel"]').addEventListener("click", function () { close(false); });
-        overlay.querySelector('[data-act="ok"]').addEventListener("click", function () { close(true); });
-        overlay.addEventListener("click", function (e) { if (e.target === overlay) close(false); });
-        document.body.appendChild(overlay);
-      });
-    }
-
     function showComingSoon(msg) {
       let tip = document.getElementById("os-tip");
       if (!tip) {
@@ -683,12 +468,7 @@
       checkForUpdate,
     };
     window.hideUpdateDialog = hideUpdateDialog;
-    window.goAgent = goAgent;
     window.openUrl = openUrl;
-    window.onSystemUpdateDismiss = onSystemUpdateDismiss;
-    window.downloadVcRedist = downloadVcRedist;
-    window.onVcRedistInstalled = onVcRedistInstalled;
-    window.doLlamacppDownload = doLlamacppDownload;
 
     // ===== 硬件栏 =====
     function updateHardwareBar() {
@@ -723,8 +503,6 @@
       "/list":     { load: () => import("./views/model_list.js"),     nav: "home-btn" },
       "/image":    { load: () => import("./views/model_image.js"),    nav: "home-btn" },
       "/settings": { load: () => import("./views/settings.js"),       nav: "settings-btn" },
-      "/agent":    { load: () => import("./views/agent.js"),          nav: "agent-btn" },
-      "/skills":   { load: () => import("./views/skills.js"),         nav: "skills-btn" },
     };
 
     let currentView = null;
@@ -756,8 +534,6 @@
         });
       }
 
-      // Agent 页面需提前检查依赖（模型运行/admAgent 存在），入口统一走 goAgent()，
-      // 直接输入 #/agent 的路由也照常加载，由 agent 视图自身做失败处理
       const route = routes[path] || routes["/list"];
       setActiveNav(route.nav);
 
@@ -806,7 +582,6 @@
     async function init() {
       console.log("[index] init() 开始初始化");
       try {
-        setupLlamacppProgressListener();
         systemInfo = await invoke("get_system_info");
         window.__adm_state.systemInfo = systemInfo;
 

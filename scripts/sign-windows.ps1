@@ -3,9 +3,9 @@
 
 $ErrorActionPreference = "Stop"
 
-$AppName = "ADM"
+$AppName = "ADM-BE"
 $ExePath = "src-tauri\target\release\$AppName.exe"
-$CertName = "ADM Self-Signed Cert"
+$CertName = "ADM-BE Self-Signed Cert"
 
 Write-Host "=== Windows 自签名脚本 ===" -ForegroundColor Cyan
 

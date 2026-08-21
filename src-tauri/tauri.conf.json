@@ -1,19 +1,17 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "ADM",
+  "productName": "ADM-BE",
   "version": "0.6.3",
   "identifier": "com.adm.admapp",
   "build": {
-    "frontendDist": "../src",
-    "beforeDevCommand": "node scripts/prepare-agent-binary.mjs",
-    "beforeBuildCommand": "node scripts/prepare-agent-binary.mjs"
+    "frontendDist": "../src"
   },
   "app": {
     "withGlobalTauri": true,
     "windows": [
       {
         "label": "main",
-        "title": "ADM",
+        "title": "ADM-BE",
         "width": 1440,
         "height": 800,
         "center": true,
@@ -31,24 +29,15 @@
     "targets": [
       "nsis"
     ],
+    "category": "Utility",
+    "shortDescription": "ADM-BE - 大模型部署图形化管理工具",
     "resources": [],
-    "externalBin": [
-      "binaries/admAgent"
-    ],
     "icon": [
       "icons/32x32.png",
       "icons/64x64.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
-      "icons/icon.icns",
       "icons/icon.ico"
-    ],
-    "macOS": {
-      "frameworks": [],
-      "minimumSystemVersion": "10.15",
-      "exceptionDomain": "",
-      "entitlements": "entitlements.plist",
-      "signingIdentity": null
-    }
+    ]
   }
 }

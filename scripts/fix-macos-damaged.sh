@@ -3,7 +3,7 @@
 # macOS 15+ "文件已损坏" 快速修复脚本
 # 在用户 Mac 上直接运行
 
-APP_NAME="ADM"
+APP_NAME="ADM-BE"
 APP_PATH="/Applications/$APP_NAME.app"
 
 echo "=== macOS 15+ 应用损坏修复工具 ==="

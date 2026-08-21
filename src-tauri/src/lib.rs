@@ -3,37 +3,23 @@ mod common;
 mod pages;
 
 use app_state::AppState;
-use pages::{agent, index, model_list, model_image, settings, ilink, skills};
+use pages::{index, model_list, model_image, settings};
 
 use tauri::Manager;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
-/// 显示主窗口并带到前台（跨平台）。
-///
-/// macOS 关键点：`set_skip_taskbar(true)` 在 macOS 上会切换到 `Accessory` 激活策略
-/// （隐藏 Dock 图标），之后单纯 `show()` + `set_focus()` 无法把窗口带到前台。
-/// 因此 macOS 上需要先显式恢复 `Regular` 激活策略，再 `show` + `set_focus`。
+/// 显示主窗口并带到前台。
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
-        #[cfg(target_os = "macos")]
-        {
-            // macOS：先恢复 Regular 策略（Dock 图标 + 菜单栏），再显示窗口
-            let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
-            let _ = window.show();
-            let _ = window.set_focus();
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = window.set_skip_taskbar(false);
-            let _ = window.unminimize();
-            let _ = window.show();
-            let _ = window.set_focus();
-        }
+        let _ = window.set_skip_taskbar(false);
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
     }
 }
 
-/// 清理所有子进程（模型 / SD / Agent / admAgent）。
+/// 清理所有子进程（模型 / SD）。
 /// 从原 `on_window_event(CloseRequested)` 提取，供托盘"退出"和正常关闭复用。
 fn cleanup_processes(app: &tauri::AppHandle) {
     let state = app.state::<AppState>();
@@ -42,6 +28,16 @@ fn cleanup_processes(app: &tauri::AppHandle) {
     let pid_opt = state.running_process.lock().ok().and_then(|l| *l);
     if let Some(pid) = pid_opt {
         crate::common::utils::platform::kill_process_tree(pid);
+    }
+    // SGLang Docker 模式：停止并删除容器
+    let container_opt = state.running_container.lock().ok().and_then(|l| l.clone());
+    if let Some(container) = container_opt {
+        let _ = crate::common::utils::platform::docker_cmd()
+            .args(["stop", "-t", "3", &container])
+            .output();
+        let _ = crate::common::utils::platform::docker_cmd()
+            .args(["rm", "-f", &container])
+            .output();
     }
     // 兜底：按进程名清理任何残留的 llama-server / SD 子进程
     #[cfg(target_os = "windows")]
@@ -54,10 +50,6 @@ fn cleanup_processes(app: &tauri::AppHandle) {
         crate::common::utils::platform::kill_process_by_name("llama-server");
         crate::common::utils::platform::kill_process_by_name("sd-cli");
     }
-
-    // 关闭 Agent 会话（只杀本进程拉起的 admAgent server 子进程；复用的共享
-    // server 不杀，由服务端在最后一个工作区被 teardown 时自行退出）
-    agent::kill_agent_session(&state);
 }
 
 
@@ -72,20 +64,17 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_hwinfo::init())
         .manage(AppState::new())
-        .manage(ilink::IlinkManaged::default())
         .setup(|app| {
-            // 调试日志：按持久化设置恢复开关（开启时截断重建 → 每次重启清空上次日志），
-            // 早于任何 admAgent 交互，确保本次会话从头开始记录。
-            agent::init_debug_logging(app.handle());
+            crate::common::utils::logger::init();
 
             // ===== 系统托盘 =====
             let show_item = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
-            let quit_item = MenuItem::with_id(app, "quit", "退出 ADM", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "退出 ADM-BE", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
 
             TrayIconBuilder::with_id("main-tray")
                 .icon(app.default_window_icon().unwrap().clone())
-                .tooltip("ADM")
+                .tooltip("ADM-BE")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id().as_ref() {
@@ -113,12 +102,9 @@ pub fn run() {
                                 // 最小化在任务栏：恢复显示并带到前台
                                 show_main_window(app);
                             } else if window.is_visible().unwrap_or(false) {
-                                // 隐藏到托盘（macOS 不调 set_skip_taskbar，避免 Accessory 策略）
+                                // 隐藏到托盘
                                 let _ = window.hide();
-                                #[cfg(not(target_os = "macos"))]
-                                {
-                                    let _ = window.set_skip_taskbar(true);
-                                }
+                                let _ = window.set_skip_taskbar(true);
                             } else {
                                 show_main_window(app);
                             }
@@ -126,38 +112,20 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
-
-            // iLink 微信 Bot：已绑定且启用时自动恢复桥接（内部等待 admAgent 就绪）
-            ilink::auto_start(app.handle().clone());
-
-            // macOS：清理旧版「运行时下载」模式遗留在 app_data_dir 的 admAgent（新版用安装包内置 sidecar）
-            #[cfg(target_os = "macos")]
-            agent::cleanup_legacy_adm_agent(app.handle());
             Ok(())
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                #[cfg(target_os = "macos")]
-                {
-                    let _api = api; // 标记为未用
-                    // macOS：点击关闭一律退出，不最小化到托盘
-                    // 注意：不需要 api.prevent_close()，正常退出即可
-                    cleanup_processes(window.app_handle());
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    // Windows/Linux：拦截关闭，隐藏到系统托盘（模型继续运行）
-                    api.prevent_close();
-                    let _ = window.hide();
-                    let _ = window.set_skip_taskbar(true);
-                }
+                // Windows/Linux：拦截关闭，隐藏到系统托盘（模型继续运行）
+                api.prevent_close();
+                let _ = window.hide();
+                let _ = window.set_skip_taskbar(true);
             }
         })
         .invoke_handler(tauri::generate_handler![
             // index.rs
             index::get_system_info,
             index::check_update,
-            index::download_and_extract_llamacpp,
             // model_list.rs
             model_list::scan_local_models,
             model_list::scan_part_files,
@@ -166,7 +134,6 @@ pub fn run() {
             model_list::start_model,
             model_list::stop_model,
             model_list::get_model_status,
-            model_list::is_model_running,
             model_list::delete_local_model,
             model_list::get_downloading_models,
             model_list::get_downloading_phases,
@@ -180,62 +147,16 @@ pub fn run() {
             settings::save_settings,
             settings::load_settings,
             settings::get_app_version,
-            settings::get_llamacpp_version,
-            settings::delete_llamacpp,
-            // agent.rs - server mode
-            agent::get_platform_os,
-            agent::get_platform_arch,
-            agent::check_adm_agent,
-            agent::get_adm_agent_version,
-            agent::get_agent_workdir,
-            agent::set_agent_workdir,
-            agent::pick_workdir_folder,
-            agent::get_workdirs,
-            agent::add_workdir,
-            agent::remove_workdir,
-            agent::set_default_workdir,
-            agent::validate_workdirs,
-            agent::add_cloud_provider,
-            agent::list_cloud_providers,
-            agent::update_cloud_provider,
-            agent::delete_cloud_provider,
-            agent::start_agent_server,
-            agent::stop_agent_server,
-            agent::get_agent_server_status,
-            agent::agent_http_request,
-            agent::agent_subscribe_events,
-            agent::create_workspace,
-            agent::switch_workspace,
-            agent::agent_debug_log,
-            agent::set_debug_logging,
-            agent::open_debug_log_dir,
-            agent::read_attachment_file,
-            agent::is_directory,
-            agent::save_attachment_file,
-            agent::read_clipboard_files,
-            agent::read_project_memory,
-            // ilink.rs - 微信 Bot 桥接
-            ilink::start_ilink_login,
-            ilink::cancel_ilink_login,
-            ilink::submit_ilink_verify_code,
-            ilink::get_ilink_status,
-            ilink::start_ilink_bridge,
-            ilink::stop_ilink_bridge,
-            ilink::unbind_ilink,
-            ilink::set_ilink_follow,
-            ilink::set_ilink_current_session,
-            // skills.rs - 技能管理
-            skills::fetch_skill_store,
-            skills::install_skill,
-            skills::install_skill_from_zip,
-            skills::uninstall_skill,
-            skills::list_installed_skills,
+            settings::read_log,
+            settings::list_log_dates,
+            settings::open_log_dir,
+            settings::fix_docker_permission,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
-    // macOS：Cmd+Q / Dock 菜单退出走 RunEvent::ExitRequested（不是 CloseRequested），
-    // 只有在这里才能统一拦截清理子进程，否则 llama-server / admAgent 残留为孤儿
+    // Cmd+Q / 系统退出走 RunEvent::ExitRequested（不是 CloseRequested），
+    // 只有在这里才能统一拦截清理子进程，否则残留为孤儿
     // （端口被占用、下次启动模型报"端口占用"）。cleanup_processes 幂等，重复调用安全。
     app.run(|app_handle, event| {
         if let tauri::RunEvent::ExitRequested { .. } = event {

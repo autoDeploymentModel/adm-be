@@ -1,6 +1,16 @@
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
+/// 创建一个 docker 命令（统一入口，各平台直接用 docker，需用户在 docker 组）。
+pub fn docker_cmd() -> std::process::Command {
+    std::process::Command::new("docker")
+}
+
+/// 创建一个 docker 命令（tokio 版）。
+pub fn docker_cmd_tokio() -> tokio::process::Command {
+    tokio::process::Command::new("docker")
+}
+
 #[cfg(target_os = "windows")]
 pub fn create_hidden_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
     let mut cmd = std::process::Command::new(program);
@@ -122,20 +132,6 @@ pub fn get_gpu_info() -> (u64, u64, bool) {
         }
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(output) = create_hidden_command("system_profiler")
-            .args(["SPDisplaysDataType"])
-            .output()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if stdout.contains("VRAM") || stdout.contains("Metal") || stdout.contains("Chipset") {
-                has_gpu = true;
-                total_vram = sysinfo::System::new().total_memory();
-            }
-        }
-    }
-
     (total_vram, used_vram, has_gpu)
 }
 
@@ -185,21 +181,7 @@ pub fn detect_gpu_vendor() -> Option<String> {
         return None;
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(output) = std::process::Command::new("system_profiler")
-            .args(["SPDisplaysDataType"])
-            .output()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if stdout.contains("Chipset Model") || stdout.contains("Metal") {
-                return Some("apple".to_string());
-            }
-        }
-        None
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(not(target_os = "windows"))]
     {
         None
     }

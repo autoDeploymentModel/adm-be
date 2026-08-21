@@ -1,5 +1,5 @@
 [package]
-name = "adm"
+name = "adm-be"
 version = "0.1.0"
 description = "A Tauri App"
 authors = ["you"]
@@ -32,24 +32,8 @@ sysinfo = "0.33"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "json"] }
 tokio = { version = "1", features = ["full"] }
-# admAgent server 本地传输（Unix socket / Windows named pipe）：reqwest 不支持，
-# 用 hyper 直接对 socket/pipe 发 HTTP/1.1 请求与 SSE 流
-hyper = { version = "1", features = ["full"] }
-hyper-util = { version = "0.1", features = ["full"] }
-http-body-util = "0.1"
-libc = "0.2"
-# hyper-util legacy client 的 Connect 基于 tower-service（hyper 1.9 不再 re-export）
-tower-service = "0.3"
 dirs = "6"
 futures-util = "0.3"
+tar = "0.4"
 zip = "0.6"
 flate2 = "1.0"
-tar = "0.4"
-rand = "0.8"
-qrcode = { version = "0.14", default-features = false, features = ["svg"] }
-wechatbot = "0.4"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-# 读取 NSPasteboard 中的文件路径列表（对应 Windows 的 CF_HDROP）
-objc2-app-kit = { version = "0.3", features = ["NSPasteboard", "NSPasteboardItem"] }
-objc2-foundation = { version = "0.3", features = ["NSArray", "NSString"] }

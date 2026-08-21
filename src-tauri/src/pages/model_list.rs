@@ -37,7 +37,7 @@ pub async fn scan_local_models(app: tauri::AppHandle) -> Result<Vec<LocalModel>,
                         if fp.is_file() {
                             if let Some(name) = fp.file_name() {
                                 let name_str = name.to_string_lossy().to_string();
-                                if !name_str.ends_with(".part") {
+                                if !name_str.ends_with(".part") && name_str != ".done" {
                                     files.push(name_str);
                                 }
                             }
@@ -124,7 +124,7 @@ pub async fn fetch_model_list() -> Result<Vec<RemoteModel>, AppError> {
         .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
 
     let response = client
-        .get("https://adm.tuduoduo.top/model.json")
+        .get("https://adm.tuduoduo.top/b/model.json")
         .send()
         .await
         .map_err(|e| format!("获取模型列表失败: {}", e))?;
@@ -153,6 +153,7 @@ pub async fn download_model(
     model_diffusion: Option<String>,
     model_vae: Option<String>,
     model_type: String,
+    model_files: Option<Vec<String>>,
 ) -> Result<(), AppError> {
     {
         let state = app.state::<AppState>();
@@ -162,11 +163,120 @@ pub async fn download_model(
         }
     }
 
-    let model_url = model_url.replace("https://huggingface.co/", "https://hf-mirror.com/");
-
     let data_dir = config::get_data_dir(Some(&app))?;
     let model_dir = data_dir.join("models").join(&model_id);
     std::fs::create_dir_all(&model_dir).map_err(|e| format!("创建模型目录失败: {}", e))?;
+
+    // ===== 新格式：HF 仓库多文件目录下载（safetensors 模型） =====
+    if let Some(files) = model_files {
+        if !files.is_empty() {
+            let total = files.len();
+            app.state::<AppState>().downloading_progress.lock().unwrap_or_else(|e| e.into_inner()).insert(model_id.clone(), 0u8);
+
+            struct CleanupGuard2 {
+                h: tauri::AppHandle,
+                id: String,
+            }
+            impl Drop for CleanupGuard2 {
+                fn drop(&mut self) {
+                    if let Ok(mut map) = self.h.state::<AppState>().downloading_progress.lock() {
+                        map.remove(&self.id);
+                    }
+                    if let Ok(mut map) = self.h.state::<AppState>().downloading_phase.lock() {
+                        map.remove(&self.id);
+                    }
+                }
+            }
+            let _guard = CleanupGuard2 { h: app.clone(), id: model_id.clone() };
+
+            let download_client = reqwest::Client::builder()
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .build()
+                .map_err(|e| format!("创建下载客户端失败: {}", e))?;
+
+            for (idx, url) in files.iter().enumerate() {
+                let url = url.replace("https://huggingface.co/", "https://hf-mirror.com/");
+                let filename = url
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&model_id)
+                    .to_string();
+                let final_path = model_dir.join(&filename);
+                let part_path = model_dir.join(format!("{}.part", filename));
+
+                // 已下载完成的文件直接跳过（断点续传）
+                let need_download = if final_path.exists() {
+                    // 无 .part 残留即视为完整
+                    !part_path.exists()
+                } else {
+                    true
+                };
+                if !need_download {
+                    app.emit(
+                        "download-progress",
+                        serde_json::json!({
+                            "model_id": &model_id,
+                            "progress": ((idx + 1) as f32 * 100.0 / total as f32) as u8,
+                            "file": &filename,
+                            "type": "model",
+                        }),
+                    ).ok();
+                    continue;
+                }
+
+                app.state::<AppState>().downloading_phase.lock().unwrap_or_else(|e| e.into_inner()).insert(model_id.clone(), filename.clone());
+                app.emit(
+                    "download-progress",
+                    serde_json::json!({
+                        "model_id": &model_id,
+                        "progress": (idx as f32 * 100.0 / total as f32) as u8,
+                        "downloaded": 0u64,
+                        "total": 0u64,
+                        "file": &filename,
+                        "type": "model",
+                    }),
+                ).ok();
+
+                let app_clone = app.clone();
+                let mid = model_id.clone();
+                let fname = filename.clone();
+                let idx_f = idx;
+                let total_f = total;
+                download_with_resume(
+                    &download_client, &url, &final_path, &part_path,
+                    |progress, _downloaded, _total| {
+                        // 总进度 = 已完成文件 + 当前文件进度折算
+                        let overall = ((idx_f as f32 + progress as f32 / 100.0) * 100.0 / total_f as f32) as u8;
+                        app_clone.emit(
+                            "download-progress",
+                            serde_json::json!({
+                                "model_id": &mid,
+                                "progress": overall,
+                                "file": &fname,
+                                "type": "model",
+                            }),
+                        ).ok();
+                        if let Ok(mut map) = app_clone.state::<AppState>().downloading_progress.lock() {
+                            map.insert(mid.clone(), overall);
+                        }
+                    },
+                ).await?;
+                // 单个文件完成不单独发 download-complete（前端收到会清空 downloading
+                // 状态导致按钮闪变），进度折算继续由 download-progress 驱动，
+                // 全部完成时集中发一次带 all=true 的完成事件。
+            }
+
+            // 全部文件下载完成：写 .done 标记（scan_local_models 排除）
+            std::fs::write(model_dir.join(".done"), "").ok();
+            app.emit(
+                "download-complete",
+                serde_json::json!({ "model_id": &model_id, "type": "model", "all": true }),
+            ).ok();
+            return Ok(());
+        }
+    }
+
+    let model_url = model_url.replace("https://huggingface.co/", "https://hf-mirror.com/");
 
     let model_filename = model_url
         .rsplit('/')
@@ -321,217 +431,549 @@ async fn download_extra_file(
     Ok(())
 }
 
-#[tauri::command]
-pub async fn start_model(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    model_id: String,
-    params: LaunchParams,
-    support_images: bool,
-    model_filename: Option<String>,
-) -> Result<(), AppError> {
-    {
-        let pid_lock = state.running_process.lock().map_err(|e| e.to_string())?;
-        if pid_lock.is_some() {
-            bail!("已有模型在运行中，请先停止当前模型");
-        }
-    }
-
-    let server_path = config::get_llama_server_path(Some(&app))?;
-    let data_dir = config::get_data_dir(Some(&app))?;
-    let models_dir = data_dir.join("models");
-    let model_path = if let Some(fname) = &model_filename {
-        let subfolder_path = models_dir.join(&model_id).join(fname);
-        if subfolder_path.exists() {
-            subfolder_path
-        } else {
-            return Err(AppError::msg(format!("模型文件不存在: {:?}", subfolder_path)));
-        }
-    } else {
-        let subfolder_path = models_dir.join(&model_id).join(format!("{}.gguf", model_id));
-        let root_path = models_dir.join(format!("{}.gguf", model_id));
-        if subfolder_path.exists() {
-            subfolder_path
-        } else if root_path.exists() {
-            root_path
-        } else {
-            return Err(AppError::msg(format!("模型文件不存在: {:?}", subfolder_path)));
-        }
-    };
-
-    let mut args: Vec<String> = vec![
-        "-m".to_string(),
-        model_path.to_string_lossy().to_string(),
-    ];
-
-    // 诊断日志：打印接收到的参数
-    app.emit(
-        "model-log",
-        serde_json::json!({
-            "model_id": &model_id,
-            "line": format!("[DEBUG] model_filename: {:?}", model_filename),
-            "source": "stdout",
-        }),
-    )
-    .ok();
-    app.emit(
-        "model-log",
-        serde_json::json!({
-            "model_id": &model_id,
-            "line": format!("[DEBUG] params: ctx={:?} port={:?}", params.ctx_size, params.port),
-            "source": "stdout",
-        }),
-    )
-    .ok();
-
-    // 视觉多模态：仅当模型声明支持图片且 mmproj 文件实际存在时才启用（同步记录到 AppState 供 Agent 配置使用）
-    let mut vision_enabled = false;
-    if support_images {
-        let model_dir = model_path.parent().unwrap();
-        let mut mmproj_path: Option<std::path::PathBuf> = None;
-        if let Ok(entries) = std::fs::read_dir(model_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    if let Some(name) = path.file_name() {
-                        let name_str = name.to_string_lossy();
-                        if name_str.starts_with("mmproj") && name_str.ends_with(".gguf") {
-                            mmproj_path = Some(path);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(mp) = mmproj_path {
-            args.extend(["--mmproj".to_string(), mp.to_string_lossy().to_string()]);
-            vision_enabled = true;
-        }
-    }
-    *state.model_supports_images.lock().unwrap_or_else(|e| e.into_inner()) = vision_enabled;
-
-    // 推理能力：UI 已不再暴露推理开关，按 llama-server 默认 auto 行为处理
-    // （llama-server 按模型格式自动启用，能出推理内容即具备该能力）
-    // 同步记录到 AppState 供 Agent 配置（admAgent.json 的 can_reason）使用。
-    *state
-        .model_supports_reasoning
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = true;
-
-    // 上下文大小（UI 唯一允许调整的参数），0 = 不传，使用模型自带上下文
-    if let Some(ctx) = params.ctx_size {
-        if ctx > 0 {
-            args.extend(["-c".to_string(), ctx.to_string()]);
-        }
-    }
-
-    // MTP (Multi-Token Prediction) auto-detection
-    if model_id.to_lowercase().contains("mtp") {
-        args.extend(["--spec-draft-n-max".to_string(), "2".to_string()]);
-        args.extend(["--spec-type".to_string(), "draft-mtp".to_string()]);
+/// Docker 环境预检：CLI 存在 → daemon 运行 → NVIDIA runtime 可用 → 镜像存在（缺失自动拉取，
+/// 拉取失败自动回退国内镜像源前缀）。成功返回**实际可用的镜像名**（可能是镜像源前缀版本，
+/// 后续 docker run 必须用它）；任一环节失败返回错误原因，前端以 toast / model-log 展示。
+async fn check_docker_env(
+    app: &tauri::AppHandle,
+    model_id: &str,
+    image: &str,
+) -> Result<String, AppError> {
+    let log = |line: String| {
         app.emit(
             "model-log",
             serde_json::json!({
-                "model_id": &model_id,
-                "line": "[DEBUG] MTP auto-detection: triggered (model_id contains 'MTP')",
+                "model_id": model_id,
+                "line": line,
                 "source": "stdout",
             }),
         )
         .ok();
+    };
+
+    // 1. docker CLI 是否存在
+    let cli = crate::common::utils::platform::docker_cmd_tokio()
+        .arg("--version")
+        .output()
+        .await;
+    match cli {
+        Ok(out) if out.status.success() => {
+            log(format!("[Docker] CLI 可用: {}", String::from_utf8_lossy(&out.stdout).trim()));
+        }
+        _ => {
+            return Err(AppError::msg(
+                "未检测到 Docker CLI，请先安装 Docker（如 sudo apt install docker.io 或 docker-ce）".to_string(),
+            ));
+        }
     }
 
-    // 监听端口
+    // 2. docker daemon 是否运行 + 权限检测
+    let info = crate::common::utils::platform::docker_cmd_tokio()
+        .args(["info"])
+        .output()
+        .await
+        .map_err(|e| AppError::msg(format!("docker info 执行失败: {}", e)))?;
+    if !info.status.success() {
+        let stderr = String::from_utf8_lossy(&info.stderr).to_string();
+        // 权限不足：stderr 含 "permission denied" 或 "Cannot connect to the Docker daemon"
+        if stderr.contains("permission denied") || stderr.contains("access denied") {
+            return Err(AppError::msg(
+                "DOCKER_PERMISSION_DENIED".to_string(),
+            ));
+        }
+        return Err(AppError::msg(
+            "Docker daemon 未运行或不可访问，请先启动 Docker 服务（systemd: sudo systemctl start docker；桌面版: 打开 Docker Desktop）".to_string(),
+        ));
+    }
+    let info_text = String::from_utf8_lossy(&info.stdout).to_string();
+    // GPU 直通检测：传统 nvidia runtime（daemon.json 配置）或 CDI 模式（/etc/cdi 挂载）任一存在即视为可用
+    let has_nvidia_runtime = info_text.contains("nvidia");
+    let has_cdi = info_text.contains("CDI");
+    log(format!(
+        "[Docker] daemon 运行正常; NVIDIA runtime: {}; CDI: {}",
+        if has_nvidia_runtime { "可用" } else { "未配置" },
+        if has_cdi { "可用" } else { "未配置" }
+    ));
+
+    // 3. 镜像检查；已存在则直接可用
+    let inspect = crate::common::utils::platform::docker_cmd_tokio()
+        .args(["image", "inspect", image])
+        .output()
+        .await
+        .map_err(|e| AppError::msg(format!("docker image inspect 执行失败: {}", e)))?;
+    if inspect.status.success() {
+        log(format!("[Docker] 镜像 {} 已存在", image));
+        return Ok(image.to_string());
+    }
+
+    // 4. 镜像不存在 → 拉取。直接拉；失败依次回退国内镜像源前缀。
+    //    仅当镜像名第一段含 "." 或 ":"（如 ghcr.io/...、docker.1ms.run/...）才视为
+    //    已带 registry 域名，不再套前缀；`org/repo:tag` 两段式默认名不算。
+    let has_registry_prefix = image
+        .split('/')
+        .next()
+        .map(|first| first.contains('.') || first.contains(':'))
+        .unwrap_or(false);
+    let mut attempts: Vec<String> = vec![image.to_string()];
+    if !has_registry_prefix {
+        for mirror in ["docker.1ms.run", "docker.m.daocloud.io", "docker.xuanyuan.me", "hub.rat.dev"] {
+            attempts.push(format!("{}/{}", mirror, image));
+        }
+    }
+
+    for (idx, candidate) in attempts.iter().enumerate() {
+        let label = if idx == 0 { "直接拉取" } else { &format!("镜像源 {}", attempts[idx].split('/').next().unwrap_or("")) };
+        log(format!(
+            "[Docker] 镜像 {} 不存在（{}），开始{}（首次可能需数分钟）...",
+            image, candidate, label
+        ));
+        // 单源超时熔断：PULL_TIMEOUT 内未完成（卡住/无数据/超慢）则 kill 该 pull 进程，自动切换下一个源
+        match pull_image(app, model_id, candidate, PULL_TIMEOUT).await {
+            Ok(true) => {
+                log(format!("[Docker] 镜像 {} 拉取完成，后续将使用 {}", candidate, candidate));
+                return Ok(candidate.clone());
+            }
+            Ok(false) => {
+                log(format!("[Docker] {} 失败，尝试下一个来源...", label));
+            }
+            Err(e) => {
+                log(format!("[Docker] {} 中止: {}，尝试下一个来源...", label, e));
+            }
+        }
+    }
+
+    Err(AppError::msg(format!(
+        "镜像拉取失败（已尝试 Docker Hub 与多个国内镜像源，单源最长等待 {} 分钟）：{}\n请检查网络后手动执行: docker pull {}；\n或配置镜像加速器：在 /etc/docker/daemon.json 添加 registry-mirrors 后 sudo systemctl restart docker",
+        PULL_TIMEOUT.as_secs() / 60,
+        image,
+        image
+    )))
+}
+
+/// 单源镜像拉取超时上限（8 分钟）：超时视为该源不可用，强制终止进程并切换下一来源。
+const PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8 * 60);
+
+/// 拉取单个镜像：stdout/stderr 逐行转发到 model-log，进度按 `\r` 段解析后发
+/// `model-pull-progress` 事件（{ model_id, image, progress } 0-100）；成功返回 true，
+/// 超时返回 Err（内部已 kill 子进程）。
+async fn pull_image(
+    app: &tauri::AppHandle,
+    model_id: &str,
+    image: &str,
+    timeout: std::time::Duration,
+) -> Result<bool, AppError> {
+    let mut child = crate::common::utils::platform::docker_cmd_tokio()
+        .args(["pull", image])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| AppError::msg(format!("docker pull 启动失败: {}", e)))?;
+
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let emit_progress = |p: u8| {
+        app.emit(
+            "model-pull-progress",
+            serde_json::json!({
+                "model_id": model_id,
+                "image": image,
+                "progress": p,
+            }),
+        )
+        .ok();
+    };
+    emit_progress(0);
+
+    let app_c = app.clone();
+    let mid = model_id.to_string();
+    let img = image.to_string();
+
+    // stdout：逐段读取 docker pull 进度（每段以 \r 结束），解析百分比并转发日志
+    if let Some(stdout) = child.stdout.take() {
+        let mut reader = BufReader::new(stdout);
+        let app_c2 = app_c.clone();
+        let mid2 = mid.clone();
+        let img2 = img.clone();
+        tokio::spawn(async move {
+            let mut buf = Vec::with_capacity(512);
+            let mut last_pct: i32 = -1;
+            loop {
+                buf.clear();
+                match reader.read_until(b'\r', &mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let raw = String::from_utf8_lossy(&buf).into_owned();
+                        let trimmed = raw.trim();
+                        if !trimmed.is_empty() {
+                            app_c2
+                                .emit(
+                                    "model-log",
+                                    serde_json::json!({
+                                        "model_id": &mid2,
+                                        "line": format!("[docker pull] {}", trimmed),
+                                        "source": "stdout",
+                                    }),
+                                )
+                                .ok();
+                            // 解析 "Downloading [========>]  123.4MB/512.3MB" 形式进度
+                            if let Some(pct) = parse_pull_percent(&raw) {
+                                let pct_i = pct as i32;
+                                if pct_i != last_pct {
+                                    last_pct = pct_i;
+                                    app_c2
+                                        .emit(
+                                            "model-pull-progress",
+                                            serde_json::json!({
+                                                "model_id": &mid2,
+                                                "image": &img2,
+                                                "progress": pct_i,
+                                            }),
+                                        )
+                                        .ok();
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // stderr：逐行转发（拉取报错多走这里）
+    if let Some(stderr) = child.stderr.take() {
+        let mut reader = BufReader::new(stderr).lines();
+        let app_c3 = app_c.clone();
+        let mid3 = mid.clone();
+        tokio::spawn(async move {
+            while let Ok(Some(line)) = reader.next_line().await {
+                let t = line.trim();
+                if !t.is_empty() {
+                    app_c3
+                        .emit(
+                            "model-log",
+                            serde_json::json!({
+                                "model_id": &mid3,
+                                "line": format!("[docker pull] {}", t),
+                                "source": "stderr",
+                            }),
+                        )
+                        .ok();
+                }
+            }
+        });
+    }
+
+    // 超时熔断：timeout 内未完成则 kill 子进程（docker pull 卡住/无数据/超慢时强制终止），
+    // 由调用方（check_docker_env 多源回退循环）切换到下一个来源
+    tokio::select! {
+        status = child.wait() => {
+            let status = status.map_err(|e| AppError::msg(format!("docker pull 等待失败: {}", e)))?;
+            let ok = status.success();
+            emit_progress(if ok { 100 } else { 0 });
+            Ok(ok)
+        }
+        _ = tokio::time::sleep(timeout) => {
+            // 终止 pull 进程（kill 整棵进程树，含 docker CLI 派生的下载子进程）
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            emit_progress(0);
+            Err(AppError::msg(format!(
+                "镜像拉取超时（超过 {} 分钟无进展）",
+                timeout.as_secs() / 60
+            )))
+        }
+    }
+}
+
+/// 解析 docker pull 进度行中的下载百分比。
+/// 支持 `123.4MB/512.3MB`、`45KB/2.3MB(KB/MB/GB)` 形式（单位必须一致才计算，
+/// 不一致时返回 0，避免误跳进度）。
+fn parse_pull_percent(raw: &str) -> Option<u8> {
+    let line = raw.replace('\r', "").replace('\n', "");
+    let slash = line.find('/')?;
+    let before = &line[..slash];
+    let after = &line[slash + 1..];
+
+    let parse_amt = |s: &str| -> Option<(f64, u32)> {
+        let s = s.trim();
+        if s.is_empty() {
+            return None;
+        }
+        let mut num_end = 0;
+        for (i, c) in s.char_indices() {
+            if c.is_ascii_digit() || c == '.' {
+                num_end = i + c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if num_end == 0 {
+            return None;
+        }
+        let num: f64 = s[..num_end].parse().ok()?;
+        let rest = s[num_end..].trim();
+        // 单位：KB/MB/GB/TB（取首字母大写，按指数换算）
+        let unit = rest.chars().next()?;
+        let exp = match unit.to_ascii_uppercase() {
+            'K' => 1u32,
+            'M' => 2u32,
+            'G' => 3u32,
+            'T' => 4u32,
+            _ => return None,
+        };
+        Some((num, exp))
+    };
+
+    // 取 "/" 前最后一个数字段，"/" 后第一个数字段
+    let bf = before.split_whitespace().last()?;
+    let (num_b, exp_b) = parse_amt(bf)?;
+    let (num_a, exp_a) = parse_amt(after)?;
+    if exp_a != exp_b || num_a <= 0.0 {
+        return Some(0);
+    }
+    let pct = ((num_b / num_a) * 100.0).round() as u8;
+    Some(pct.min(99))
+}
+
+/// SGLang Docker 启动（Ubuntu / DGX Spark 等机型）。
+/// 模型目录以只读方式挂载进容器，容器前台运行（生命周期 = docker run 进程），
+/// 就绪信号：stdout 出现 "Uvicorn running on"（SGLang 启动完成）。
+async fn start_sglang_docker(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, AppState>,
+    model_id: &str,
+    model_dir: &std::path::Path,
+    params: LaunchParams,
+    device: Option<String>,
+) -> Result<(), AppError> {
+    const CONTAINER_PREFIX: &str = "adm-sglang-";
+    let container_name = format!("{}{}", CONTAINER_PREFIX, model_id);
+
+    // 加载设置中的 SGLang 详细参数配置
+    let settings_path = config::get_data_dir(Some(app))?.join("config.json");
+    let mut sglang_args = SglangArgs::default();
+    if let Ok(json) = std::fs::read_to_string(&settings_path) {
+        if let Ok(parsed) = serde_json::from_str::<Settings>(&json) {
+            sglang_args = parsed.sglang_args;
+        }
+    }
+
+    // 机型 → 启动配置（后续按机型扩展）；镜像/内存以设置页配置为准（缺省按机型兜底）
+    let default_image = match device.as_deref() {
+        Some("dgx-spark-128G") => "lmsysorg/sglang:v0.5.17",
+        _ => "lmsysorg/sglang:v0.5.17",
+    };
+    let default_shm = match device.as_deref() {
+        Some("dgx-spark-128G") => "64g",
+        _ => "32g",
+    };
+    let image = if sglang_args.image.is_empty() { default_image.to_string() } else { sglang_args.image.clone() };
+    let shm_size = if sglang_args.shm_size.is_empty() { default_shm.to_string() } else { sglang_args.shm_size.clone() };
+
+    // ===== 启动前 Docker 环境预检（CLI / daemon / GPU runtime / 镜像）=====
+    // 返回实际可用镜像名（可能是国内镜像源前缀版本），后续 docker run 必须用它
+    let image = check_docker_env(app, model_id, &image).await?;
+
     let port: u16 = params.port.unwrap_or(5678);
-    args.extend(["--port".to_string(), port.to_string()]);
+    // Docker 容器内必须监听 0.0.0.0 才能经 -p 端口映射对外服务；设置页 host 不适用容器内
+    let host = "0.0.0.0".to_string();
 
-    // 监听地址（默认 127.0.0.1 仅本地）
-    let host = params.host.clone().unwrap_or_else(|| "127.0.0.1".to_string());
-    args.extend(["--host".to_string(), host]);
+    // 端口占用检查：镜像就绪后、容器启动前，先确认宿主机端口可 bind（避免启动即端口冲突退出）
+    {
+        let probe = std::net::TcpListener::bind(("0.0.0.0", port));
+        if probe.is_err() {
+            bail!(
+                "端口 {} 已被占用，请先关闭占用该端口的进程，或在设置页更换监听端口",
+                port
+            );
+        }
+    }
 
-    args.push("--verbose".to_string());
+    // 清理同名残留容器
+    let _ = crate::common::utils::platform::docker_cmd()
+        .args(["rm", "-f", &container_name])
+        .output();
 
-    dbg_log!("[DEBUG] llama-server args: {:?}", args);
+    let mount_src = model_dir.to_string_lossy().to_string();
+    let mount_dst = format!("/models/{}", model_id);
+
+    let mut args: Vec<String> = vec![
+        "run".to_string(),
+        "--name".to_string(),
+        container_name.clone(),
+        "--gpus".to_string(),
+        "all".to_string(),
+        "--shm-size".to_string(),
+        shm_size,
+        "--cap-add".to_string(),
+        "SYS_NICE".to_string(),
+        "--ipc".to_string(),
+        "host".to_string(),
+        "-p".to_string(),
+        format!("{}:{}", port, port),
+        "-v".to_string(),
+        format!("{}:{}:ro", mount_src, mount_dst),
+        image,
+        "python3".to_string(),
+        "-m".to_string(),
+        "sglang.launch_server".to_string(),
+        "--model-path".to_string(),
+        mount_dst,
+        "--host".to_string(),
+        host,
+        "--port".to_string(),
+        port.to_string(),
+    ];
+
+    // ===== 设置页 SGLang 详细参数（仅非空/非默认值才追加） =====
+    // 上下文大小：设置页 ctx_size 优先，其次 sglang_args.context_length
+    let mut ctx: i64 = params.ctx_size.unwrap_or(0) as i64;
+    if ctx <= 0 { ctx = sglang_args.context_length; }
+    if ctx > 0 {
+        args.extend(["--context-length".to_string(), ctx.to_string()]);
+    }
+    if sglang_args.tensor_parallel_size > 1 {
+        args.extend(["--tensor-parallel-size".to_string(), sglang_args.tensor_parallel_size.to_string()]);
+    }
+    if sglang_args.mem_fraction_static > 0.0 {
+        args.extend(["--mem-fraction-static".to_string(), format!("{}", sglang_args.mem_fraction_static)]);
+    }
+    if !sglang_args.dtype.is_empty() {
+        args.extend(["--dtype".to_string(), sglang_args.dtype.clone()]);
+    }
+    if !sglang_args.quantization.is_empty() {
+        args.extend(["--quantization".to_string(), sglang_args.quantization.clone()]);
+    }
+    if !sglang_args.kv_cache_dtype.is_empty() {
+        args.extend(["--kv-cache-dtype".to_string(), sglang_args.kv_cache_dtype.clone()]);
+    }
+    if !sglang_args.schedule_policy.is_empty() {
+        args.extend(["--schedule-policy".to_string(), sglang_args.schedule_policy.clone()]);
+    }
+    if sglang_args.max_running_requests > 0 {
+        args.extend(["--max-running-requests".to_string(), sglang_args.max_running_requests.to_string()]);
+    }
+    if sglang_args.max_queued_requests > 0 {
+        args.extend(["--max-queued-requests".to_string(), sglang_args.max_queued_requests.to_string()]);
+    }
+    if sglang_args.chunked_prefill_size != 0 {
+        args.extend(["--chunked-prefill-size".to_string(), sglang_args.chunked_prefill_size.to_string()]);
+    }
+    if !sglang_args.log_level.is_empty() && sglang_args.log_level != "info" {
+        args.extend(["--log-level".to_string(), sglang_args.log_level.clone()]);
+    }
+    if sglang_args.log_requests {
+        args.push("--log-requests".to_string());
+    }
+    if sglang_args.enable_metrics {
+        args.push("--enable-metrics".to_string());
+    }
+    if !sglang_args.reasoning_parser.is_empty() {
+        args.extend(["--reasoning-parser".to_string(), sglang_args.reasoning_parser.clone()]);
+    }
+    if !sglang_args.tool_call_parser.is_empty() {
+        args.extend(["--tool-call-parser".to_string(), sglang_args.tool_call_parser.clone()]);
+    }
+    // 额外参数：每行一个 key=value，拼成 --key value
+    for line in sglang_args.extra_args.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        if let Some((k, v)) = line.split_once('=') {
+            let k = k.trim().trim_start_matches("--");
+            let v = v.trim();
+            if !k.is_empty() && !v.is_empty() {
+                args.push(format!("--{}", k));
+                args.push(v.to_string());
+            }
+        }
+    }
+
+    // ===== MTP（Multi-Token Prediction）自动启用 =====
+    // 模型目录含 MTP 权重（如 model_mtp.safetensors）时自动启用 NEXTN 投机解码
+    // （SGLang 中 NEXTN 是 EAGLE 的别名；MTP 权重与主模型同目录，SGLang 自动加载，
+    // 无需 --speculative-draft-model-path。参考 DeepSeek-V3.2 官方用法：
+    // --speculative-algorithm EAGLE --speculative-num-steps 3
+    // --speculative-eagle-topk 1 --speculative-num-draft-tokens 4）
+    // 用户已在额外参数里自定义 speculative 相关参数时跳过（尊重覆盖，
+    // 也可用 --speculative-algorithm NONE 显式关闭）。
+    let has_mtp_weight = {
+        let mut found = false;
+        if let Ok(entries) = std::fs::read_dir(model_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_lowercase();
+                if name.contains("mtp") && (name.ends_with(".safetensors") || name.ends_with(".bin")) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        found
+    };
+    let user_specified_spec = sglang_args.extra_args.lines().any(|l| {
+        let t = l.trim();
+        t.starts_with("--speculative-algorithm") || t.starts_with("speculative-algorithm")
+    });
+    if has_mtp_weight && !user_specified_spec {
+        args.extend([
+            "--speculative-algorithm".to_string(),
+            "EAGLE".to_string(),
+            "--speculative-num-steps".to_string(),
+            "3".to_string(),
+            "--speculative-eagle-topk".to_string(),
+            "1".to_string(),
+            "--speculative-num-draft-tokens".to_string(),
+            "4".to_string(),
+        ]);
+        app.emit(
+            "model-log",
+            serde_json::json!({
+                "model_id": model_id,
+                "line": "[MTP] 检测到 MTP 权重，已自动启用 EAGLE 投机解码（num-steps=3, eagle-topk=1, num-draft-tokens=4）；如需调整或关闭，请在设置页「额外参数」填写 speculative-algorithm=...",
+                "source": "stdout",
+            }),
+        )
+        .ok();
+        crate::common::utils::logger::write_log("INFO", "MODEL", &format!("[{}] MTP 权重检测到，已启用 EAGLE 投机解码", model_id));
+    }
+
+    dbg_log!("[DEBUG] sglang docker args: {:?}", args);
 
     app.emit(
         "model-log",
         serde_json::json!({
-            "model_id": &model_id,
-            "line": format!("启动参数: {:?}", args),
+            "model_id": model_id,
+            "line": format!("[DEBUG] full command: docker {:?}", args),
             "source": "stdout",
         }),
     )
     .ok();
 
-    let mut cmd = crate::common::utils::platform::create_hidden_command(&server_path);
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(llamacpp_dir) = config::get_llamacpp_dir(Some(&app)) {
-            // 同时设置 DYLD_LIBRARY_PATH 和 current_dir：
-            // - DYLD_LIBRARY_PATH 用于查找动态库（旧版 macOS）
-            // - current_dir 作为备用，防止 SIP 删除 DYLD_LIBRARY_PATH（macOS 14+）
-            cmd.env("DYLD_LIBRARY_PATH", llamacpp_dir.to_string_lossy().to_string());
-            cmd.current_dir(&llamacpp_dir);
-            app.emit(
-                "model-log",
-                serde_json::json!({
-                    "model_id": &model_id,
-                    "line": format!("[DEBUG] macOS env: DYLD_LIBRARY_PATH={}, current_dir={}", llamacpp_dir.to_string_lossy(), llamacpp_dir.to_string_lossy()),
-                    "source": "stdout",
-                }),
-            ).ok();
-        }
-    }
-
-    app.emit(
-        "model-log",
-        serde_json::json!({
-            "model_id": &model_id,
-            "line": format!("[DEBUG] server_path: {}", server_path.to_string_lossy()),
-            "source": "stdout",
-        }),
-    ).ok();
-    app.emit(
-        "model-log",
-        serde_json::json!({
-            "model_id": &model_id,
-            "line": format!("[DEBUG] full command: {} {:?}", server_path.to_string_lossy(), args),
-            "source": "stdout",
-        }),
-    ).ok();
-
     #[cfg(target_os = "windows")]
-    let mut child = cmd
+    let mut child = crate::common::utils::platform::docker_cmd()
         .args(&args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| {
-            let msg = format!("启动 llama-server 失败: {} | path: {} | args: {:?}", e, server_path.to_string_lossy(), args);
-            app.emit(
-                "model-log",
-                serde_json::json!({
-                    "model_id": &model_id,
-                    "line": format!("[ERROR] spawn failed: {}", msg),
-                    "source": "stderr",
-                }),
-            ).ok();
+            let msg = format!("启动推理引擎容器失败: {}", e);
+            app.emit("model-log", serde_json::json!({
+                "model_id": model_id, "line": format!("[ERROR] {}", msg), "source": "stderr",
+            })).ok();
             msg
         })?;
 
     #[cfg(not(target_os = "windows"))]
-    let mut child = crate::common::utils::platform::spawn_detached(cmd.args(&args).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()))
-        .map_err(|e| {
-            let msg = format!("启动 llama-server 失败: {} | path: {} | args: {:?}", e, server_path.to_string_lossy(), args);
-            app.emit(
-                "model-log",
-                serde_json::json!({
-                    "model_id": &model_id,
-                    "line": format!("[ERROR] spawn failed: {}", msg),
-                    "source": "stderr",
-                }),
-            ).ok();
-            msg
-        })?;
+    let mut child = crate::common::utils::platform::spawn_detached(
+        crate::common::utils::platform::docker_cmd().args(&args).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()),
+    )
+    .map_err(|e| {
+        let msg = format!("启动推理引擎容器失败: {}", e);
+        app.emit("model-log", serde_json::json!({
+            "model_id": model_id, "line": format!("[ERROR] {}", msg), "source": "stderr",
+        })).ok();
+        msg
+    })?;
 
     let pid = child.id();
 
@@ -541,68 +983,53 @@ pub async fn start_model(
     }
     {
         let mut model_lock = state.running_model_id.lock().map_err(|e| e.to_string())?;
-        *model_lock = Some(model_id.clone());
+        *model_lock = Some(model_id.to_string());
     }
     {
         let mut port_lock = state.running_port.lock().map_err(|e| e.to_string())?;
         *port_lock = Some(port);
     }
+    {
+        let mut container_lock = state.running_container.lock().map_err(|e| e.to_string())?;
+        *container_lock = Some(container_name.clone());
+    }
     state.set_model_running(true);
-    state.bump_model_generation(); // 模型重启代次 +1，供 Agent 页判断是否需要重启 admAgent
-
-    // 同步本地模型能力（supports_images 等）给运行中的 admAgent：
-    // 服务端只在启动时读 admAgent.json，若它先于模型启动（如微信 Bridge 自动拉起），
-    // 不同步会导致视觉模型被误判为不支持图片（图片附件被静默丢弃）
-    crate::pages::agent::sync_local_model_capabilities(app.clone());
+    state.bump_model_generation();
 
     app.emit(
         "model-started",
-        serde_json::json!({
-            "model_id": &model_id,
-            "port": port,
-        }),
+        serde_json::json!({ "model_id": model_id, "port": port }),
     )
     .ok();
 
     let app_clone = app.clone();
-    let model_id_clone = model_id.clone();
-
+    let model_id_clone = model_id.to_string();
     let app_clone2 = app.clone();
-    let model_id_clone2 = model_id.clone();
+    let model_id_clone2 = model_id.to_string();
 
     std::thread::spawn(move || {
         use std::io::{BufRead, BufReader};
 
-        // 并发读取 stdout 和 stderr，防止单个流阻塞导致另一个流无法读取
         let stdout_handle = if let Some(stdout) = child.stdout.take() {
             let app_c = app_clone.clone();
             let mid = model_id_clone.clone();
             Some(std::thread::spawn(move || {
                 let reader = BufReader::new(stdout);
                 for line in reader.lines().map_while(Result::ok) {
+                    crate::common::utils::logger::write_log("INFO", "SGLang", &line);
                     app_c
-                        .emit(
-                            "model-log",
-                            serde_json::json!({
-                                "model_id": &mid,
-                                "line": line,
-                                "source": "stdout",
-                            }),
-                        )
+                        .emit("model-log", serde_json::json!({
+                            "model_id": &mid, "line": line.clone(), "source": "stdout",
+                        }))
                         .ok();
-
-                    if line.contains("llama server listening")
-                        || line.contains("HTTP server listening")
-                        || line.contains("listening on")
+                    // 推理引擎就绪信号
+                    if line.contains("Uvicorn running on")
+                        || line.contains("The server is fired up and ready to rock!")
                     {
                         app_c
-                            .emit(
-                                "model-started",
-                                serde_json::json!({
-                                    "model_id": &mid,
-                                    "port": port,
-                                }),
-                            )
+                            .emit("model-started", serde_json::json!({
+                                "model_id": &mid, "port": port,
+                            }))
                             .ok();
                     }
                 }
@@ -617,15 +1044,11 @@ pub async fn start_model(
             Some(std::thread::spawn(move || {
                 let reader = BufReader::new(stderr);
                 for line in reader.lines().map_while(Result::ok) {
+                    crate::common::utils::logger::write_log("WARN", "SGLang", &line);
                     app_c
-                        .emit(
-                            "model-log",
-                            serde_json::json!({
-                                "model_id": &mid,
-                                "line": line,
-                                "source": "stderr",
-                            }),
-                        )
+                        .emit("model-log", serde_json::json!({
+                            "model_id": &mid, "line": line, "source": "stderr",
+                        }))
                         .ok();
                 }
             }))
@@ -633,53 +1056,77 @@ pub async fn start_model(
             None
         };
 
-        // 等待 stdout/stderr 读取线程结束
         if let Some(h) = stdout_handle { let _ = h.join(); }
         if let Some(h) = stderr_handle { let _ = h.join(); }
 
-        // 等待子进程退出，获取退出码
         let exit_status = child.wait();
         match &exit_status {
             Ok(status) => {
-                app_clone2.emit(
-                    "model-log",
-                    serde_json::json!({
-                        "model_id": &model_id_clone2,
-                        "line": format!("[DEBUG] llama-server exited with status: {}", status),
-                        "source": "stdout",
-                    }),
-                ).ok();
+                app_clone2.emit("model-log", serde_json::json!({
+                    "model_id": &model_id_clone2,
+                    "line": format!("[DEBUG] 推理引擎容器退出 with status: {}", status),
+                    "source": "stdout",
+                })).ok();
             }
             Err(e) => {
-                app_clone2.emit(
-                    "model-log",
-                    serde_json::json!({
-                        "model_id": &model_id_clone2,
-                        "line": format!("[ERROR] failed to wait for llama-server: {}", e),
-                        "source": "stderr",
-                    }),
-                ).ok();
+                app_clone2.emit("model-log", serde_json::json!({
+                    "model_id": &model_id_clone2,
+                    "line": format!("[ERROR] 推理引擎容器等待失败: {}", e),
+                    "source": "stderr",
+                })).ok();
             }
         }
 
-        // 清除 AppState 中的状态，确保进程退出后可以重新启动
+        // 容器退出：清理容器与状态
+        let _ = crate::common::utils::platform::docker_cmd()
+            .args(["rm", "-f", &container_name])
+            .output();
+
         {
             let state = app_clone2.state::<AppState>();
             *state.running_process.lock().unwrap_or_else(|e| e.into_inner()) = None;
             *state.running_model_id.lock().unwrap_or_else(|e| e.into_inner()) = None;
             *state.running_port.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *state.running_container.lock().unwrap_or_else(|e| e.into_inner()) = None;
             state.set_model_running(false);
         }
 
         app_clone2
-            .emit(
-                "model-stopped",
-                serde_json::json!({ "model_id": &model_id_clone2 }),
-            )
+            .emit("model-stopped", serde_json::json!({ "model_id": &model_id_clone2 }))
             .ok();
     });
 
     Ok(())
+}
+
+#[tauri::command]
+pub async fn start_model(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    model_id: String,
+    params: LaunchParams,
+    device: Option<String>,
+) -> Result<(), AppError> {
+    {
+        let pid_lock = state.running_process.lock().map_err(|e| e.to_string())?;
+        if pid_lock.is_some() {
+            bail!("已有模型在运行中，请先停止当前模型");
+        }
+    }
+
+    let data_dir = config::get_data_dir(Some(&app))?;
+    let models_dir = data_dir.join("models");
+    let model_dir = models_dir.join(&model_id);
+
+    // ===== 新格式（safetensors 目录模型）：SGLang Docker 启动 =====
+    let is_dir_model = model_dir.join(".done").exists()
+        || (model_dir.join("config.json").exists() && model_dir.join("model.safetensors").exists());
+    if is_dir_model {
+        return start_sglang_docker(&app, &state, &model_id, &model_dir, params, device).await;
+    }
+
+    // 仅支持 SGLang Docker 部署（safetensors 目录模型）
+    Err(AppError::msg("当前仅支持推理引擎（safetensors 目录）模型，请下载新版模型后重试"))
 }
 
 #[tauri::command]
@@ -688,6 +1135,16 @@ pub async fn stop_model(state: tauri::State<'_, AppState>) -> Result<(), AppErro
         let pid_lock = state.running_process.lock().map_err(|e| e.to_string())?;
         pid_lock.ok_or("没有正在运行的模型")?
     };
+    // SGLang Docker 模式：先优雅停止容器，再兜底杀进程
+    let container = state.running_container.lock().map_err(|e| e.to_string())?.clone();
+    if let Some(container_name) = container {
+        let _ = crate::common::utils::platform::docker_cmd()
+            .args(["stop", "-t", "5", &container_name])
+            .output();
+        let _ = crate::common::utils::platform::docker_cmd()
+            .args(["rm", "-f", &container_name])
+            .output();
+    }
 
     crate::common::utils::platform::kill_process_tree(pid);
 
@@ -702,6 +1159,10 @@ pub async fn stop_model(state: tauri::State<'_, AppState>) -> Result<(), AppErro
     {
         let mut port_lock = state.running_port.lock().map_err(|e| e.to_string())?;
         *port_lock = None;
+    }
+    {
+        let mut container_lock = state.running_container.lock().map_err(|e| e.to_string())?;
+        *container_lock = None;
     }
     state.set_model_running(false);
 
@@ -739,12 +1200,6 @@ pub async fn delete_local_model(
     }
 
     Ok(())
-}
-
-/// 查询是否有模型已成功启动（全局标识），用于进入 Agent 页前的判断
-#[tauri::command]
-pub async fn is_model_running(state: tauri::State<'_, AppState>) -> Result<bool, AppError> {
-    Ok(state.is_model_running())
 }
 
 #[tauri::command]
