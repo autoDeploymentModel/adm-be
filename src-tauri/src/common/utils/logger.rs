@@ -92,3 +92,17 @@ pub fn cleanup_old_logs() {
 pub fn init() {
     cleanup_old_logs();
 }
+
+pub fn clear_all_logs() -> Result<(), AppError> {
+    let dir = get_log_dir()?;
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.ends_with(".log") {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+    Ok(())
+}

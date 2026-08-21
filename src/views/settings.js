@@ -489,6 +489,7 @@ const template = `
               <select id="log-date-select" style="min-width:160px;width:auto;"></select>
               <button class="btn-reset" id="log-refresh-btn" style="margin:0;padding:6px 16px;font-size:13px;">${_t("刷新")}</button>
               <button class="btn-reset" id="log-open-dir-btn" style="margin:0;padding:6px 16px;font-size:13px;">${_t("打开日志目录")}</button>
+              <button class="btn-reset" id="log-clear-btn" style="margin:0;padding:6px 16px;font-size:13px;">${_t("清空日志")}</button>
             </div>
           </div>
           <pre id="log-content" style="background:var(--c-bg-deep);color:var(--c-text-2);font-family:'SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace;font-size:12px;line-height:1.6;padding:12px 16px;border-radius:8px;border:1px solid var(--c-border);overflow-y:auto;max-height:60vh;white-space:pre-wrap;word-break:break-all;margin:0;">${_t("暂无日志")}</pre>
@@ -806,6 +807,17 @@ export default {
     var logOpenDir = document.getElementById("log-open-dir-btn");
     if (logOpenDir) logOpenDir.addEventListener("click", async function() {
       try { await invoke()("open_log_dir"); } catch (e) { showToast(_t("打开失败: ") + e, true); }
+    });
+    var logClearBtn = document.getElementById("log-clear-btn");
+    if (logClearBtn) logClearBtn.addEventListener("click", async function() {
+      if (!confirm(_t("确定清空所有日志吗？"))) return;
+      try {
+        await invoke()("clear_all_logs");
+        document.getElementById("log-content").textContent = _t("暂无日志");
+        var sel = document.getElementById("log-date-select");
+        if (sel) sel.innerHTML = '<option value="">' + _t("暂无日志") + '</option>';
+        showToast(_t("日志已清空"));
+      } catch (e) { showToast(_t("清空失败: ") + e, true); }
     });
     var logDateSel = document.getElementById("log-date-select");
     if (logDateSel) logDateSel.addEventListener("change", function() { loadLogContent(this.value); });

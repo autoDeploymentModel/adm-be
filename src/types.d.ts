@@ -14,6 +14,7 @@ declare global {
       systemInfo: any;
       runningModelId: string | null;
       runningModelPort: number | null;
+      startingModelId: string | null;
       localModels: any[];
       partFiles: Record<string, any>;
       downloadingModels: Record<string, any>;

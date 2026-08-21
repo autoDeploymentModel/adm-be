@@ -70,6 +70,17 @@ pub async fn list_log_dates() -> Result<Vec<String>, AppError> {
 }
 
 #[tauri::command]
+pub async fn write_app_log(level: String, tag: String, message: String) -> Result<(), AppError> {
+    crate::common::utils::logger::write_log(&level, &tag, &message);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn clear_all_logs() -> Result<(), AppError> {
+    crate::common::utils::logger::clear_all_logs()
+}
+
+#[tauri::command]
 pub async fn open_log_dir() -> Result<(), AppError> {
     let dir = crate::common::utils::logger::get_log_dir()?;
     #[cfg(target_os = "windows")]
@@ -106,22 +117,24 @@ pub async fn fix_docker_permission() -> Result<String, AppError> {
 
         match pkexec_result {
             Ok(output) if output.status.success() => {
-                return Ok(format!("已将用户 {} 加入 docker 组，请重启 ADM-BE 后生效", user));
+                // 权限修复成功，自动注销当前桌面会话（让 docker 组生效）
+                // GNOME: gnome-session-quit --logout --no-prompt
+                // KDE: qdbus org.kde.ksmserver /KSMServer logout 0 0 0
+                // 兜底: loginctl terminate-user $UID
+                let _ = tokio::process::Command::new("sh")
+                    .args(["-c", "gnome-session-quit --logout --no-prompt 2>/dev/null || qdbus org.kde.ksmserver /KSMServer logout 0 0 0 2>/dev/null || loginctl terminate-user $UID 2>/dev/null"])
+                    .spawn();
+                return Ok("PERMISSION_FIXED".to_string());
             }
             Ok(output) => {
-                // pkexec 执行了但失败（用户取消密码框 / 认证失败）
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
                 if stderr.contains("Not authorized") || stderr.contains("Request dismissed") || stderr.contains("cancelled") {
                     return Err(AppError::msg("PKEXEC_CANCELLED".to_string()));
                 }
-                // 其他失败：回退到方案 2
             }
-            Err(_) => {
-                // pkexec 不存在（headless / 无 polkit），回退到方案 2
-            }
+            Err(_) => {}
         }
 
-        // 方案 2：回退提示——用户在终端手动执行
         Err(AppError::msg(format!(
             "FALLBACK_TERMINAL|{}|请在终端执行以下命令，然后重新登录（注销再登录）后重启 ADM-BE：\n  sudo usermod -aG docker {}\n  sudo systemctl restart docker",
             user, user

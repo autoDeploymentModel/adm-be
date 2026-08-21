@@ -219,6 +219,7 @@ const EN = {
   "全部机型": "All devices",
   "拉取镜像 ": "Pulling image ",
   "切换镜像源重试中...": "Retrying with next mirror...",
+  "启动中": "Starting",
   "推理引擎": "Inference Engine",
   "模型最大上下文长度，留 0 表示使用模型自带默认值": "Max context length; 0 uses the model default",
   "Docker 端口映射（容器内始终监听 0.0.0.0）": "Docker port mapping (container always listens on 0.0.0.0)",
@@ -280,6 +281,11 @@ const EN = {
   "修复失败: ": "Fix failed: ",
   "已取消，可重新点击修复": "Cancelled, click fix to retry",
   "系统不支持自动修复，请在终端手动执行以下命令，然后重新登录后重启 ADM-BE：": "Auto-fix is not supported on this system. Please run the following command in a terminal, then re-login and restart ADM-BE:",
+  "权限修复成功，系统即将自动注销登录，重新登录后即可使用。": "Permission fixed. The system will log out automatically. Please log back in to continue.",
+  "清空日志": "Clear Logs",
+  "确定清空所有日志吗？": "Are you sure you want to clear all logs?",
+  "日志已清空": "Logs cleared",
+  "清空失败: ": "Failed to clear: ",
 };
 
 let lang = "zh";

@@ -929,7 +929,7 @@ async fn start_sglang_docker(
             "model-log",
             serde_json::json!({
                 "model_id": model_id,
-                "line": "[MTP] 检测到 MTP 权重，已自动启用 EAGLE 投机解码（num-steps=3, eagle-topk=1, num-draft-tokens=4）；如需调整或关闭，请在设置页「额外参数」填写 speculative-algorithm=...",
+                "line": "[MTP] 检测到 MTP 权重，已自动启用 EAGLE 投机解码（num-steps=3, eagle-topk=1, num-draft-tokens=4）",
                 "source": "stdout",
             }),
         )

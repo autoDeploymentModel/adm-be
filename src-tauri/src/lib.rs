@@ -151,6 +151,8 @@ pub fn run() {
             settings::list_log_dates,
             settings::open_log_dir,
             settings::fix_docker_permission,
+            settings::write_app_log,
+            settings::clear_all_logs,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

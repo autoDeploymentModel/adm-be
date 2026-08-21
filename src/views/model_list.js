@@ -447,6 +447,18 @@ const template = `
 
 let unlisteners = [];
 
+// 模型日志批量写入（避免每行 stdout 一次 invoke）
+let pendingLogLines = [];
+let logFlushTimer = null;
+function flushLogLines() {
+  if (pendingLogLines.length === 0) { logFlushTimer = null; return; }
+  var batch = pendingLogLines.splice(0);
+  logFlushTimer = null;
+  batch.forEach(function(item) {
+    try { invoke()("write_app_log", { level: item.level, tag: "MODEL", message: item.line }); } catch (_) {}
+  });
+}
+
 const invoke = () => window.__adm_invoke;
 const listen = () => window.__adm_listen;
 const S = () => window.__adm_state;
@@ -587,6 +599,7 @@ function renderModelTable() {
     const available = isModelAvailable(model);
     const downloaded = isModelDownloaded(model.model_id);
     const isRunning = st.runningModelId === model.model_id;
+    const isStarting = st.startingModelId === model.model_id;
 
     const card = document.createElement("div");
     card.className = "model-card" + (isRunning ? " card-running" : (!available ? " card-unavailable" : ""));
@@ -594,6 +607,8 @@ function renderModelTable() {
     let statusHtml = "";
     if (isRunning) {
       statusHtml = '<span class="status-badge status-running">' + _t("已启动") + '</span>';
+    } else if (isStarting) {
+      statusHtml = '<span class="status-badge status-running">' + _t("启动中") + '</span>';
     } else if (available) {
       statusHtml = '<span class="status-badge status-available">' + _t("可用") + '</span>';
     } else {
@@ -632,6 +647,8 @@ function renderModelTable() {
     if (isRunning) {
 actionsHtml = '<button class="btn btn-view" id="view-' + safeModelId + '">' + _t("查看模型") + '</button>';
       actionsHtml += '<button class="btn btn-stop" data-stop-btn="' + safeModelId + '" id="stop-' + safeModelId + '">' + _t("关闭模型") + '</button>';
+    } else if (isStarting) {
+      actionsHtml = '<button class="btn btn-start" disabled id="start-' + safeModelId + '">' + _t("启动中...") + '</button>';
     } else if (model.model_type === "文本生成图片" && downloaded) {
       actionsHtml = '<button class="btn btn-start" id="img-' + safeModelId + '">' + _t("生成图片") + '</button>';
     } else if (downloaded && available) {
@@ -772,11 +789,20 @@ function showDockerPermissionDialog() {
     statusEl.textContent = "";
     try {
       var msg = await invoke()("fix_docker_permission");
-      statusEl.style.color = "#4caf50";
-      statusEl.textContent = msg;
-      fixBtn.textContent = _t("已修复，请重启");
-      fixBtn.disabled = false;
-      fixBtn.onclick = function() { overlay.remove(); };
+      if (msg === "PERMISSION_FIXED") {
+        // 权限修复成功，系统正在注销登录
+        msgEl.innerHTML = _t("权限修复成功，系统即将自动注销登录，重新登录后即可使用。");
+        statusEl.style.color = "#4caf50";
+        statusEl.textContent = "";
+        fixBtn.style.display = "none";
+        overlay.querySelector("#docker-perm-cancel-btn").textContent = _t("关闭");
+      } else {
+        statusEl.style.color = "#4caf50";
+        statusEl.textContent = msg;
+        fixBtn.textContent = _t("已修复，请重启");
+        fixBtn.disabled = false;
+        fixBtn.onclick = function() { overlay.remove(); };
+      }
     } catch (err) {
       var errStr = String(err);
       if (errStr.indexOf("PKEXEC_CANCELLED") !== -1) {
@@ -817,13 +843,14 @@ async function handleStart(btn) {
 
     const device = S().currentDeviceFilter && S().currentDeviceFilter !== "all" ? S().currentDeviceFilter : null;
 
-    btn.textContent = _t("启动中...");
-    btn.disabled = true;
+    S().startingModelId = modelId;
+    renderModelTable();
 
     await invoke()("start_model", { modelId: modelId, params: params, device: device });
     console.log("[model_list] 启动模型 invoke 完成:", modelId);
   } catch (e) {
     console.error("[model_list] 启动失败:", e);
+    S().startingModelId = null;
     var errMsg = String(e);
     if (errMsg.indexOf("DOCKER_PERMISSION_DENIED") !== -1) {
       showDockerPermissionDialog();
@@ -1009,6 +1036,7 @@ function handleTauriEvent(type, payload) {
     case "model-pull-progress": {
       // 推理引擎镜像拉取进度：启动按钮显示百分比 + 卡片进度条；
       // 进度回跳（超时切源后重新从 0 拉）时提示"正在切换镜像源重试"
+      st.startingModelId = model_id;
       const startBtn = document.getElementById("start-" + model_id);
       if (startBtn) {
         const prev = parseInt(startBtn.dataset.pullPct || "-1", 10);
@@ -1023,22 +1051,33 @@ function handleTauriEvent(type, payload) {
       break;
     }
     case "model-log": {
+      // 模型日志写入本地日志文件（批量合并避免高频 invoke）
+      if (payload && payload.line) {
+        pendingLogLines.push({ level: payload.source === "stderr" ? "WARN" : "INFO", line: payload.line });
+        if (!logFlushTimer) {
+          logFlushTimer = setTimeout(flushLogLines, 500);
+        }
+      }
       break;
     }
 case "model-started": {
       st.runningModelId = model_id;
       st.runningModelPort = port;
+      st.startingModelId = null;
       renderModelTable();
       break;
     }
     case "model-stopped": {
       st.runningModelId = null;
       st.runningModelPort = null;
+      st.startingModelId = null;
       renderModelTable();
       break;
     }
     case "model-error": {
+      st.startingModelId = null;
       showToast(_t("模型错误 [") + model_id + _t("]: ") + error);
+      renderModelTable();
       break;
     }
   }
@@ -1076,6 +1115,11 @@ async function init() {
     for (const p of parts) st.partFiles[p.model_id] = p.existing_size;
   } catch (e) { console.error("扫描未完成下载失败:", e); }
 
+  // 重新从后端同步下载状态（切页回来时恢复正在下载/已完成的进度）
+  st.downloadingModels = {};
+  st.downloadingMmproj = {};
+  st.downloadingDiffusion = {};
+  st.downloadingVae = {};
   try { st.downloadingModels = await invoke()("get_downloading_models"); } catch (e) { console.error("获取正在下载的模型失败:", e); }
 
   try {
@@ -1108,7 +1152,7 @@ if (status.running) {
 
 function setupListeners() {
   const L = listen();
-  const events = ["download-progress", "download-complete", "download-error", "model-pull-progress", "model-started", "model-stopped", "model-error"];
+  const events = ["download-progress", "download-complete", "download-error", "model-pull-progress", "model-log", "model-started", "model-stopped", "model-error"];
   events.forEach(function(ev) {
     try {
       L(ev, function(event) { handleTauriEvent(ev, event.payload); })
@@ -1123,7 +1167,8 @@ export default {
   mount(root) {
     console.log("[model_list] mount()");
     root.innerHTML = template;
-  S().currentDeviceFilter = "all";
+  if (!S().currentDeviceFilter) S().currentDeviceFilter = "all";
+  S().startingModelId = S().startingModelId || null;
 
     // 禁用页面右键（屏蔽浏览器默认菜单，删除弹窗在根容器内一并覆盖）
     var listRoot = document.getElementById("model-list-root");
