@@ -25,6 +25,7 @@
 ## IPC 注意事项（重要）
 - SPA 运行在 Tauri 主窗口内，**直接**调用 `window.__TAURI__.core.invoke` / `.event.listen`，无需 `postMessage` 代理。
 - `index.html` 初始化时把 `window.__adm_invoke` / `window.__adm_listen` 暴露给所有视图模块；视图模块通过这两个全局引用调用 IPC。
+- **事件监听必须在 `index.html` 全局层注册（`init()` 中一次注册、永不释放）**，不得在视图模块 `mount`/`unmount` 中注册/释放。原因：视图切换时 `unmount` 会释放监听，导致切页期间事件丢失、状态不同步。全局监听只更新 `window.__adm_state`，再通过 `currentView.handleTauriEvent(type, payload)` 转发给当前视图做 DOM 更新（视图未挂载时静默跳过）。视图模块默认导出需包含 `handleTauriEvent` 方法。
 - **共享状态** `window.__adm_state`（systemInfo / runningModelId / modelList / currentDeviceFilter 等）跨视图共享，切换不丢。
 - 视图 `mount` 时 `listen()` 保存 unlisten 句柄，`unmount` 时统一调用以防事件重复绑定（泄漏）。
 - 子页面 → 父窗口导航：使用 `location.hash = "#/list"` 等 hash 路由。

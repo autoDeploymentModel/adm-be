@@ -969,8 +969,12 @@ function handleTauriEvent(type, payload) {
       break;
     }
     case "model-started":
-    case "model-stopped":
+    case "model-stopped": {
+      renderModelTable();
+      break;
+    }
     case "model-error": {
+      showToast(_t("模型错误 [") + model_id + _t("]: ") + error);
       renderModelTable();
       break;
     }
