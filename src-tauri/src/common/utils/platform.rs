@@ -145,18 +145,6 @@ pub fn get_gpu_info() -> (u64, u64, bool) {
                 }
             }
         }
-
-        // 方案 3：nvidia-smi 不存在时，用 sysinfo 检测 GPU
-        if !has_gpu {
-            let sys = sysinfo::System::new_all();
-            for gpu in sys.gpus() {
-                if !gpu.name().is_empty() {
-                    has_gpu = true;
-                    total_vram = sys.total_memory();
-                    break;
-                }
-            }
-        }
     }
 
     (total_vram, used_vram, has_gpu)
@@ -214,18 +202,6 @@ pub fn detect_gpu_vendor() -> Option<String> {
         if let Ok(output) = create_hidden_command("nvidia-smi").arg("--version").output() {
             if output.status.success() {
                 return Some("nvidia".to_string());
-            }
-        }
-        // 兜底：sysinfo 检测 GPU 名称
-        let sys = sysinfo::System::new_all();
-        for gpu in sys.gpus() {
-            let name = gpu.name().to_lowercase();
-            if name.contains("nvidia") || name.contains("geforce") {
-                return Some("nvidia".to_string());
-            } else if name.contains("amd") || name.contains("radeon") {
-                return Some("amd".to_string());
-            } else if name.contains("intel") {
-                return Some("intel".to_string());
             }
         }
         None
