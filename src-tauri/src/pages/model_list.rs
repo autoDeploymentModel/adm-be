@@ -569,6 +569,12 @@ async fn pull_image(
         .map_err(|e| AppError::msg(format!("docker pull 启动失败: {}", e)))?;
 
     use tokio::io::{AsyncBufReadExt, BufReader};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    // 非 TTY 下 docker pull 没有统一百分比，用 layer 完成数 / 总 layer 数估算进度
+    let total_layers = Arc::new(AtomicUsize::new(0));
+    let completed_layers = Arc::new(AtomicUsize::new(0));
 
     let emit_progress = |p: u8| {
         app.emit(
@@ -585,44 +591,37 @@ async fn pull_image(
 
     let app_c = app.clone();
     let mid = model_id.to_string();
-    let img = image.to_string();
+    let _img = image.to_string();
 
-    // stdout：逐行读取 docker pull 进度（非 TTY 下 docker pull 用 \n 换行输出到 stdout）
+    // stdout：逐行读取（非 TTY 下 docker pull 进度走 stdout）
     if let Some(stdout) = child.stdout.take() {
         let mut reader = BufReader::new(stdout).lines();
         let app_c2 = app_c.clone();
         let mid2 = mid.clone();
-        let img2 = img.clone();
-        let mut last_pct: i32 = -1;
+        let total2 = total_layers.clone();
+        let done2 = completed_layers.clone();
         tokio::spawn(async move {
             while let Ok(Some(line)) = reader.next_line().await {
                 let trimmed = line.trim();
                 if !trimmed.is_empty() {
                     crate::common::utils::logger::write_log("INFO", "DOCKER", &format!("[{}] {}", mid2, trimmed));
                     app_c2
-                        .emit(
-                            "model-log",
-                            serde_json::json!({
-                                "model_id": &mid2,
-                                "line": format!("[docker pull] {}", trimmed),
-                                "source": "stdout",
-                            }),
-                        )
-                        .ok();
-                    if let Some(pct) = parse_pull_percent(&line) {
-                        let pct_i = pct as i32;
-                        if pct_i != last_pct {
-                            last_pct = pct_i;
-                            app_c2
-                                .emit(
-                                    "model-pull-progress",
-                                    serde_json::json!({
-                                        "model_id": &mid2,
-                                        "image": &img2,
-                                        "progress": pct_i,
-                                    }),
-                                )
-                                .ok();
+                        .emit("model-log", serde_json::json!({
+                            "model_id": &mid2, "line": format!("[docker pull] {}", trimmed), "source": "stdout",
+                        })).ok();
+
+                    // 统计 layer 数量
+                    if trimmed.contains("Pulling fs layer") || trimmed.contains("Already exists") {
+                        total2.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if trimmed.contains("Pull complete") || trimmed.contains("Already exists") {
+                        let done = done2.fetch_add(1, Ordering::Relaxed) + 1;
+                        let total = total2.load(Ordering::Relaxed);
+                        if total > 0 {
+                            let pct = ((done as f64 / total as f64) * 99.0) as u8;
+                            app_c2.emit("model-pull-progress", serde_json::json!({
+                                "model_id": &mid2, "image": "", "progress": pct,
+                            })).ok();
                         }
                     }
                 }
@@ -641,15 +640,9 @@ async fn pull_image(
                 if !trimmed.is_empty() {
                     crate::common::utils::logger::write_log("WARN", "DOCKER", &format!("[{}] {}", mid3, trimmed));
                     app_c3
-                        .emit(
-                            "model-log",
-                            serde_json::json!({
-                                "model_id": &mid3,
-                                "line": format!("[docker pull] {}", trimmed),
-                                "source": "stderr",
-                            }),
-                        )
-                        .ok();
+                        .emit("model-log", serde_json::json!({
+                            "model_id": &mid3, "line": format!("[docker pull] {}", trimmed), "source": "stderr",
+                        })).ok();
                 }
             }
         });
@@ -680,6 +673,7 @@ async fn pull_image(
 /// 解析 docker pull 进度行中的下载百分比。
 /// 支持 `123.4MB/512.3MB`、`45KB/2.3MB(KB/MB/GB)` 形式（单位必须一致才计算，
 /// 不一致时返回 0，避免误跳进度）。
+#[allow(dead_code)]
 fn parse_pull_percent(raw: &str) -> Option<u8> {
     let line = raw.replace('\r', "").replace('\n', "");
     let slash = line.find('/')?;
