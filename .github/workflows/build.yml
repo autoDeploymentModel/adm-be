@@ -19,10 +19,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 仅打包 Windows x64 安装包 (x64-setup.exe / NSIS)
-          - platform: windows-latest
-            target: x86_64-pc-windows-msvc
-            bundles: nsis
           # Ubuntu x64 (.deb)
           - platform: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
@@ -93,31 +89,3 @@ jobs:
           prerelease: false
           # 每个平台只产出指定格式的包：Windows x64-setup.exe / Ubuntu x64+arm64 (.deb)
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
-
-      - name: Windows 自签名
-        if: matrix.platform == 'windows-latest'
-        shell: powershell
-        run: |
-          Write-Host "创建自签名证书"
-          $Cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=ADM-BE Self-Signed Cert" -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddYears(10)
-          Write-Host "证书指纹: $($Cert.Thumbprint)"
-
-          # 签名 NSIS 安装包（发布产物 x64-setup.exe，实际位于 bundle/nsis 目录）
-          $Setup = Get-ChildItem -Path "src-tauri\target" -Recurse -Filter "*-setup.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($Setup) {
-            Write-Host "对安装包签名: $($Setup.FullName)"
-            Set-AuthenticodeSignature -FilePath $Setup.FullName -Certificate $Cert -HashAlgorithm SHA256
-            Get-AuthenticodeSignature -FilePath $Setup.FullName | Format-List
-          } else {
-            Write-Warning "未找到 *-setup.exe，安装包未被签名"
-          }
-
-          # 同时签名主程序二进制（release 目录下的 ADM-BE.exe，便于直接分发）
-          $App = Get-ChildItem -Path "src-tauri\target" -Recurse -Filter "ADM-BE.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($App) {
-            Write-Host "对主程序签名: $($App.FullName)"
-            Set-AuthenticodeSignature -FilePath $App.FullName -Certificate $Cert -HashAlgorithm SHA256
-            Get-AuthenticodeSignature -FilePath $App.FullName | Format-List
-          } else {
-            Write-Warning "未找到 ADM-BE.exe"
-          }
