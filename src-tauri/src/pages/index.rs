@@ -7,6 +7,7 @@ use crate::bail;
 
 // ===== 辅助函数 =====
 
+#[allow(dead_code)]
 fn compare_versions(current: &str, remote: &str) -> std::cmp::Ordering {
     let parse_version = |v: &str| -> Vec<u32> {
         v.trim()
