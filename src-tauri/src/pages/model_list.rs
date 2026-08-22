@@ -542,15 +542,24 @@ async fn check_docker_env(
     }
 
     Err(AppError::msg(format!(
-        "镜像拉取失败（已尝试 Docker Hub 与多个国内镜像源，单源最长等待 {} 分钟）：{}\n请检查网络后手动执行: docker pull {}；\n或配置镜像加速器：在 /etc/docker/daemon.json 添加 registry-mirrors 后 sudo systemctl restart docker",
+        "镜像拉取失败（已尝试 Docker Hub 与多个国内镜像源，单源连续 {} 分钟无输出即放弃）：{}\n请检查网络后手动执行: docker pull {}；\n或配置镜像加速器：在 /etc/docker/daemon.json 添加 registry-mirrors 后 sudo systemctl restart docker",
         PULL_TIMEOUT.as_secs() / 60,
         image,
         image
     )))
 }
 
-/// 单源镜像拉取超时上限（8 分钟）：超时视为该源不可用，强制终止进程并切换下一来源。
-const PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8 * 60);
+/// 单源镜像拉取「闲置」超时（3 分钟）：仅当 stdout/stderr 连续 3 分钟无任何输出
+/// （下载进度停滞/连接卡死）才强制终止并切换下一来源；只要进度在动就永不超时。
+const PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3 * 60);
+
+/// 当前 Unix 毫秒时间戳（闲置超时计算用）
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// 拉取单个镜像：stdout/stderr 逐行转发到 model-log，进度按 `\r` 段解析后发
 /// `model-pull-progress` 事件（{ model_id, image, progress } 0-100）；成功返回 true，
@@ -569,12 +578,16 @@ async fn pull_image(
         .map_err(|e| AppError::msg(format!("docker pull 启动失败: {}", e)))?;
 
     use tokio::io::{AsyncBufReadExt, BufReader};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
-    // 非 TTY 下 docker pull 没有统一百分比，用 layer 完成数 / 总 layer 数估算进度
+    // 进度估算（非 TTY 下 docker pull 无统一百分比）：
+    //   层维度：Pulling fs layer / Pull complete 计数跳格；
+    //   字节维度：Downloading / Extracting 行的「当前/总字节」在当前层槽位内插值 → 连续移动
     let total_layers = Arc::new(AtomicUsize::new(0));
     let completed_layers = Arc::new(AtomicUsize::new(0));
+    // layer 槽位：sha → 0-based 序号（按出现顺序登记，字节插值用）
+    let layer_order: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let emit_progress = |p: u8| {
         app.emit(
@@ -589,6 +602,9 @@ async fn pull_image(
     };
     emit_progress(0);
 
+    // 闲置超时计时基准：任一输出行到达即刷新时间戳（下载进度在动 = 永不超时）
+    let last_activity = Arc::new(AtomicU64::new(now_millis()));
+
     let app_c = app.clone();
     let mid = model_id.to_string();
     let _img = image.to_string();
@@ -600,20 +616,34 @@ async fn pull_image(
         let mid2 = mid.clone();
         let total2 = total_layers.clone();
         let done2 = completed_layers.clone();
+        let order2 = layer_order.clone();
+        let act = last_activity.clone();
         tokio::spawn(async move {
             while let Ok(Some(line)) = reader.next_line().await {
                 let trimmed = line.trim();
                 if !trimmed.is_empty() {
+                    act.store(now_millis(), Ordering::Relaxed);
                     crate::common::utils::logger::write_log("INFO", "DOCKER", &format!("[{}] {}", mid2, trimmed));
                     app_c2
                         .emit("model-log", serde_json::json!({
                             "model_id": &mid2, "line": format!("[docker pull] {}", trimmed), "source": "stdout",
                         })).ok();
 
-                    // 统计 layer 数量
+                    // "<sha>: <状态>" 形式行；sha 为空（纯文本行）则跳过进度统计
+                    let (sha, rest) = match trimmed.split_once(':') {
+                        Some((s, r)) => (s.trim().to_string(), r.trim_start()),
+                        None => (String::new(), ""),
+                    };
+
+                    // 层开始：登记总层数并按出现顺序分配槽位
                     if trimmed.contains("Pulling fs layer") || trimmed.contains("Already exists") {
-                        total2.fetch_add(1, Ordering::Relaxed);
+                        let idx = total2.fetch_add(1, Ordering::Relaxed);
+                        if !sha.is_empty() {
+                            order2.lock().unwrap_or_else(|e| e.into_inner()).entry(sha.clone()).or_insert(idx);
+                        }
                     }
+
+                    // 层完成：按完成数跳一格
                     if trimmed.contains("Pull complete") || trimmed.contains("Already exists") {
                         let done = done2.fetch_add(1, Ordering::Relaxed) + 1;
                         let total = total2.load(Ordering::Relaxed);
@@ -622,6 +652,22 @@ async fn pull_image(
                             app_c2.emit("model-pull-progress", serde_json::json!({
                                 "model_id": &mid2, "image": "", "progress": pct,
                             })).ok();
+                        }
+                    }
+
+                    // 下载/解压过程行（含 当前/总 字节）：在所在槽位内按字节插值 → 进度连续移动
+                    if rest.starts_with("Downloading") || rest.starts_with("Extracting") {
+                        if let Some(p) = parse_pull_percent(trimmed) {
+                            if p > 0 {
+                                let total = total2.load(Ordering::Relaxed);
+                                let idx = order2.lock().unwrap_or_else(|e| e.into_inner()).get(&sha).copied().unwrap_or(0);
+                                if total > 0 && idx < total {
+                                    let pct = (((idx as f64) + (p as f64 / 100.0)) / (total as f64) * 99.0) as u8;
+                                    app_c2.emit("model-pull-progress", serde_json::json!({
+                                        "model_id": &mid2, "image": "", "progress": pct.min(99),
+                                    })).ok();
+                                }
+                            }
                         }
                     }
                 }
@@ -634,10 +680,12 @@ async fn pull_image(
         let mut reader = BufReader::new(stderr).lines();
         let app_c3 = app_c.clone();
         let mid3 = mid.clone();
+        let act3 = last_activity.clone();
         tokio::spawn(async move {
             while let Ok(Some(line)) = reader.next_line().await {
                 let trimmed = line.trim();
                 if !trimmed.is_empty() {
+                    act3.store(now_millis(), Ordering::Relaxed);
                     crate::common::utils::logger::write_log("WARN", "DOCKER", &format!("[{}] {}", mid3, trimmed));
                     app_c3
                         .emit("model-log", serde_json::json!({
@@ -648,8 +696,8 @@ async fn pull_image(
         });
     }
 
-    // 超时熔断：timeout 内未完成则 kill 子进程（docker pull 卡住/无数据/超慢时强制终止），
-    // 由调用方（check_docker_env 多源回退循环）切换到下一个来源
+    // 闲置超时熔断：仅当连续 timeout 无任何输出（进度停滞/卡死）才终止，
+    // 由调用方（check_docker_env 多源回退循环）切换到下一个来源；进度在动则永远等待
     tokio::select! {
         status = child.wait() => {
             let status = status.map_err(|e| AppError::msg(format!("docker pull 等待失败: {}", e)))?;
@@ -657,13 +705,21 @@ async fn pull_image(
             emit_progress(if ok { 100 } else { 0 });
             Ok(ok)
         }
-        _ = tokio::time::sleep(timeout) => {
+        _ = async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let idle = now_millis().saturating_sub(last_activity.load(Ordering::Relaxed));
+                if idle >= timeout.as_millis() as u64 {
+                    break;
+                }
+            }
+        } => {
             // 终止 pull 进程（kill 整棵进程树，含 docker CLI 派生的下载子进程）
             let _ = child.start_kill();
             let _ = child.wait().await;
             emit_progress(0);
             Err(AppError::msg(format!(
-                "镜像拉取超时（超过 {} 分钟无进展）",
+                "镜像拉取连续 {} 分钟无任何输出，判定卡死已终止（下载进度在动时不会超时）",
                 timeout.as_secs() / 60
             )))
         }
@@ -673,7 +729,6 @@ async fn pull_image(
 /// 解析 docker pull 进度行中的下载百分比。
 /// 支持 `123.4MB/512.3MB`、`45KB/2.3MB(KB/MB/GB)` 形式（单位必须一致才计算，
 /// 不一致时返回 0，避免误跳进度）。
-#[allow(dead_code)]
 fn parse_pull_percent(raw: &str) -> Option<u8> {
     let line = raw.replace('\r', "").replace('\n', "");
     let slash = line.find('/')?;
@@ -731,6 +786,7 @@ async fn start_sglang_docker(
     model_dir: &std::path::Path,
     params: LaunchParams,
     device: Option<String>,
+    sglang_version: Option<String>,
 ) -> Result<(), AppError> {
     const CONTAINER_PREFIX: &str = "adm-sglang-";
     let container_name = format!("{}{}", CONTAINER_PREFIX, model_id);
@@ -753,7 +809,24 @@ async fn start_sglang_docker(
         Some("dgx-spark-128G") => "64g",
         _ => "32g",
     };
-    let image = if sglang_args.image.is_empty() { default_image.to_string() } else { sglang_args.image.clone() };
+    // 镜像优先级：模型配置 sglang-version > 设置页镜像 > 机型默认。
+    // 版本字段直接写 tag（如 "v0.5.17"）则拼 lmsysorg/sglang:；写完整镜像名（含 "/" 或 lmsysorg/ 前缀）则原样使用
+    let mut image = if sglang_args.image.is_empty() { default_image.to_string() } else { sglang_args.image.clone() };
+    if let Some(ver) = sglang_version.as_deref().map(str::trim) {
+        if !ver.is_empty() {
+            image = if ver.contains('/') || ver.starts_with("lmsysorg/") {
+                ver.to_string()
+            } else {
+                format!("lmsysorg/sglang:{}", ver)
+            };
+        }
+    }
+    crate::common::utils::logger::write_log("INFO", "DOCKER", &format!("[{}] 使用镜像 {}（优先级：模型 sglang-version > 设置页 > 默认）", model_id, image));
+    app.emit("model-log", serde_json::json!({
+        "model_id": model_id,
+        "line": format!("使用镜像 {}（模型 sglang-version / 设置页 / 默认）", image),
+        "source": "stdout",
+    })).ok();
     let shm_size = if sglang_args.shm_size.is_empty() { default_shm.to_string() } else { sglang_args.shm_size.clone() };
 
     // ===== 启动前 Docker 环境预检（CLI / daemon / GPU runtime / 镜像）=====
@@ -1091,6 +1164,7 @@ pub async fn start_model(
     model_id: String,
     params: LaunchParams,
     device: Option<String>,
+    sglang_version: Option<String>,
 ) -> Result<(), AppError> {
     {
         let pid_lock = state.running_process.lock().map_err(|e| e.to_string())?;
@@ -1107,7 +1181,7 @@ pub async fn start_model(
     let is_dir_model = model_dir.join(".done").exists()
         || (model_dir.join("config.json").exists() && model_dir.join("model.safetensors").exists());
     if is_dir_model {
-        return start_sglang_docker(&app, &state, &model_id, &model_dir, params, device).await;
+        return start_sglang_docker(&app, &state, &model_id, &model_dir, params, device, sglang_version).await;
     }
 
     // 仅支持 SGLang Docker 部署（safetensors 目录模型）

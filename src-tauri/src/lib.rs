@@ -3,7 +3,7 @@ mod common;
 mod pages;
 
 use app_state::AppState;
-use pages::{index, model_list, model_image, settings};
+use pages::{index, model_list, model_image, settings, benchmark};
 
 use tauri::Manager;
 use tauri::menu::{Menu, MenuItem};
@@ -153,6 +153,9 @@ pub fn run() {
             settings::fix_docker_permission,
             settings::write_app_log,
             settings::clear_all_logs,
+            // benchmark.rs
+            benchmark::start_benchmark,
+            benchmark::get_benchmark_status,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

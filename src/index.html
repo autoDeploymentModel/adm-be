@@ -27,6 +27,8 @@
       --c-text-hi: #ffffff;
       --c-overlay: rgba(255, 255, 255, 0.1);
       --c-overlay-strong: rgba(255, 255, 255, 0.2);
+      /* 原生控件（下拉弹层/输入框等）跟随暗色渲染，防止 Linux 下白底白字 */
+      color-scheme: dark;
     }
     html[data-theme="vscode"] {
       --c-bg: #1e1e1e; --c-bg-deep: #181818; --c-panel: #252526; --c-panel-2: #2d2d30;
@@ -46,6 +48,7 @@
       --c-border-hi: #bcc4cc; --c-accent: #0066b8; --c-accent-2: #005a9e; --c-accent-rgb: 0, 102, 184;
       --c-text: #1f2328; --c-text-2: #4b5563; --c-text-3: #6a737d; --c-text-4: #8a94a0; --c-text-hi: #000000;
       --c-overlay: rgba(0, 0, 0, 0.05); --c-overlay-strong: rgba(0, 0, 0, 0.1);
+      color-scheme: light;
     }
     html[data-theme="sepia"] {
       --c-bg: #fdf6e3; --c-bg-deep: #f4ecd8; --c-panel: #eee8d5; --c-panel-2: #fbf6e6;
@@ -53,6 +56,7 @@
       --c-border-hi: #cabf98; --c-accent: #b5651d; --c-accent-2: #99551a; --c-accent-rgb: 181, 101, 29;
       --c-text: #586e75; --c-text-2: #657b83; --c-text-3: #839496; --c-text-4: #93a1a1; --c-text-hi: #073642;
       --c-overlay: rgba(101, 90, 40, 0.08); --c-overlay-strong: rgba(101, 90, 40, 0.16);
+      color-scheme: light;
     }
     html[data-theme="github"] {
       --c-bg: #0d1117; --c-bg-deep: #010409; --c-panel: #161b22; --c-panel-2: #21262d;
@@ -114,7 +118,8 @@
     }
 
     #home-btn,
-    #settings-btn {
+    #settings-btn,
+    #benchmark-btn {
       cursor: pointer;
       font-size: 13px;
       padding: 2px 10px;
@@ -138,19 +143,22 @@
     }
 
     #home-btn:hover,
-    #settings-btn:hover {
+    #settings-btn:hover,
+    #benchmark-btn:hover {
       color: var(--c-accent);
     }
 
     #home-btn.active,
-    #settings-btn.active {
+    #settings-btn.active,
+    #benchmark-btn.active {
       background: rgba(var(--c-accent-rgb), 0.20);
       color: var(--c-text-hi);
       border-radius: 6px;
       border-right-color: transparent;
     }
     #home-btn.active .btn-icon,
-    #settings-btn.active .btn-icon {
+    #settings-btn.active .btn-icon,
+    #benchmark-btn.active .btn-icon {
       color: var(--c-accent);
     }
 
@@ -293,6 +301,10 @@
         <span class="btn-icon">&#9881;</span>
         <span class="btn-text" data-i18n="设置">设置</span>
       </div>
+      <div id="benchmark-btn" onclick="location.hash='#/benchmark'">
+        <span class="btn-icon">&#9889;</span>
+        <span class="btn-text" data-i18n="测试">测试</span>
+      </div>
       <div id="hw-items">
         <div class="hw-item">
           <span class="hw-label" data-i18n="内存">内存</span>
@@ -369,7 +381,7 @@
 
     // ===== 导航激活态 =====
     function setActiveNav(id) {
-      ["home-btn", "settings-btn"].forEach(function (b) {
+      ["home-btn", "settings-btn", "benchmark-btn"].forEach(function (b) {
         const el = document.getElementById(b);
         if (el) el.classList.toggle("active", b === id);
       });
@@ -503,6 +515,7 @@
       "/list":     { load: () => import("./views/model_list.js"),     nav: "home-btn" },
       "/image":    { load: () => import("./views/model_image.js"),    nav: "home-btn" },
       "/settings": { load: () => import("./views/settings.js"),       nav: "settings-btn" },
+      "/benchmark": { load: () => import("./views/benchmark.js"),   nav: "benchmark-btn" },
     };
 
     let currentView = null;

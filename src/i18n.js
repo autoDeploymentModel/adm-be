@@ -286,6 +286,18 @@ const EN = {
   "确定清空所有日志吗？": "Are you sure you want to clear all logs?",
   "日志已清空": "Logs cleared",
   "清空失败: ": "Failed to clear: ",
+
+  // ===== benchmark.js =====
+  "性能测试": "Benchmark",
+  "输入长度 (tokens)": "Input Length (tokens)",
+  "输出长度 (tokens)": "Output Length (tokens)",
+  "请求数": "Requests",
+  "开始测试": "Start Benchmark",
+  "测试中...": "Running...",
+  "测试启动中...": "Starting benchmark...",
+  "点击开始测试，测试结果将显示在此处": "Click start to run benchmark. Results will appear here.",
+  "测试启动失败: ": "Failed to start benchmark: ",
+  "测试未成功完成": "Benchmark did not complete successfully",
 };
 
 let lang = "zh";

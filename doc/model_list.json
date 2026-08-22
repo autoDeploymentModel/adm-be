@@ -17,6 +17,7 @@
         "model_support_devices": [
             "dgx-spark-128G"
         ],
+        "sglang-version": "v0.5.17",
         "model_size": "23.4 GB",
         "model_type": "视觉多模态理解",
         "model_description": "支持对话,推理,图片识别",

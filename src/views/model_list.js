@@ -848,10 +848,14 @@ async function handleStart(btn) {
 
     const device = S().currentDeviceFilter && S().currentDeviceFilter !== "all" ? S().currentDeviceFilter : null;
 
+    // 模型配置的 sglang-version（如 "v0.5.17"）→ 指定该模型使用的 SGLang 镜像版本
+    const model = (S().modelList || []).find(m => m.model_id === modelId);
+    const sglangVersion = (model && (model["sglang-version"] || model.sglangVersion || "")) || null;
+
     S().startingModelId = modelId;
     renderModelTable();
 
-    await invoke()("start_model", { modelId: modelId, params: params, device: device });
+    await invoke()("start_model", { modelId: modelId, params: params, device: device, sglangVersion: sglangVersion });
     console.log("[model_list] 启动模型 invoke 完成:", modelId);
   } catch (e) {
     console.error("[model_list] 启动失败:", e);
