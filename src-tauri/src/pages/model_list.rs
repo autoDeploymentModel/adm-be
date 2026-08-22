@@ -1208,12 +1208,30 @@ pub async fn stop_model(state: tauri::State<'_, AppState>) -> Result<(), AppErro
     // SGLang Docker 模式：先优雅停止容器，再兜底杀进程
     let container = state.running_container.lock().map_err(|e| e.to_string())?.clone();
     if let Some(container_name) = container {
-        let _ = crate::common::utils::platform::docker_cmd()
-            .args(["stop", "-t", "5", &container_name])
-            .output();
-        let _ = crate::common::utils::platform::docker_cmd()
-            .args(["rm", "-f", &container_name])
-            .output();
+        // docker stop/rm 放进 spawn_blocking 并整体限时：docker CLI 卡死（守护进程无响应等）
+        // 时最多等待 20s 即放弃，避免"关闭模型"永久无响应
+        let timeout = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            tokio::task::spawn_blocking({
+                let name = container_name.clone();
+                move || {
+                    let _ = crate::common::utils::platform::docker_cmd()
+                        .args(["stop", "-t", "5", &name])
+                        .output();
+                    let _ = crate::common::utils::platform::docker_cmd()
+                        .args(["rm", "-f", &name])
+                        .output();
+                }
+            }),
+        )
+        .await;
+        if timeout.is_err() {
+            crate::common::utils::logger::write_log(
+                "WARN",
+                "MODEL",
+                &format!("[{}] docker stop/rm 超时（20s），改用进程树强杀兜底", container_name),
+            );
+        }
     }
 
     crate::common::utils::platform::kill_process_tree(pid);

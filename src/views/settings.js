@@ -157,6 +157,14 @@ const template = `
   .version-table td:first-child { color: var(--c-text-2); width: 140px; }
   .version-table td:last-child { color: var(--c-text); font-weight: 500; }
 
+  /* 镜像管理表：自适应宽度，不限制最大宽度 */
+  .version-table.engine-table { max-width: none; table-layout: auto; }
+  .version-table.engine-table th { padding: 6px 10px; font-size: 12px; color: var(--c-text-3); font-weight: 500; }
+  .version-table.engine-table td { padding: 8px 10px; }
+  .version-table.engine-table td:first-child,
+  .version-table.engine-table td:last-child { width: auto; color: inherit; font-weight: normal; }
+  .version-table.engine-table td:first-child { font-family: 'SFMono-Regular',Consolas,monospace; font-size: 12px; white-space: nowrap; }
+
   .about-content { max-width: 500px; }
   .about-content h3 { font-size: 20px; color: var(--c-text-hi); margin-bottom: 8px; }
   .about-content .about-subtitle { font-size: 13px; color: var(--c-accent); margin-bottom: 20px; }
@@ -260,7 +268,10 @@ const template = `
           <div class="param-group-title">${_t("Docker 部署")}</div>
           <div class="param-row">
             <div class="param-label">${_t("镜像")}<div class="param-key">sglang_image</div></div>
-            <div class="param-input"><input type="text" id="sglang_image" placeholder="lmsysorg/sglang:v0.5.17" style="max-width:400px;"><div class="param-desc">${_t("固定版本 tag，DGX Spark 推荐 lmsysorg/sglang:v0.5.17（多架构自动含 arm64）")}</div></div>
+            <div class="param-input">
+              <select id="sglang_image" style="max-width:480px;"></select>
+              <div class="param-desc">${_t("下拉列出本地已拉取的推理引擎版本，选中即保存生效（重启模型后应用）；列表外的版本可在模型清单 sglang-version 指定")}</div>
+            </div>
           </div>
           <div class="param-row">
             <div class="param-label">${_t("共享内存")}<div class="param-key">--shm-size</div></div>
@@ -270,18 +281,14 @@ const template = `
 
         <div class="param-group">
           <div class="param-group-title">${_t("推理引擎管理")}</div>
-          <div class="param-row">
-            <div class="param-label">${_t("当前配置镜像")}<div class="param-key">sglang_image</div></div>
-            <div class="param-input" style="align-items:center;">
-              <span id="engine-current" style="font-family:monospace;font-size:13px;word-break:break-all;">-</span>
-              <button class="btn-reset" id="engine-refresh-btn" style="margin:0 0 0 12px;padding:6px 16px;font-size:13px;">${_t("刷新")}</button>
-            </div>
-          </div>
-          <div class="param-desc" style="margin-bottom:10px;">${_t("从本地已拉取的版本中选择使用（写入上方镜像字段并保存，重启模型后生效）；列表外的版本可在镜像输入框中手动填写，启动时自动拉取")}</div>
-          <table class="version-table" style="width:100%;">
-            <thead><tr><th style="text-align:left;">${_t("版本")}</th><th>${_t("大小")}</th><th>${_t("创建时间")}</th><th>${_t("状态")}</th><th>${_t("操作")}</th></tr></thead>
-            <tbody id="engine-tbody"><tr><td colspan="5" style="text-align:center;color:var(--c-text-3);padding:16px;">${_t("加载中...")}</td></tr></tbody>
+          <div class="param-desc" style="margin-bottom:10px;">${_t("本地已拉取的镜像列表；正在被运行中的模型使用的镜像不可删除")}</div>
+          <div style="overflow-x:auto;">
+          <table class="version-table engine-table" style="width:100%;">
+            <thead><tr><th style="text-align:left;">${_t("版本")}</th><th>${_t("大小")}</th><th>${_t("状态")}</th><th>${_t("操作")}</th></tr></thead>
+            <tbody id="engine-tbody"><tr><td colspan="4" style="text-align:center;color:var(--c-text-3);padding:16px;">${_t("加载中...")}</td></tr></tbody>
           </table>
+          </div>
+          <button class="btn-reset" id="engine-refresh-btn" style="margin-top:10px;padding:6px 16px;font-size:13px;">${_t("刷新")}</button>
         </div>
 
         <div class="param-group">
@@ -787,54 +794,53 @@ function renderThemeGrid() {
 
 // ===== 推理引擎镜像管理 =====
 
+// 下拉与列表联动：下拉实时反映配置（即当前选中的本地版本），列表标出使用中/已配置
 async function loadEngineImages() {
   const tbody = document.getElementById("engine-tbody");
-  const curEl = document.getElementById("engine-current");
   if (!tbody) return;
-  const cur = (document.getElementById("sglang_image").value || "").trim();
-  if (curEl) curEl.textContent = cur || _t("未设置");
   try {
+    let configured = "";
+    try {
+      const s = await invoke()("load_settings");
+      configured = (s.sglang_args && s.sglang_args.image) || "";
+    } catch (_) {}
+
     const images = await invoke()("list_engine_images");
+    const sel = document.getElementById("sglang_image");
+
+    // 下拉：本地镜像 + 配置值（不在本地时前置追加，保证默认选中）
+    if (sel) {
+      const tags = images.map(function (i) { return i.repoTag; });
+      if (configured && tags.indexOf(configured) === -1) tags.unshift(configured);
+      sel.innerHTML = tags.map(function (t) {
+        return '<option value="' + escHtml(t) + '"' + (t === configured ? ' selected' : '') + '>' + escHtml(t) + '</option>';
+      }).join("");
+      if (tags.length === 0) {
+        sel.innerHTML = '<option value="">--</option>';
+      }
+    }
+
     if (!images || images.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--c-text-3);padding:16px;">' + _t("本地没有已拉取的推理引擎镜像") + '</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--c-text-3);padding:16px;">' + _t("本地没有已拉取的推理引擎镜像") + '</td></tr>';
       return;
     }
     tbody.innerHTML = images.map(function (img) {
-      const isCurrent = cur === img.repoTag;
-      const status = img.inUse ? '<span style="color:#4caf50;">' + _t("使用中") + '</span>' : (isCurrent ? _t("已配置") : _t("未使用"));
-      const useBtn = img.inUse ? "" : '<button class="btn-reset engine-use-btn" data-tag="' + escHtml(img.repoTag) + '" style="margin:0;padding:4px 12px;font-size:12px;">' + _t("使用") + '</button>';
-      const delBtn = img.inUse ? "" : '<button class="btn-reset engine-del-btn" data-tag="' + escHtml(img.repoTag) + '" style="margin:0 0 0 8px;padding:4px 12px;font-size:12px;color:#f44336;">' + _t("删除") + '</button>';
+      const inUse = img.inUse;
+      const isCurrent = configured === img.repoTag;
+      const status = inUse ? '<span style="color:#4caf50;">' + _t("使用中") + '</span>' : (isCurrent ? _t("已配置") : _t("未使用"));
+      const delBtn = inUse ? "" : '<button class="btn-reset engine-del-btn" data-tag="' + escHtml(img.repoTag) + '" style="margin:0;padding:4px 12px;font-size:12px;color:#f44336;">' + _t("删除") + '</button>';
       return '<tr>' +
         '<td style="font-family:monospace;font-size:12px;">' + escHtml(img.repoTag) + '</td>' +
         '<td style="text-align:center;font-size:12px;">' + escHtml(img.size) + '</td>' +
-        '<td style="text-align:center;font-size:12px;">' + escHtml(img.created) + '</td>' +
         '<td style="text-align:center;font-size:12px;">' + status + '</td>' +
-        '<td style="text-align:center;white-space:nowrap;">' + useBtn + delBtn + '</td>' +
+        '<td style="text-align:center;white-space:nowrap;">' + delBtn + '</td>' +
       '</tr>';
     }).join("");
-    tbody.querySelectorAll(".engine-use-btn").forEach(function (btn) {
-      btn.addEventListener("click", function () { useEngineImage(btn.dataset.tag); });
-    });
     tbody.querySelectorAll(".engine-del-btn").forEach(function (btn) {
       btn.addEventListener("click", function () { deleteEngineImage(btn.dataset.tag); });
     });
   } catch (e) {
-    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#f44336;padding:16px;">' + _t("列表加载失败: ") + escHtml(String(e)) + '</td></tr>';
-  }
-}
-
-async function useEngineImage(tag) {
-  try {
-    let s = await invoke()("load_settings");
-    s.sglang_args = s.sglang_args || {};
-    s.sglang_args.image = tag;
-    await invoke()("save_settings", { settings: s });
-    const input = document.getElementById("sglang_image");
-    if (input) input.value = tag;
-    showToast(_t("已切换使用版本，重启模型后生效"));
-    loadEngineImages();
-  } catch (e) {
-    showToast(_t("保存失败: ") + e, true);
+    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#f44336;padding:16px;">' + _t("列表加载失败: ") + escHtml(String(e)) + '</td></tr>';
   }
 }
 
@@ -921,6 +927,9 @@ export default {
 
     var engineRefresh = document.getElementById("engine-refresh-btn");
     if (engineRefresh) engineRefresh.addEventListener("click", loadEngineImages);
+    // 下拉切换镜像：setupAutoSave 已负责保存，这里仅联动刷新列表标注
+    var engineSel = document.getElementById("sglang_image");
+    if (engineSel) engineSel.addEventListener("change", loadEngineImages);
 
     (async function() {
       try {

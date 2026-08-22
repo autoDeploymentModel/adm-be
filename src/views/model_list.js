@@ -872,6 +872,10 @@ async function handleStart(btn) {
 
 async function handleStop(btn) {
   console.log("[model_list] 停止模型");
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = _t("停止中...");
+  }
   try {
     await invoke()("stop_model");
     S().runningModelId = null;
@@ -879,6 +883,7 @@ async function handleStop(btn) {
     renderModelTable();
   } catch (e) {
     showToast(_t("停止失败: ") + e);
+    if (btn) { btn.disabled = false; btn.textContent = _t("关闭模型"); }
   }
 }
 

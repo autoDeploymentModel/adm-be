@@ -82,7 +82,6 @@ pub async fn write_app_log(level: String, tag: String, message: String) -> Resul
 pub struct EngineImageInfo {
     pub repo_tag: String,
     pub size: String,
-    pub created: String,
     pub id: String,
     pub in_use: bool,
 }
@@ -90,8 +89,9 @@ pub struct EngineImageInfo {
 /// 收集本地已拉取的推理引擎镜像：docker images 过滤仓库名含 sglang 的条目，
 /// 并标记当前运行中容器正在使用的镜像（阻止删除）。
 fn collect_engine_images(state: &AppState) -> Result<Vec<EngineImageInfo>, AppError> {
+    // 用 JSON 格式输出解析（tab 列解析在部分 docker 版本上字段会错位/缺失）
     let out = crate::common::utils::platform::docker_cmd()
-        .args(["images", "--no-trunc", "--format", "{{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.Size}}\t{{.CreatedSince}}"])
+        .args(["images", "--no-trunc", "--format", "{{json .}}"])
         .output()
         .map_err(|e| AppError::msg(format!("执行 docker images 失败: {}", e)))?;
     if !out.status.success() {
@@ -115,12 +115,16 @@ fn collect_engine_images(state: &AppState) -> Result<Vec<EngineImageInfo>, AppEr
 
     let mut images = Vec::new();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() < 5 {
+        let line = line.trim();
+        if line.is_empty() {
             continue;
         }
-        let repo = parts[0].trim();
-        let tag = parts[1].trim();
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let repo = v["Repository"].as_str().unwrap_or("").trim();
+        let tag = v["Tag"].as_str().unwrap_or("").trim();
         if repo.is_empty() || tag.is_empty() || tag == "<none>" {
             continue;
         }
@@ -128,11 +132,10 @@ fn collect_engine_images(state: &AppState) -> Result<Vec<EngineImageInfo>, AppEr
         if !repo.contains("sglang") && !tag.contains("sglang") {
             continue;
         }
-        let id = parts[2].trim().to_string();
+        let id = v["ID"].as_str().unwrap_or("").trim().to_string();
         images.push(EngineImageInfo {
             repo_tag: format!("{}:{}", repo, tag),
-            size: parts[3].trim().to_string(),
-            created: parts[4].trim().to_string(),
+            size: v["Size"].as_str().unwrap_or("-").trim().to_string(),
             in_use: use_id.as_deref() == Some(id.as_str()),
             id,
         });
