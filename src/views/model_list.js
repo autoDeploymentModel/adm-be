@@ -851,11 +851,13 @@ async function handleStart(btn) {
     // 模型配置的 sglang_version（完整镜像名，如 lmsysorg/sglang:dev-cu13-qwen38-27b-dflash2）→ 指定该模型使用的镜像
     const model = (S().modelList || []).find(m => m.model_id === modelId);
     const sglangVersion = (model && model.sglang_version) || null;
+    // 模型配置的官方推荐启动参数（如 --mem-fraction-static 0.80）→ 优先级最高的启动参数
+    const sglangFlags = (model && model.sglang_flags) || null;
 
     S().startingModelId = modelId;
     renderModelTable();
 
-    await invoke()("start_model", { modelId: modelId, params: params, device: device, sglangVersion: sglangVersion });
+    await invoke()("start_model", { modelId: modelId, params: params, device: device, sglangVersion: sglangVersion, sglangFlags: sglangFlags });
     console.log("[model_list] 启动模型 invoke 完成:", modelId);
   } catch (e) {
     console.error("[model_list] 启动失败:", e);

@@ -778,6 +778,7 @@ async fn start_sglang_docker(
     params: LaunchParams,
     device: Option<String>,
     sglang_version: Option<String>,
+    sglang_flags: Option<Vec<String>>,
 ) -> Result<(), AppError> {
     const CONTAINER_PREFIX: &str = "adm-sglang-";
     let container_name = format!("{}{}", CONTAINER_PREFIX, model_id);
@@ -960,7 +961,7 @@ async fn start_sglang_docker(
     let user_specified_spec = sglang_args.extra_args.lines().any(|l| {
         let t = l.trim();
         t.starts_with("--speculative-algorithm") || t.starts_with("speculative-algorithm")
-    });
+    }) || sglang_flags.as_deref().unwrap_or(&[]).iter().any(|f| f.contains("speculative-algorithm"));
     if has_mtp_weight && !user_specified_spec {
         args.extend([
             "--speculative-algorithm".to_string(),
@@ -982,6 +983,41 @@ async fn start_sglang_docker(
         )
         .ok();
         crate::common::utils::logger::write_log("INFO", "MODEL", &format!("[{}] MTP 权重检测到，已启用 EAGLE 投机解码", model_id));
+    }
+
+    // ===== 模型配置 SGLang 参数（sglang_flags）=====
+    // 官方 cookbook 推荐值，最后追加，优先级最高：同名参数可覆盖设置页配置与默认值
+    //（SGLang 各参数为 argparse 后值生效）。每条格式 "--key value" 或 "--flag"。
+    if let Some(flags) = sglang_flags.as_deref().filter(|f| !f.is_empty()) {
+        let mut applied = Vec::new();
+        for raw in flags {
+            let raw = raw.trim();
+            if raw.is_empty() { continue; }
+            let (k, v) = match raw.split_once(char::is_whitespace) {
+                Some((k, v)) => (k, v.trim()),
+                None => (raw, ""),
+            };
+            let k = k.trim_start_matches("--");
+            if k.is_empty() { continue; }
+            args.push(format!("--{}", k));
+            applied.push(format!("--{}", k));
+            if !v.is_empty() {
+                args.push(v.to_string());
+                applied.push(v.to_string());
+            }
+        }
+        if !applied.is_empty() {
+            app.emit(
+                "model-log",
+                serde_json::json!({
+                    "model_id": model_id,
+                    "line": format!("[模型配置] 已应用模型清单 sglang_flags（优先级最高）：{}", applied.join(" ")),
+                    "source": "stdout",
+                }),
+            )
+            .ok();
+            crate::common::utils::logger::write_log("INFO", "MODEL", &format!("[{}] 应用模型清单 sglang_flags: {}", model_id, applied.join(" ")));
+        }
     }
 
     dbg_log!("[DEBUG] sglang docker args: {:?}", args);
@@ -1154,6 +1190,7 @@ pub async fn start_model(
     params: LaunchParams,
     device: Option<String>,
     sglang_version: Option<String>,
+    sglang_flags: Option<Vec<String>>,
 ) -> Result<(), AppError> {
     {
         let pid_lock = state.running_process.lock().map_err(|e| e.to_string())?;
@@ -1170,7 +1207,7 @@ pub async fn start_model(
     let is_dir_model = model_dir.join(".done").exists()
         || (model_dir.join("config.json").exists() && model_dir.join("model.safetensors").exists());
     if is_dir_model {
-        return start_sglang_docker(&app, &state, &model_id, &model_dir, params, device, sglang_version).await;
+        return start_sglang_docker(&app, &state, &model_id, &model_dir, params, device, sglang_version, sglang_flags).await;
     }
 
     // 仅支持 SGLang Docker 部署（safetensors 目录模型）

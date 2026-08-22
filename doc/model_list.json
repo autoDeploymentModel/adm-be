@@ -1,6 +1,6 @@
 [
     {
-        "model_id": "Qwen3.5-9B-Q4_K_M",
+        "model_id": "Qwen3.8-27B-NVFP4",
         "model_download_files": [
             "https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4/resolve/main/chat_template.jinja",
             "https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4/resolve/main/config.json",
@@ -17,7 +17,17 @@
         "model_support_devices": [
             "dgx-spark-128G"
         ],
-        "sglang_version": "lmsysorg/sglang:dev-cu13-qwen38-27b-dflash2",
+        "sglang_version": "lmsysorg/sglang:dev-qwen38-27b-dflash2",
+        "sglang_flags": [
+            "--trust-remote-code",
+            "--kv-cache-dtype fp8_e4m3",
+            "--mem-fraction-static 0.80",
+            "--attention-backend flashinfer",
+            "--chunked-prefill-size 2048",
+            "--reasoning-parser qwen3",
+            "--tool-call-parser qwen3_coder",
+            "--enable-linear-replayssm-spec"
+        ],
         "model_size": "23.4 GB",
         "model_type": "视觉多模态理解",
         "model_description": "支持对话,推理,图片识别",

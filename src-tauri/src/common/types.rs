@@ -45,6 +45,10 @@ pub struct RemoteModel {
     /// 模型指定的 SGLang 镜像（完整 Docker 镜像名，如 "lmsysorg/sglang:dev-cu13-qwen38-27b-dflash2"）；非空时启动直接使用
     #[serde(default)]
     pub sglang_version: String,
+    /// 模型指定的 SGLang 启动参数（官方 cookbook 推荐值，如 ["--mem-fraction-static 0.80"]）；
+    /// 每条为完整 `--key value` 或 `--flag`，最后追加，优先级最高（可覆盖设置页同名参数与默认值）
+    #[serde(default)]
+    pub sglang_flags: Vec<String>,
     #[serde(default)]
     pub model_size: String,
     #[serde(default)]

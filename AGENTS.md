@@ -43,7 +43,8 @@
 - **NVFP4 在 DGX Spark（GB10）有已知 CUDA 崩溃问题**：优先使用 FP8 权重模型；NVFP4 模型在 Spark 上异常时换 FP8。
 - **模型下载（多文件目录）**：`model_download_files` 清单逐文件 `.part` 续传，下载完成写 `.done`；所有 `huggingface.co` 自动替换为 `hf-mirror.com`。
 - **SGLang 参数**：设置页「模型启动参数」面板配置 `sglang_args`（image/shm_size/tp/mem-fraction-static/dtype/quantization/kv-cache-dtype/schedule-policy/请求数/chunked-prefill/log 等 + `extra_args` 每行 `key=value` 追加 `--key value`），仅非空/非默认值拼入命令。**官方参数文档（权威，改参数前必查）：`https://docs.sglang.io/docs/advanced_features/server_arguments`**；推测解码文档：`https://docs.sglang.io/docs/advanced_features/speculative_decoding`；DeepSeek MTP 用法：`https://docs.sglang.io/basic_usage/deepseek_v3.html`。设置页下拉选项必须与文档支持的枚举值完全一致，新增/变更参数前先查文档再改代码。
-- **MTP 自动启用**：模型目录含 MTP 权重（`model_mtp.safetensors` 等，文件名含 `mtp` 且为 `.safetensors`/`.bin`）时自动追加 `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`（SGLang 中 NEXTN 是 EAGLE 别名，MTP 权重同目录自动加载，无需 `--speculative-draft-model-path`）；`extra_args` 已自定义 `speculative-algorithm` 则跳过。实现位置：`model_list.rs` `start_sglang_docker`。
+- **MTP 自动启用**：模型目录含 MTP 权重（`model_mtp.safetensors` 等，文件名含 `mtp` 且为 `.safetensors`/`.bin`）时自动追加 `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`（SGLang 中 NEXTN 是 EAGLE 别名，MTP 权重同目录自动加载，无需 `--speculative-draft-model-path`）；`extra_args` 或模型清单 `sglang_flags` 已自定义 `speculative-algorithm` 则跳过。实现位置：`model_list.rs` `start_sglang_docker`。
+- **模型清单 `sglang_flags`**：`RemoteModel` 可带官方推荐启动参数数组（每条 `--key value` 或 `--flag`），启动时最后追加、优先级最高（可覆盖设置页同名参数，SGLang 后值生效），经前端 `start_model` 的 `sglangFlags` 透传；含 `speculative-algorithm` 时跳过 MTP 自动启用。示例见 `doc/model_list.json`（Qwen3.8-27B DGX Spark 配方）。
 - **硬件优先级**：`hwinfo` 插件数据覆盖 `sysinfo`。
 - **更新流程**：启动后延迟 3 秒 → 应用更新（不再有 llamacpp / VC++ 运行库流程）。
 - **窗口关闭**：`cleanup_processes`（托盘退出 / 窗口关闭 / `ExitRequested` 统一入口，幂等）停止 SGLang 容器（`docker stop/rm`）+ 杀 llama-server/sd-cli 残留兜底。
