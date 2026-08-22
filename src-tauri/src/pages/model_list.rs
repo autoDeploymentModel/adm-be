@@ -440,6 +440,8 @@ async fn check_docker_env(
     image: &str,
 ) -> Result<String, AppError> {
     let log = |line: String| {
+        // 同时写入日志文件（设置 → 运行日志可查），与事件转发并存
+        crate::common::utils::logger::write_log("INFO", "DOCKER", &line);
         app.emit(
             "model-log",
             serde_json::json!({

@@ -755,6 +755,29 @@ function goBack() { location.hash = "#/list"; }
 
 // ===== 运行日志 =====
 
+// 实时日志轮询（仅当天日志自动刷新，其他日期静态展示）
+const LOG_POLL_MS = 2000;
+let logPollTimer = null;
+
+function todayStr() {
+  const d = new Date();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return d.getFullYear() + "-" + m + "-" + day;
+}
+
+function stopLogPolling() {
+  if (logPollTimer) { clearInterval(logPollTimer); logPollTimer = null; }
+}
+
+// 选中日期为今天时开启轮询，否则停止；date 为空（读取默认今天）也开启
+function syncLogPolling(date) {
+  stopLogPolling();
+  if (!date || date === todayStr()) {
+    logPollTimer = setInterval(function () { loadLogContent(date, true); }, LOG_POLL_MS);
+  }
+}
+
 async function loadLogDates() {
   try {
     const dates = await invoke()("list_log_dates");
@@ -762,6 +785,7 @@ async function loadLogDates() {
     if (!select) return;
     select.innerHTML = "";
     if (dates.length === 0) {
+      stopLogPolling();
       select.innerHTML = '<option value="">' + _t("暂无日志") + '</option>';
       document.getElementById("log-content").textContent = _t("暂无日志");
       return;
@@ -773,22 +797,28 @@ async function loadLogDates() {
       select.appendChild(opt);
     });
     loadLogContent(dates[0]);
+    syncLogPolling(dates[0]);
   } catch (e) {
     console.error("[settings] 加载日志日期失败:", e);
     document.getElementById("log-content").textContent = _t("加载失败: ") + e;
   }
 }
 
-async function loadLogContent(date) {
+async function loadLogContent(date, isPoll) {
   const pre = document.getElementById("log-content");
   if (!pre) return;
-  pre.textContent = _t("加载中...");
+  if (!isPoll) pre.textContent = _t("加载中...");
   try {
     const content = await invoke()("read_log", { date: date });
-    pre.textContent = content || _t("暂无日志");
-    pre.scrollTop = pre.scrollHeight;
+    const text = content || _t("暂无日志");
+    // 轮询时内容未变不重绘（避免闪烁/打断滚动）；手动加载总是刷新
+    if (isPoll && pre.textContent === text) return;
+    // 跟踪是否接近底部：轮询仅在用户停留底部时自动跟随，上翻查看历史不被打断
+    const nearBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 40;
+    pre.textContent = text;
+    if (!isPoll || nearBottom) pre.scrollTop = pre.scrollHeight;
   } catch (e) {
-    pre.textContent = _t("加载失败: ") + e;
+    if (!isPoll) pre.textContent = _t("加载失败: ") + e;
   }
 }
 
@@ -1001,11 +1031,15 @@ export default {
         document.getElementById("log-content").textContent = _t("暂无日志");
         var sel = document.getElementById("log-date-select");
         if (sel) sel.innerHTML = '<option value="">' + _t("暂无日志") + '</option>';
+        stopLogPolling();
         showToast(_t("日志已清空"));
       } catch (e) { showToast(_t("清空失败: ") + e, true); }
     });
     var logDateSel = document.getElementById("log-date-select");
-    if (logDateSel) logDateSel.addEventListener("change", function() { loadLogContent(this.value); });
+    if (logDateSel) logDateSel.addEventListener("change", function() {
+      syncLogPolling(this.value);
+      loadLogContent(this.value);
+    });
 
     // 语言切换：保存到 Settings.language + localStorage，并立即重建当前视图生效
     const langSelect = document.getElementById("ui-lang-select");
@@ -1051,5 +1085,6 @@ export default {
   },
   unmount() {
     console.log("[settings] unmount()");
+    stopLogPolling();
   }
 };
