@@ -25,6 +25,7 @@ pub async fn start_benchmark(
     let port = state.running_port.lock().map_err(|e| e.to_string())?.unwrap_or(5678);
 
     let container_name = container.ok_or("没有正在运行的模型容器")?;
+    let model_id = state.running_model_id.lock().map_err(|e| e.to_string())?.clone().unwrap_or_else(|| "default".to_string());
 
     {
         let mut running = state.benchmark_running.lock().map_err(|e| e.to_string())?;
@@ -40,14 +41,25 @@ pub async fn start_benchmark(
 
     let base_url = format!("http://127.0.0.1:{}", port);
 
+    // 容器通常无外网，random 数据集默认会下载 ShareGPT 语料；先写入一份本地 JSON 供 --dataset-path 使用
+    let _ = crate::common::utils::platform::docker_cmd()
+        .args([
+            "exec", &container_name,
+            "sh", "-c",
+            r#"python3 -c 'import json;json.dump([{"conversations":[{"value":"hello world, this is a benchmark prompt from admapp"},{"value":"hi there, this is the assistant reply"}]} for _ in range(20)], open("/tmp/bench_sharegpt.json","w",encoding="utf-8"))'"#,
+        ])
+        .output();
+
     let mut cmd = crate::common::utils::platform::docker_cmd();
     cmd.args([
-        "exec", &container_name,
-        "python3", "-m", "sglang.bench_serving",
+        "exec", "-e", "HF_HUB_OFFLINE=1", &container_name,
+        "python3", "-m", "sglang.benchmark.serving",
         "--backend", "sglang",
         "--base-url", &base_url,
         "--model", "default",
+        "--tokenizer", &format!("/models/{}", model_id),
         "--dataset-name", "random",
+        "--dataset-path", "/tmp/bench_sharegpt.json",
         "--random-input-len", &input_len.to_string(),
         "--random-output-len", &output_len.to_string(),
         "--num-prompts", &num_prompts.to_string(),
