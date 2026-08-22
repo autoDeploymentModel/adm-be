@@ -116,6 +116,51 @@ pub async fn scan_part_files(app: tauri::AppHandle) -> Result<Vec<PartFileProgre
     Ok(result)
 }
 
+/// 展开分片文件模式：URL 文件名形如 `model-00001-of-00048.safetensors` 且序号以 1
+/// 开头时，自动展开为 model-00001..00048-of-00048；非分片模式原样返回自身。
+fn expand_shard_urls(url: &str) -> Vec<String> {
+    let Some((dir, fname)) = url.rsplit_once('/') else {
+        return vec![url.to_string()];
+    };
+    let Some(of_idx) = fname.rfind("-of-") else {
+        return vec![url.to_string()];
+    };
+    let (head, tail) = fname.split_at(of_idx);
+    let Some(dash) = head.rfind('-') else {
+        return vec![url.to_string()];
+    };
+    let prefix = &head[..dash];
+    let start_str = &head[dash + 1..];
+    let rest = &tail[4..]; // 跳过 "-of-"
+    let Some(dot) = rest.find('.') else {
+        return vec![url.to_string()];
+    };
+    let total_str = &rest[..dot];
+    let ext = &rest[dot..];
+    if start_str.is_empty()
+        || total_str.is_empty()
+        || !start_str.bytes().all(|b| b.is_ascii_digit())
+        || !total_str.bytes().all(|b| b.is_ascii_digit())
+    {
+        return vec![url.to_string()];
+    }
+    let Ok(start) = start_str.parse::<u32>() else {
+        return vec![url.to_string()];
+    };
+    let Ok(total) = total_str.parse::<u32>() else {
+        return vec![url.to_string()];
+    };
+    // 仅当序号从 1 开始才展开全部分片，避免误伤其他命名；
+    // 上限 1000 防止恶意/异常 JSON 导致 OOM
+    if total <= 1 || total > 1000 || start != 1 {
+        return vec![url.to_string()];
+    }
+    let width = start_str.len();
+    (1..=total)
+        .map(|i| format!("{}/{}-{:0width$}-of-{}{}", dir, prefix, i, total_str, ext, width = width))
+        .collect()
+}
+
 #[tauri::command]
 pub async fn fetch_model_list() -> Result<Vec<RemoteModel>, AppError> {
     let client = reqwest::Client::builder()
@@ -138,8 +183,22 @@ pub async fn fetch_model_list() -> Result<Vec<RemoteModel>, AppError> {
         .await
         .map_err(|e| format!("读取响应文本失败: {}", e))?;
 
-    let models: Vec<RemoteModel> = serde_json::from_str(&text)
+    let mut models: Vec<RemoteModel> = serde_json::from_str(&text)
         .map_err(|e| format!("解析模型列表失败: {}", e))?;
+
+    // 统一在此处展开分片 URL，使 fetch_model_list 的返回值与下载清单一致；
+    // download_model 和前端均直接使用展开后的结果，无需重复展开
+    for m in &mut models {
+        if m.model_download_files.is_empty() {
+            continue;
+        }
+        let expanded: Vec<String> = m.model_download_files.iter().flat_map(|u| expand_shard_urls(u)).collect();
+        let mut seen = std::collections::HashSet::new();
+        m.model_download_files = expanded
+            .into_iter()
+            .filter(|u| seen.insert(u.clone()))
+            .collect();
+    }
 
     Ok(models)
 }
@@ -170,6 +229,7 @@ pub async fn download_model(
     // ===== 新格式：HF 仓库多文件目录下载（safetensors 模型） =====
     if let Some(files) = model_files {
         if !files.is_empty() {
+            // 分片 URL 已在 fetch_model_list 中展开，此处直接使用
             let total = files.len();
             app.state::<AppState>().downloading_progress.lock().unwrap_or_else(|e| e.into_inner()).insert(model_id.clone(), 0u8);
 

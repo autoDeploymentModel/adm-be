@@ -1049,7 +1049,8 @@ if (status.running) {
   } catch (e) { console.error("获取模型状态失败:", e); }
 
   try {
-    st.modelList = await invoke()("fetch_model_list");
+    const list = await invoke()("fetch_model_list");
+    st.modelList = list;
   } catch (e) {
     showToast(_t("获取模型列表失败: ") + e);
   }
