@@ -52,7 +52,7 @@ pub async fn start_benchmark(
 
     let mut cmd = crate::common::utils::platform::docker_cmd();
     cmd.args([
-        "exec", "-e", "HF_HUB_OFFLINE=1", &container_name,
+        "exec", "-e", "HF_HUB_OFFLINE=1", "-e", "PYTHONWARNINGS=ignore::FutureWarning", &container_name,
         "python3", "-m", "sglang.benchmark.serving",
         "--backend", "sglang",
         "--base-url", &base_url,

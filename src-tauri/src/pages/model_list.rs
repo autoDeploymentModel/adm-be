@@ -867,6 +867,8 @@ async fn start_sglang_docker(
 
     let mut args: Vec<String> = vec![
         "run".to_string(),
+        "-e".to_string(),
+        "PYTHONWARNINGS=ignore::FutureWarning".to_string(),
         "--name".to_string(),
         container_name.clone(),
         "--gpus".to_string(),

@@ -269,6 +269,22 @@ const template = `
         </div>
 
         <div class="param-group">
+          <div class="param-group-title">${_t("推理引擎管理")}</div>
+          <div class="param-row">
+            <div class="param-label">${_t("当前配置镜像")}<div class="param-key">sglang_image</div></div>
+            <div class="param-input" style="align-items:center;">
+              <span id="engine-current" style="font-family:monospace;font-size:13px;word-break:break-all;">-</span>
+              <button class="btn-reset" id="engine-refresh-btn" style="margin:0 0 0 12px;padding:6px 16px;font-size:13px;">${_t("刷新")}</button>
+            </div>
+          </div>
+          <div class="param-desc" style="margin-bottom:10px;">${_t("从本地已拉取的版本中选择使用（写入上方镜像字段并保存，重启模型后生效）；列表外的版本可在镜像输入框中手动填写，启动时自动拉取")}</div>
+          <table class="version-table" style="width:100%;">
+            <thead><tr><th style="text-align:left;">${_t("版本")}</th><th>${_t("大小")}</th><th>${_t("创建时间")}</th><th>${_t("状态")}</th><th>${_t("操作")}</th></tr></thead>
+            <tbody id="engine-tbody"><tr><td colspan="5" style="text-align:center;color:var(--c-text-3);padding:16px;">${_t("加载中...")}</td></tr></tbody>
+          </table>
+        </div>
+
+        <div class="param-group">
           <div class="param-group-title">${_t("推理参数")}</div>
           <div class="param-row">
             <div class="param-label">${_t("张量并行")}<div class="param-key">--tensor-parallel-size</div></div>
@@ -769,6 +785,71 @@ function renderThemeGrid() {
   });
 }
 
+// ===== 推理引擎镜像管理 =====
+
+async function loadEngineImages() {
+  const tbody = document.getElementById("engine-tbody");
+  const curEl = document.getElementById("engine-current");
+  if (!tbody) return;
+  const cur = (document.getElementById("sglang_image").value || "").trim();
+  if (curEl) curEl.textContent = cur || _t("未设置");
+  try {
+    const images = await invoke()("list_engine_images");
+    if (!images || images.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--c-text-3);padding:16px;">' + _t("本地没有已拉取的推理引擎镜像") + '</td></tr>';
+      return;
+    }
+    tbody.innerHTML = images.map(function (img) {
+      const isCurrent = cur === img.repoTag;
+      const status = img.inUse ? '<span style="color:#4caf50;">' + _t("使用中") + '</span>' : (isCurrent ? _t("已配置") : _t("未使用"));
+      const useBtn = img.inUse ? "" : '<button class="btn-reset engine-use-btn" data-tag="' + escHtml(img.repoTag) + '" style="margin:0;padding:4px 12px;font-size:12px;">' + _t("使用") + '</button>';
+      const delBtn = img.inUse ? "" : '<button class="btn-reset engine-del-btn" data-tag="' + escHtml(img.repoTag) + '" style="margin:0 0 0 8px;padding:4px 12px;font-size:12px;color:#f44336;">' + _t("删除") + '</button>';
+      return '<tr>' +
+        '<td style="font-family:monospace;font-size:12px;">' + escHtml(img.repoTag) + '</td>' +
+        '<td style="text-align:center;font-size:12px;">' + escHtml(img.size) + '</td>' +
+        '<td style="text-align:center;font-size:12px;">' + escHtml(img.created) + '</td>' +
+        '<td style="text-align:center;font-size:12px;">' + status + '</td>' +
+        '<td style="text-align:center;white-space:nowrap;">' + useBtn + delBtn + '</td>' +
+      '</tr>';
+    }).join("");
+    tbody.querySelectorAll(".engine-use-btn").forEach(function (btn) {
+      btn.addEventListener("click", function () { useEngineImage(btn.dataset.tag); });
+    });
+    tbody.querySelectorAll(".engine-del-btn").forEach(function (btn) {
+      btn.addEventListener("click", function () { deleteEngineImage(btn.dataset.tag); });
+    });
+  } catch (e) {
+    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#f44336;padding:16px;">' + _t("列表加载失败: ") + escHtml(String(e)) + '</td></tr>';
+  }
+}
+
+async function useEngineImage(tag) {
+  try {
+    let s = await invoke()("load_settings");
+    s.sglang_args = s.sglang_args || {};
+    s.sglang_args.image = tag;
+    await invoke()("save_settings", { settings: s });
+    const input = document.getElementById("sglang_image");
+    if (input) input.value = tag;
+    showToast(_t("已切换使用版本，重启模型后生效"));
+    loadEngineImages();
+  } catch (e) {
+    showToast(_t("保存失败: ") + e, true);
+  }
+}
+
+async function deleteEngineImage(tag) {
+  const ok = await showConfirmDialog(_t("确认删除镜像 ") + tag + _t("？此操作不可恢复"));
+  if (!ok) return;
+  try {
+    await invoke()("delete_engine_image", { repoTag: tag });
+    showToast(_t("镜像已删除"));
+    loadEngineImages();
+  } catch (e) {
+    showToast(_t("删除失败: ") + e, true);
+  }
+}
+
 export default {
   template,
   mount(root) {
@@ -836,6 +917,10 @@ export default {
 
     setupAutoSave();
     renderThemeGrid();
+    loadEngineImages();
+
+    var engineRefresh = document.getElementById("engine-refresh-btn");
+    if (engineRefresh) engineRefresh.addEventListener("click", loadEngineImages);
 
     (async function() {
       try {
@@ -845,6 +930,8 @@ export default {
         if (settings && params) fillFormFromParams(params);
         // SGLang 详细参数回填
         if (settings && settings.sglang_args) fillSglangArgsForm(settings.sglang_args);
+        // 参数回填后再刷一次镜像列表，保证"当前配置镜像/已配置"标记准确
+        loadEngineImages();
       } catch (e) {
         console.error("加载设置失败:", e);
       }

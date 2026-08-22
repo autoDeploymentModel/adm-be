@@ -153,6 +153,8 @@ pub fn run() {
             settings::fix_docker_permission,
             settings::write_app_log,
             settings::clear_all_logs,
+            settings::list_engine_images,
+            settings::delete_engine_image,
             // benchmark.rs
             benchmark::start_benchmark,
             benchmark::get_benchmark_status,

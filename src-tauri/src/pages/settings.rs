@@ -75,6 +75,100 @@ pub async fn write_app_log(level: String, tag: String, message: String) -> Resul
     Ok(())
 }
 
+// ===== 推理引擎镜像管理 =====
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineImageInfo {
+    pub repo_tag: String,
+    pub size: String,
+    pub created: String,
+    pub id: String,
+    pub in_use: bool,
+}
+
+/// 收集本地已拉取的推理引擎镜像：docker images 过滤仓库名含 sglang 的条目，
+/// 并标记当前运行中容器正在使用的镜像（阻止删除）。
+fn collect_engine_images(state: &AppState) -> Result<Vec<EngineImageInfo>, AppError> {
+    let out = crate::common::utils::platform::docker_cmd()
+        .args(["images", "--no-trunc", "--format", "{{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.Size}}\t{{.CreatedSince}}"])
+        .output()
+        .map_err(|e| AppError::msg(format!("执行 docker images 失败: {}", e)))?;
+    if !out.status.success() {
+        return Err(AppError::msg(format!(
+            "执行 docker images 失败: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+
+    // 当前运行中容器使用的镜像 ID（去掉 sha256: 前缀；--no-trunc 下与 images 输出同为完整 ID）
+    let mut use_id: Option<String> = None;
+    let container = state.running_container.lock().map_err(|e| e.to_string())?.clone();
+    if let Some(c) = container {
+        if let Ok(insp) = crate::common::utils::platform::docker_cmd()
+            .args(["inspect", "-f", "{{.Image}}", &c])
+            .output()
+        {
+            use_id = String::from_utf8_lossy(&insp.stdout).trim().strip_prefix("sha256:").map(|s| s.trim().to_string());
+        }
+    }
+
+    let mut images = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 5 {
+            continue;
+        }
+        let repo = parts[0].trim();
+        let tag = parts[1].trim();
+        if repo.is_empty() || tag.is_empty() || tag == "<none>" {
+            continue;
+        }
+        // 仓库名或 tag 含 sglang 才收（兼容国内镜像源前缀仓库名）
+        if !repo.contains("sglang") && !tag.contains("sglang") {
+            continue;
+        }
+        let id = parts[2].trim().to_string();
+        images.push(EngineImageInfo {
+            repo_tag: format!("{}:{}", repo, tag),
+            size: parts[3].trim().to_string(),
+            created: parts[4].trim().to_string(),
+            in_use: use_id.as_deref() == Some(id.as_str()),
+            id,
+        });
+    }
+    images.sort_by(|a, b| b.repo_tag.cmp(&a.repo_tag));
+    Ok(images)
+}
+
+/// 列出本地已拉取的推理引擎镜像（版本管理面板用）
+#[tauri::command]
+pub async fn list_engine_images(state: tauri::State<'_, AppState>) -> Result<Vec<EngineImageInfo>, AppError> {
+    collect_engine_images(&state)
+}
+
+/// 删除指定 tag 的推理引擎镜像；正在被运行中的模型使用时会拒绝删除
+#[tauri::command]
+pub async fn delete_engine_image(
+    state: tauri::State<'_, AppState>,
+    repo_tag: String,
+) -> Result<(), AppError> {
+    for img in collect_engine_images(&state)? {
+        if img.repo_tag == repo_tag && img.in_use {
+            return Err(AppError::msg("该镜像正在被运行中的模型使用，请先停止模型".to_string()));
+        }
+    }
+    let out = crate::common::utils::platform::docker_cmd()
+        .args(["rmi", &repo_tag])
+        .output()
+        .map_err(|e| AppError::msg(format!("执行 docker rmi 失败: {}", e)))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(AppError::msg(if stderr.is_empty() { "docker rmi 失败".to_string() } else { stderr }));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn clear_all_logs() -> Result<(), AppError> {
     crate::common::utils::logger::clear_all_logs()

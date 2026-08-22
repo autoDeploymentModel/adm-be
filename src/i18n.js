@@ -263,6 +263,27 @@ const EN = {
   "每行一个 key=value，启动时拼成 --key value 追加到命令尾部；布尔值写 true/false；# 开头为注释": "One key=value per line, appended as --key value; booleans as true/false; lines starting with # are comments",
   "完整参数说明见推理引擎官方文档：docs.sglang.io/docs/advanced_features/server_arguments": "Full argument reference (serving engine docs): docs.sglang.io/docs/advanced_features/server_arguments",
 
+  // ===== settings.js - 推理引擎管理 =====
+  "推理引擎管理": "Inference Engine Management",
+  "当前配置镜像": "Configured Image",
+  "未设置": "Not set",
+  "版本": "Version",
+  "大小": "Size",
+  "创建时间": "Created",
+  "状态": "Status",
+  "操作": "Actions",
+  "使用": "Use",
+  "使用中": "In use",
+  "已配置": "Configured",
+  "未使用": "Not in use",
+  "本地没有已拉取的推理引擎镜像": "No local inference engine images",
+  "从本地已拉取的版本中选择使用（写入上方镜像字段并保存，重启模型后生效）；列表外的版本可在镜像输入框中手动填写，启动时自动拉取": "Pick a locally pulled version to use (writes to the image field above and saves; takes effect after model restart). Versions not listed can be typed manually in the image field and will be pulled on startup",
+  "已切换使用版本，重启模型后生效": "Version set, takes effect after model restart",
+  "确认删除镜像 ": "Delete image ",
+  "？此操作不可恢复": "? This action cannot be undone",
+  "镜像已删除": "Image deleted",
+  "列表加载失败: ": "Failed to load list: ",
+
   // ===== settings.js - 运行日志 =====
   "选择日期": "Date",
   "刷新": "Refresh",
