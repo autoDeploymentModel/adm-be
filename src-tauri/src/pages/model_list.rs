@@ -578,7 +578,7 @@ async fn pull_image(
         .map_err(|e| AppError::msg(format!("docker pull 启动失败: {}", e)))?;
 
     use tokio::io::{AsyncBufReadExt, BufReader};
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     // 进度估算（非 TTY 下 docker pull 无统一百分比）：
@@ -588,6 +588,8 @@ async fn pull_image(
     let completed_layers = Arc::new(AtomicUsize::new(0));
     // layer 槽位：sha → 0-based 序号（按出现顺序登记，字节插值用）
     let layer_order: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
+    // 已上报的最高进度：docker 并行下载层完成可能乱序，防止进度条回退
+    let last_pct = Arc::new(AtomicU8::new(0));
 
     let emit_progress = |p: u8| {
         app.emit(
@@ -617,6 +619,7 @@ async fn pull_image(
         let total2 = total_layers.clone();
         let done2 = completed_layers.clone();
         let order2 = layer_order.clone();
+        let lp2 = last_pct.clone();
         let act = last_activity.clone();
         tokio::spawn(async move {
             while let Ok(Some(line)) = reader.next_line().await {
@@ -643,15 +646,18 @@ async fn pull_image(
                         }
                     }
 
-                    // 层完成：按完成数跳一格
+                    // 层完成：按完成数跳一格（单调不回落）
                     if trimmed.contains("Pull complete") || trimmed.contains("Already exists") {
                         let done = done2.fetch_add(1, Ordering::Relaxed) + 1;
                         let total = total2.load(Ordering::Relaxed);
                         if total > 0 {
                             let pct = ((done as f64 / total as f64) * 99.0) as u8;
-                            app_c2.emit("model-pull-progress", serde_json::json!({
-                                "model_id": &mid2, "image": "", "progress": pct,
-                            })).ok();
+                            let prev = lp2.fetch_max(pct, Ordering::Relaxed);
+                            if pct > prev {
+                                app_c2.emit("model-pull-progress", serde_json::json!({
+                                    "model_id": &mid2, "image": "", "progress": pct,
+                                })).ok();
+                            }
                         }
                     }
 
@@ -663,9 +669,12 @@ async fn pull_image(
                                 let idx = order2.lock().unwrap_or_else(|e| e.into_inner()).get(&sha).copied().unwrap_or(0);
                                 if total > 0 && idx < total {
                                     let pct = (((idx as f64) + (p as f64 / 100.0)) / (total as f64) * 99.0) as u8;
-                                    app_c2.emit("model-pull-progress", serde_json::json!({
-                                        "model_id": &mid2, "image": "", "progress": pct.min(99),
-                                    })).ok();
+                                    let prev = lp2.fetch_max(pct.min(99), Ordering::Relaxed);
+                                    if pct > prev {
+                                        app_c2.emit("model-pull-progress", serde_json::json!({
+                                            "model_id": &mid2, "image": "", "progress": pct.min(99),
+                                        })).ok();
+                                    }
                                 }
                             }
                         }

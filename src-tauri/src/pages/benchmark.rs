@@ -21,6 +21,11 @@ pub async fn start_benchmark(
     state: tauri::State<'_, AppState>,
     params: BenchmarkParams,
 ) -> Result<(), AppError> {
+    let container = state.running_container.lock().map_err(|e| e.to_string())?.clone();
+    let port = state.running_port.lock().map_err(|e| e.to_string())?.unwrap_or(5678);
+
+    let container_name = container.ok_or("没有正在运行的模型容器")?;
+
     {
         let mut running = state.benchmark_running.lock().map_err(|e| e.to_string())?;
         if *running {
@@ -28,11 +33,6 @@ pub async fn start_benchmark(
         }
         *running = true;
     }
-
-    let container = state.running_container.lock().map_err(|e| e.to_string())?.clone();
-    let port = state.running_port.lock().map_err(|e| e.to_string())?.unwrap_or(5678);
-
-    let container_name = container.ok_or("没有正在运行的模型容器")?;
 
     let input_len = params.input_len.unwrap_or(1024);
     let output_len = params.output_len.unwrap_or(256);
