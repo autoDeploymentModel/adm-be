@@ -506,43 +506,23 @@ async fn check_docker_env(
         return Ok(image.to_string());
     }
 
-    // 4. 镜像不存在 → 拉取。国内镜像源优先，Docker Hub 直连兜底。
-    let has_registry_prefix = image
-        .split('/')
-        .next()
-        .map(|first| first.contains('.') || first.contains(':'))
-        .unwrap_or(false);
-    let mut attempts: Vec<String> = vec![];
-    if !has_registry_prefix {
-        for mirror in ["docker.1ms.run", "docker.m.daocloud.io", "docker.xuanyuan.me", "hub.rat.dev"] {
-            attempts.push(format!("{}/{}", mirror, image));
+    // 4. 镜像不存在 → 直接 docker pull（镜像加速由 daemon.json registry-mirrors
+    //    配置全局生效，见设置页「Docker 镜像配置」，不再做应用内镜像源回退）
+    match pull_image(app, model_id, image, PULL_TIMEOUT).await {
+        Ok(true) => {
+            log(format!("[Docker] 镜像 {} 拉取完成", image));
+            return Ok(image.to_string());
         }
-    }
-    attempts.push(image.to_string());
-
-    for (idx, candidate) in attempts.iter().enumerate() {
-        let label = if idx == attempts.len() - 1 { "Docker Hub 直连" } else { &format!("镜像源 {}", attempts[idx].split('/').next().unwrap_or("")) };
-        log(format!(
-            "[Docker] 镜像 {} 不存在（{}），开始{}（首次可能需数分钟）...",
-            image, candidate, label
-        ));
-        // 单源超时熔断：PULL_TIMEOUT 内未完成（卡住/无数据/超慢）则 kill 该 pull 进程，自动切换下一个源
-        match pull_image(app, model_id, candidate, PULL_TIMEOUT).await {
-            Ok(true) => {
-                log(format!("[Docker] 镜像 {} 拉取完成，后续将使用 {}", candidate, candidate));
-                return Ok(candidate.clone());
-            }
-            Ok(false) => {
-                log(format!("[Docker] {} 失败，尝试下一个来源...", label));
-            }
-            Err(e) => {
-                log(format!("[Docker] {} 中止: {}，尝试下一个来源...", label, e));
-            }
+        Ok(false) => {
+            log(format!("[Docker] 拉取 {} 失败，中止启动", image));
+        }
+        Err(e) => {
+            log(format!("[Docker] 拉取 {} 中止: {}", image, e));
         }
     }
 
     Err(AppError::msg(format!(
-        "镜像拉取失败（已尝试 Docker Hub 与多个国内镜像源，单源连续 {} 分钟无输出即放弃）：{}\n请检查网络后手动执行: docker pull {}；\n或配置镜像加速器：在 /etc/docker/daemon.json 添加 registry-mirrors 后 sudo systemctl restart docker",
+        "镜像拉取失败（单源连续 {} 分钟无输出即放弃）：{}\n请检查网络或镜像地址后手动执行: docker pull {}；\n国内网络可改用镜像加速：设置页「Docker 镜像配置」写入加速器地址（如 https://docker.1ms.run）并重启 Docker",
         PULL_TIMEOUT.as_secs() / 60,
         image,
         image
@@ -818,22 +798,18 @@ async fn start_sglang_docker(
         Some("dgx-spark-128G") => "64g",
         _ => "32g",
     };
-    // 镜像优先级：模型配置 sglang-version > 设置页镜像 > 机型默认。
-    // 版本字段直接写 tag（如 "v0.5.17"）则拼 lmsysorg/sglang:；写完整镜像名（含 "/" 或 lmsysorg/ 前缀）则原样使用
+    // 镜像优先级：模型配置 sglang_version（完整镜像名）> 设置页镜像 > 机型默认。
+    // sglang_version 直接就是完整镜像名（如 lmsysorg/sglang:dev-cu13-qwen38-27b-dflash2），原样使用不再拼接
     let mut image = if sglang_args.image.is_empty() { default_image.to_string() } else { sglang_args.image.clone() };
     if let Some(ver) = sglang_version.as_deref().map(str::trim) {
         if !ver.is_empty() {
-            image = if ver.contains('/') || ver.starts_with("lmsysorg/") {
-                ver.to_string()
-            } else {
-                format!("lmsysorg/sglang:{}", ver)
-            };
+            image = ver.to_string();
         }
     }
-    crate::common::utils::logger::write_log("INFO", "DOCKER", &format!("[{}] 使用镜像 {}（优先级：模型 sglang-version > 设置页 > 默认）", model_id, image));
+    crate::common::utils::logger::write_log("INFO", "DOCKER", &format!("[{}] 使用镜像 {}（优先级：模型 sglang_version > 设置页 > 默认）", model_id, image));
     app.emit("model-log", serde_json::json!({
         "model_id": model_id,
-        "line": format!("使用镜像 {}（模型 sglang-version / 设置页 / 默认）", image),
+        "line": format!("使用镜像 {}（模型 sglang_version / 设置页 / 默认）", image),
         "source": "stdout",
     })).ok();
     let shm_size = if sglang_args.shm_size.is_empty() { default_shm.to_string() } else { sglang_args.shm_size.clone() };

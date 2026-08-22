@@ -155,6 +155,8 @@ pub fn run() {
             settings::clear_all_logs,
             settings::list_engine_images,
             settings::delete_engine_image,
+            settings::get_docker_mirror_config,
+            settings::save_docker_mirror_config,
             // benchmark.rs
             benchmark::start_benchmark,
             benchmark::get_benchmark_status,

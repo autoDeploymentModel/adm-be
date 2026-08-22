@@ -172,6 +172,156 @@ pub async fn delete_engine_image(
     Ok(())
 }
 
+// ===== Docker 镜像加速配置（daemon.json registry-mirrors）=====
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerMirrorConfig {
+    pub daemon_path: String,
+    pub exists: bool,
+    pub mirrors: Vec<String>,
+    pub platform: &'static str,
+}
+
+/// 各平台 Docker daemon.json 路径（Linux/DGX Spark: /etc/docker/daemon.json；
+/// Windows Docker Desktop: C:\ProgramData\Docker\config\daemon.json）
+fn docker_daemon_path() -> String {
+    if cfg!(target_os = "windows") {
+        "C:\\ProgramData\\Docker\\config\\daemon.json".to_string()
+    } else {
+        "/etc/docker/daemon.json".to_string()
+    }
+}
+
+/// 读取 Docker daemon.json 的 registry-mirrors 配置（用于镜像加速，仅影响后续拉取）
+#[tauri::command]
+pub async fn get_docker_mirror_config() -> Result<DockerMirrorConfig, AppError> {
+    let path = docker_daemon_path();
+    let path_obj = std::path::Path::new(&path);
+    let exists = path_obj.exists();
+    let mirrors = if exists {
+        std::fs::read_to_string(path_obj)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| {
+                v["registry-mirrors"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    Ok(DockerMirrorConfig {
+        daemon_path: path,
+        exists,
+        mirrors,
+        platform: if cfg!(target_os = "windows") { "windows" } else { "linux" },
+    })
+}
+
+/// 保存 registry-mirrors 到 Docker daemon.json 并重启 Docker 服务使配置生效。
+/// Linux：pkexec 提权写 /etc/docker/daemon.json + systemctl/service 重启；
+/// Windows：UAC 提权写 ProgramData + 重启 Docker Desktop。
+#[tauri::command]
+pub async fn save_docker_mirror_config(mirrors: Vec<String>) -> Result<String, AppError> {
+    // 1. 清洗输入：去空白、去重复
+    let mut cleaned: Vec<String> = Vec::new();
+    for m in mirrors {
+        let t = m.trim();
+        if t.is_empty() || cleaned.contains(&t.to_string()) {
+            continue;
+        }
+        cleaned.push(t.to_string());
+    }
+
+    // 2. 读取现有 daemon.json（不存在则空对象），仅更新 registry-mirrors，保留其他字段
+    let path = docker_daemon_path();
+    let path_obj = std::path::Path::new(&path);
+    let mut daemon: serde_json::Value = if path_obj.exists() {
+        std::fs::read_to_string(path_obj)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .unwrap_or_else(|| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+    daemon["registry-mirrors"] = serde_json::Value::Array(
+        cleaned.iter().map(|m| serde_json::Value::String(m.clone())).collect(),
+    );
+
+    // 3. 写入临时文件（当前用户可写），再提权安装到 daemon.json
+    let tmp_dir = std::env::temp_dir();
+    let tmp_json = tmp_dir.join("adm-daemon.json");
+    std::fs::write(&tmp_json, serde_json::to_string_pretty(&daemon).map_err(|e| AppError::msg(format!("序列化 daemon.json 失败: {}", e)))?)
+        .map_err(|e| AppError::msg(format!("写入临时文件失败: {}", e)))?;
+
+    #[cfg(target_os = "windows")]
+    {
+        // UAC 提权：copy 临时文件到 ProgramData，重启 Docker Desktop
+        let ps1 = tmp_dir.join("adm-docker-mirror.ps1");
+        let script = format!(
+            "Copy-Item -Force '{}' '{}'\n\
+             Restart-Service com.docker.service -Force -ErrorAction SilentlyContinue\n\
+             Get-Process 'Docker Desktop' -ErrorAction SilentlyContinue | Stop-Process -Force\n\
+             Start-Sleep -Seconds 2\n\
+             Start-Process 'C:\\Program Files\\Docker\\Docker\\Docker Desktop.exe' -ErrorAction SilentlyContinue\n",
+            tmp_json.display(),
+            path
+        );
+        std::fs::write(&ps1, script).map_err(|e| AppError::msg(format!("写入提权脚本失败: {}", e)))?;
+        let out = tokio::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command"])
+            .arg(format!(
+                "Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{}'",
+                ps1.display()
+            ))
+            .output()
+            .await
+            .map_err(|e| AppError::msg(format!("启动提权进程失败: {}", e)))?;
+        if out.status.success() {
+            return Ok("DOCKER_RESTARTED".to_string());
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        // 兼容英美拼写：canceled（美）/ cancelled（英）
+        if stderr.contains("cancel") || stderr.contains("denied") {
+            return Err(AppError::msg("UAC_CANCELLED".to_string()));
+        }
+        return Err(AppError::msg(format!(
+            "FALLBACK_MANUAL|请在管理员 PowerShell 中执行：\n  Copy-Item -Force '{}' '{}'\n  然后重启 Docker Desktop",
+            tmp_json.display(),
+            path
+        )));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // pkexec 提权：安装 daemon.json + 重启 Docker（systemd 优先，回退 service）
+        let cmd = format!(
+            "install -m 0644 '{}' '{}' && (systemctl restart docker 2>/dev/null || service docker restart 2>/dev/null)",
+            tmp_json.display(),
+            path
+        );
+        let out = tokio::process::Command::new("pkexec")
+            .args(["sh", "-c", &cmd])
+            .output()
+            .await
+            .map_err(|e| AppError::msg(format!("启动 pkexec 失败: {}", e)))?;
+        if out.status.success() {
+            return Ok("DOCKER_RESTARTED".to_string());
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        if stderr.contains("Not authorized") || stderr.contains("dismissed") || stderr.contains("cancel") {
+            return Err(AppError::msg("PKEXEC_CANCELLED".to_string()));
+        }
+        return Err(AppError::msg(format!(
+            "FALLBACK_MANUAL|请在终端执行以下命令并重启 Docker 服务：\n  sudo install -m 0644 '{}' '{}'\n  sudo systemctl restart docker",
+            tmp_json.display(),
+            path
+        )));
+    }
+}
+
 #[tauri::command]
 pub async fn clear_all_logs() -> Result<(), AppError> {
     crate::common::utils::logger::clear_all_logs()

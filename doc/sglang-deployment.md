@@ -74,6 +74,7 @@ DGX Spark 上**优先推荐 FP8 权重**。模型清单配置 NVFP4 模型时若
 
 - `model_download_files`：HF 仓库多文件清单（safetensors 目录模型必需；旧 `model_url` 单文件不再支持启动）
 - `model_support_devices`：适配机型列表；**空数组 = 全机型可用**；首页下拉按此过滤
+- `sglang_version`（可选）：**完整 Docker 镜像名**（如 `lmsysorg/sglang:dev-cu13-qwen38-27b-dflash2`），非空时启动直接使用该镜像（优先级：模型 `sglang_version` > 设置页镜像 > 机型默认）
 - 下载时自动替换 `huggingface.co` → `hf-mirror.com`
 
 ## 5. 模型下载（多文件目录）
@@ -99,12 +100,10 @@ DGX Spark 上**优先推荐 FP8 权重**。模型清单配置 NVFP4 模型时若
 | 1 | Docker CLI 存在 | `docker --version` | 未检测到 Docker CLI，请先安装 Docker |
 | 2 | daemon 运行 | `docker info` | daemon 未运行或不可访问，请启动 Docker 服务 |
 | 3 | NVIDIA runtime | `docker info` 输出含 `nvidia` | 仅日志提示（未配置时可能 --gpus all 失败） |
-| 4 | 镜像存在 | `docker image inspect <image>` | 不存在 → **自动 `docker pull`**（进度逐行转发 `[docker pull]` 到 model-log）；**直接拉取失败自动回退国内镜像源**：`docker.1ms.run` → `docker.m.daocloud.io` → `docker.xuanyuan.me` → `hub.rat.dev`，任一成功则用镜像源前缀镜像启动（如 `docker.1ms.run/lmsysorg/sglang:v0.5.17`）；全部失败提示手动 pull |
+| 4 | 镜像存在 | `docker image inspect <image>` | 不存在 → **自动 `docker pull`**（进度逐行转发 `[docker pull]` 到 model-log）；拉取失败（如 Docker Hub 被墙/超时）提示手动 pull，或配置镜像加速 |
 | 5 | 端口未被占用 | `TcpListener::bind("0.0.0.0:<port>")` | 端口已被占用，请换端口/关进程 |
 
-预检通过后才清理同名残留容器并启动。镜像源列表维护在 `model_list.rs` 的 `check_docker_env`（`attempts` 数组）：Docker Hub 被墙/超时时自动按序回退，无需用户配置；若用户设置页镜像已带 registry 域名（如 `docker.1ms.run/...`），不再套前缀。
-
-> **镜像源提示**：上述国内源列表时效性强（部分可能失效），失效时可在设置页把镜像直接改成可用源前缀，或在 `/etc/docker/daemon.json` 配 `registry-mirrors` 后 `sudo systemctl restart docker`。
+预检通过后才清理同名残留容器并启动。**国内镜像加速**：应用内不再做镜像源回退，改为在设置页「Docker 镜像配置」写入 `daemon.json` 的 `registry-mirrors`（如 `https://docker.1ms.run`，每行一个）并自动重启 Docker（Linux 走 pkexec 提权，Windows 走 UAC），加速对后续所有 `docker pull` 全局生效；也可以手动编辑 `/etc/docker/daemon.json` 后 `sudo systemctl restart docker`。
 
 ### 6.1 生成的 docker run 命令
 

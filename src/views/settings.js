@@ -239,6 +239,7 @@ const template = `
   <div id="settings-layout">
     <nav id="settings-nav">
       <div class="nav-item active" data-panel="launch-params" id="nav-launch-params">${_t("模型启动参数")}</div>
+      <div class="nav-item" data-panel="docker-mirror" id="nav-docker-mirror">${_t("Docker 镜像配置")}</div>
       <div class="nav-item" data-panel="appearance" id="nav-appearance">${_t("外观主题")}</div>
       <div class="nav-item" data-panel="logs" id="nav-logs">${_t("运行日志")}</div>
       <div class="nav-item" data-panel="version" id="nav-version">${_t("系统版本号")}</div>
@@ -270,7 +271,7 @@ const template = `
             <div class="param-label">${_t("镜像")}<div class="param-key">sglang_image</div></div>
             <div class="param-input">
               <select id="sglang_image" style="max-width:480px;"></select>
-              <div class="param-desc">${_t("下拉列出本地已拉取的推理引擎版本，选中即保存生效（重启模型后应用）；列表外的版本可在模型清单 sglang-version 指定")}</div>
+              <div class="param-desc">${_t("下拉列出本地已拉取的推理引擎版本，选中即保存生效（重启模型后应用）；列表外的版本可在模型清单 sglang_version 指定")}</div>
             </div>
           </div>
           <div class="param-row">
@@ -455,6 +456,33 @@ const template = `
         </div>
 
         <button class="btn-reset" id="reset-btn">${_t("恢复默认")}</button>
+      </div>
+
+      <div id="panel-docker-mirror" class="panel">
+        <div class="panel-title">${_t("Docker 镜像配置")}</div>
+
+        <div class="param-group">
+          <div class="param-group-title">${_t("镜像加速（registry-mirrors）")}</div>
+          <div class="param-desc" style="margin-bottom:10px;">${_t("写回 Docker daemon.json 的 registry-mirrors 实现国内镜像加速（仅影响后续镜像拉取），保存后自动重启 Docker 服务使配置生效")}</div>
+          <div class="param-row">
+            <div class="param-label">${_t("配置文件")}<div class="param-key">daemon.json</div></div>
+            <div class="param-input" style="max-width:none;"><span id="mirror-daemon-path" style="font-family:monospace;font-size:12px;color:var(--c-text-2);"></span></div>
+          </div>
+          <div class="param-row" style="align-items:flex-start;">
+            <div class="param-label">${_t("加速器地址")}<div class="param-key">registry-mirrors</div></div>
+            <div class="param-input" style="max-width:480px;">
+              <textarea id="mirror-list" rows="4" style="width:100%;resize:vertical;background:var(--c-panel-2);border:1px solid var(--c-border);border-radius:6px;color:var(--c-text);font-size:13px;padding:8px 12px;font-family:monospace;outline:none;" placeholder="https://docker.1ms.run&#10;https://docker.m.daocloud.io"></textarea>
+              <div class="param-desc">${_t("每行一个加速器地址，留空表示直连 Docker Hub")}</div>
+            </div>
+          </div>
+          <div class="param-row">
+            <div class="param-label">${_t("操作")}</div>
+            <div class="param-input" style="max-width:none;display:flex;align-items:center;gap:10px;">
+              <button class="btn-save" id="mirror-save-btn" style="margin-top:0;font-size:13px;padding:8px 20px;">${_t("保存并重启 Docker")}</button>
+              <span id="mirror-status" style="font-size:12px;color:var(--c-text-3);"></span>
+            </div>
+          </div>
+        </div>
       </div>
 
       <div id="panel-appearance" class="panel">
@@ -837,22 +865,87 @@ async function loadEngineImages() {
       '</tr>';
     }).join("");
     tbody.querySelectorAll(".engine-del-btn").forEach(function (btn) {
-      btn.addEventListener("click", function () { deleteEngineImage(btn.dataset.tag); });
+      btn.addEventListener("click", function () { deleteEngineImage(btn.dataset.tag, btn); });
     });
   } catch (e) {
     tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#f44336;padding:16px;">' + _t("列表加载失败: ") + escHtml(String(e)) + '</td></tr>';
   }
 }
 
-async function deleteEngineImage(tag) {
+async function deleteEngineImage(tag, btn) {
   const ok = await showConfirmDialog(_t("确认删除镜像 ") + tag + _t("？此操作不可恢复"));
   if (!ok) return;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = _t("正在删除...");
+  }
   try {
     await invoke()("delete_engine_image", { repoTag: tag });
     showToast(_t("镜像已删除"));
     loadEngineImages();
   } catch (e) {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = _t("删除");
+    }
     showToast(_t("删除失败: ") + e, true);
+  }
+}
+
+// ===== Docker 镜像配置（daemon.json registry-mirrors）=====
+
+// 解析后端错误消息：FALLBACK_MANUAL|xxx 携带手动执行命令；PKEXEC_CANCELLED / UAC_CANCELLED 为用户取消
+function parseMirrorError(e) {
+  const s = String(e);
+  const idx = s.indexOf("FALLBACK_MANUAL|");
+  if (idx !== -1) return { kind: "manual", message: s.slice(idx + "FALLBACK_MANUAL|".length) };
+  if (s.indexOf("PKEXEC_CANCELLED") !== -1 || s.indexOf("UAC_CANCELLED") !== -1) return { kind: "cancelled", message: "" };
+  return { kind: "error", message: s };
+}
+
+async function loadDockerMirrorConfig() {
+  const statusEl = document.getElementById("mirror-status");
+  try {
+    const cfg = await invoke()("get_docker_mirror_config");
+    const pathEl = document.getElementById("mirror-daemon-path");
+    if (pathEl) pathEl.textContent = cfg.daemonPath + (cfg.exists ? "" : _t("（不存在，保存时将新建）"));
+    const ta = document.getElementById("mirror-list");
+    if (ta) ta.value = (cfg.mirrors || []).join("\n");
+    if (statusEl) statusEl.textContent = "";
+  } catch (e) {
+    if (statusEl) statusEl.textContent = _t("读取失败: ") + e;
+  }
+}
+
+async function saveDockerMirrorConfig() {
+  const ta = document.getElementById("mirror-list");
+  const statusEl = document.getElementById("mirror-status");
+  const btn = document.getElementById("mirror-save-btn");
+  if (!ta || btn.disabled) return;
+  const mirrors = (ta.value || "").split("\n").map(function (l) { return l.trim(); }).filter(Boolean);
+  btn.disabled = true;
+  if (statusEl) statusEl.textContent = _t("正在写入配置并重启 Docker，请稍候...");
+  try {
+    const res = await invoke()("save_docker_mirror_config", { mirrors: mirrors });
+    if (res === "DOCKER_RESTARTED") {
+      if (statusEl) statusEl.textContent = _t("配置已写入，Docker 已重启");
+      showToast(_t("镜像加速配置已生效"));
+      loadDockerMirrorConfig();
+    } else {
+      if (statusEl) statusEl.textContent = String(res);
+    }
+  } catch (e) {
+    const parsed = parseMirrorError(e);
+    if (parsed.kind === "manual") {
+      if (statusEl) statusEl.textContent = _t("需要权限，请手动执行");
+      await showConfirmDialog(_t("需要管理员权限手动执行以下命令：\n\n") + parsed.message);
+    } else if (parsed.kind === "cancelled") {
+      if (statusEl) statusEl.textContent = _t("已取消");
+    } else {
+      if (statusEl) statusEl.textContent = _t("保存失败: ") + parsed.message;
+    }
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -881,6 +974,15 @@ export default {
     var navLogs = document.getElementById("nav-logs");
     if (navLogs) {
       navLogs.addEventListener("click", function() { loadLogDates(); });
+    }
+    // Docker 镜像配置：进入面板时加载当前 daemon.json 配置
+    var navMirror = document.getElementById("nav-docker-mirror");
+    if (navMirror) {
+      navMirror.addEventListener("click", loadDockerMirrorConfig);
+    }
+    var mirrorSaveBtn = document.getElementById("mirror-save-btn");
+    if (mirrorSaveBtn) {
+      mirrorSaveBtn.addEventListener("click", saveDockerMirrorConfig);
     }
     var logRefresh = document.getElementById("log-refresh-btn");
     if (logRefresh) logRefresh.addEventListener("click", function() {

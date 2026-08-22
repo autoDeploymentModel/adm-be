@@ -42,8 +42,8 @@ pub struct RemoteModel {
     /// 适配机型列表（如 "dgx-spark-128G"）；空数组 = 所有机型可用
     #[serde(default)]
     pub model_support_devices: Vec<String>,
-    /// 模型指定的 SGLang 镜像版本（如 "v0.5.17"）；非空时启动拼成 lmsysorg/sglang:<版本>
-    #[serde(default, rename = "sglang-version", alias = "sglang_version")]
+    /// 模型指定的 SGLang 镜像（完整 Docker 镜像名，如 "lmsysorg/sglang:dev-cu13-qwen38-27b-dflash2"）；非空时启动直接使用
+    #[serde(default)]
     pub sglang_version: String,
     #[serde(default)]
     pub model_size: String,

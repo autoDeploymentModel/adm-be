@@ -848,9 +848,9 @@ async function handleStart(btn) {
 
     const device = S().currentDeviceFilter && S().currentDeviceFilter !== "all" ? S().currentDeviceFilter : null;
 
-    // 模型配置的 sglang-version（如 "v0.5.17"）→ 指定该模型使用的 SGLang 镜像版本
+    // 模型配置的 sglang_version（完整镜像名，如 lmsysorg/sglang:dev-cu13-qwen38-27b-dflash2）→ 指定该模型使用的镜像
     const model = (S().modelList || []).find(m => m.model_id === modelId);
-    const sglangVersion = (model && (model["sglang-version"] || model.sglangVersion || "")) || null;
+    const sglangVersion = (model && model.sglang_version) || null;
 
     S().startingModelId = modelId;
     renderModelTable();
