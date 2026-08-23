@@ -845,10 +845,33 @@ pub async fn push_image_to_remote(
 ) -> Result<String, AppError> {
     crate::common::ssh::validate_host(&ip)?;
     crate::common::ssh::validate_ssh_user(&user)?;
-    let image = image.trim();
-    if image.is_empty() {
-        return Err(AppError::msg("镜像名为空".to_string()));
+
+    // 全量同步本机所有推理引擎镜像（仓库名含 sglang，兼容国内镜像源前缀）；
+    // 传入的 image（设置页当前选择）排到最前优先同步
+    let mut images: Vec<String> = Vec::new();
+    match collect_engine_images(&app.state::<AppState>()) {
+        Ok(list) => {
+            for it in list {
+                if !images.contains(&it.repo_tag) {
+                    images.push(it.repo_tag);
+                }
+            }
+        }
+        Err(e) => return Err(e),
     }
+    let sel = image.trim();
+    if !sel.is_empty() {
+        if let Some(pos) = images.iter().position(|i| i == sel) {
+            let m = images.remove(pos);
+            images.insert(0, m);
+        } else {
+            images.insert(0, sel.to_string());
+        }
+    }
+    if images.is_empty() {
+        return Err(AppError::msg("本机没有已下载的推理引擎镜像，请先下载镜像".to_string()));
+    }
+
     let ssh_port = if port == 0 { 22 } else { port };
     let key_ref = key.as_deref().filter(|k| !k.trim().is_empty()).map(str::trim);
 
@@ -867,15 +890,6 @@ pub async fn push_image_to_remote(
     let remote_sudo = rsok && rcout.contains("SUDO_OK");
     let dk = if local_sudo { "sudo -n docker" } else { "docker" };
     let rdk = if remote_sudo { "sudo -n docker" } else { "docker" };
-
-    // 镜像总大小（供 pv -s 显示总进度）；pv 不存在时跳过
-    let mut size = String::new();
-    let size_cmd = format!("{} image inspect --format '{{{{.Size}}}}' {}", dk, crate::common::ssh::sh_quote(&image));
-    if let Ok(out) = tokio::process::Command::new("sh").arg("-c").arg(&size_cmd).output().await {
-        if out.status.success() {
-            size = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        }
-    }
     let has_pv = tokio::process::Command::new("sh")
         .args(["-c", "command -v pv >/dev/null 2>&1 && echo 1 || echo 0"])
         .output()
@@ -883,60 +897,92 @@ pub async fn push_image_to_remote(
         .map(|o| o.stdout.starts_with(b"1"))
         .unwrap_or(false);
 
-    pipe_emit(&app, &ip, "image-push-progress", "save", 3, "导出并流式传输中...");
-    // 光口直连带宽充足（200GbE），不再 gzip 压缩（单线程 gzip 反而成为瓶颈）；
-    // pv 直接计量原始流，进度实时滚动。
-    let remote_cmd = format!(
-        "{} load && {} image inspect {} >/dev/null 2>&1 && echo LOAD_OK || echo LOAD_FAIL",
-        rdk,
-        rdk,
-        crate::common::ssh::sh_quote(&image)
-    );
-    let pipe = if has_pv && !size.is_empty() {
-        format!(
-            "{} save {} | pv -f -s {} | ssh {} {}@{} \"{}\"",
-            dk,
-            crate::common::ssh::sh_quote(&image),
-            size,
-            ssh_opts(ssh_port, key_ref),
-            user.trim(),
-            ip.trim(),
-            remote_cmd
-        )
-    } else {
-        format!(
-            "{} save {} | ssh {} {}@{} \"{}\"",
-            dk,
-            crate::common::ssh::sh_quote(&image),
-            ssh_opts(ssh_port, key_ref),
-            user.trim(),
-            ip.trim(),
-            remote_cmd
-        )
-    };
-
-    let (ok, stdout, err_tail) = run_pipe_with_progress(&app, &ip, "image-push-progress", &pipe, std::time::Duration::from_secs(600)).await
-        .map_err(|e| {
-            if e.to_string().contains("超时") {
-                AppError::msg(format!("{}\n（镜像同步超时，请检查光口连通）", e))
-            } else {
-                e
-            }
-        })?;
-    if !ok || !stdout.contains("LOAD_OK") {
-        let mut detail = if err_tail.trim().is_empty() {
-            stdout.trim().to_string()
-        } else {
-            format!("{}\n{}", stdout.trim(), err_tail.trim())
-        };
-        // 权限失败（远端用户无 docker 权限且无免密 sudo）时给出明确引导
-        if detail.contains("permission denied") || detail.contains("LOAD_FAIL") {
-            detail.push_str("\n提示：远端用户无 docker 权限，请在直连节点将 SSH 用户加入 docker 组（sudo usermod -aG docker <user>），或配置免密 sudo（visudo 添加 <user> ALL=(ALL) NOPASSWD: ALL）后重试");
+    let mut synced = 0usize;
+    let mut skipped = 0usize;
+    for image in &images {
+        // 远端已存在该镜像则跳过
+        let chk_remote = format!(
+            "(sudo -n docker image inspect {} >/dev/null 2>&1 || docker image inspect {} >/dev/null 2>&1) && echo IMAGE_OK || echo IMAGE_MISSING",
+            crate::common::ssh::sh_quote(image),
+            crate::common::ssh::sh_quote(image)
+        );
+        let (iok, iout, _) = crate::common::ssh::ssh_run(
+            &ip, &user, ssh_port, key_ref, &chk_remote, std::time::Duration::from_secs(15),
+        ).await?;
+        if iok && iout.contains("IMAGE_OK") {
+            skipped += 1;
+            continue;
         }
-        return Err(AppError::msg(format!("远端镜像导入失败：\n{}", detail)));
+
+        // 本机镜像总大小（供 pv -s 显示总进度）
+        let mut size = String::new();
+        let size_cmd = format!("{} image inspect --format '{{{{.Size}}}}' {}", dk, crate::common::ssh::sh_quote(image));
+        if let Ok(out) = tokio::process::Command::new("sh").arg("-c").arg(&size_cmd).output().await {
+            if out.status.success() {
+                size = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            }
+        }
+
+        pipe_emit(&app, &ip, "image-push-progress", "save", 3, &format!("同步镜像 {} ...", image));
+        // 光口直连带宽充足（200GbE），不再 gzip 压缩（单线程 gzip 反而成为瓶颈）；
+        // pv 直接计量原始流，进度实时滚动。
+        let remote_cmd = format!(
+            "{} load && {} image inspect {} >/dev/null 2>&1 && echo LOAD_OK || echo LOAD_FAIL",
+            rdk,
+            rdk,
+            crate::common::ssh::sh_quote(image)
+        );
+        let pipe = if has_pv && !size.is_empty() {
+            format!(
+                "{} save {} | pv -f -s {} | ssh {} {}@{} \"{}\"",
+                dk,
+                crate::common::ssh::sh_quote(image),
+                size,
+                ssh_opts(ssh_port, key_ref),
+                user.trim(),
+                ip.trim(),
+                remote_cmd
+            )
+        } else {
+            format!(
+                "{} save {} | ssh {} {}@{} \"{}\"",
+                dk,
+                crate::common::ssh::sh_quote(image),
+                ssh_opts(ssh_port, key_ref),
+                user.trim(),
+                ip.trim(),
+                remote_cmd
+            )
+        };
+
+        let (ok, stdout, err_tail) = run_pipe_with_progress(&app, &ip, "image-push-progress", &pipe, std::time::Duration::from_secs(600)).await
+            .map_err(|e| {
+                if e.to_string().contains("超时") {
+                    AppError::msg(format!("{}\n（同步镜像 {} 超时，请检查光口连通）", e, image))
+                } else {
+                    e
+                }
+            })?;
+        if !ok || !stdout.contains("LOAD_OK") {
+            let mut detail = if err_tail.trim().is_empty() {
+                stdout.trim().to_string()
+            } else {
+                format!("{}\n{}", stdout.trim(), err_tail.trim())
+            };
+            // 权限失败（远端用户无 docker 权限且无免密 sudo）时给出明确引导
+            if detail.contains("permission denied") || detail.contains("LOAD_FAIL") {
+                detail.push_str("\n提示：远端用户无 docker 权限，请在直连节点将 SSH 用户加入 docker 组（sudo usermod -aG docker <user>），或配置免密 sudo（visudo 添加 <user> ALL=(ALL) NOPASSWD: ALL）后重试");
+            }
+            return Err(AppError::msg(format!("同步镜像 {} 失败：\n{}", image, detail)));
+        }
+        synced += 1;
     }
     pipe_emit(&app, &ip, "image-push-progress", "done", 100, "镜像同步完成");
-    Ok(format!("镜像 {} 已流式同步到 {}", image, ip))
+    if synced == 0 {
+        Ok(format!("全部镜像已同步，无需重复（跳过 {} 个已存在）", skipped))
+    } else {
+        Ok(format!("镜像同步完成：新同步 {} 个，跳过 {} 个已存在", synced, skipped))
+    }
 }
 
 /// 一键同步本机所有已下载模型到直连节点（rsync 增量优先，无 rsync 回退 scp -r；

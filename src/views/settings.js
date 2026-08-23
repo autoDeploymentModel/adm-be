@@ -878,13 +878,19 @@ function handleTauriEvent(type, payload) {
   if (!statusEl) return;
   let txt;
   if (type === "image-push-progress") {
-    // 镜像同步：save/transfer 阶段显示正在同步的镜像名，完成阶段显示完成
+    // 镜像同步：显示正在同步的镜像名（save 事件 detail 形如「同步镜像 xxx ...」），完成阶段显示完成
     if (payload.phase === "done") {
       txt = syncPhaseText("done");
     } else {
-      txt = mnImgSyncName
-        ? _t("正在同步") + " " + mnImgSyncName
-        : syncPhaseText(payload.phase) + (payload.detail ? " · " + payload.detail : "");
+      const img = String(payload.detail || "")
+        .replace(/^同步镜像\s*/, "")
+        .replace(/\s*\.\.\.?$/, "")
+        .trim();
+      txt = img
+        ? _t("正在同步") + " " + img
+        : mnImgSyncName
+          ? _t("正在同步") + " " + mnImgSyncName
+          : syncPhaseText(payload.phase) + (payload.detail ? " · " + payload.detail : "");
     }
   } else if (payload.phase === "save") {
     // 模型同步：显示正在同步的模型名（detail 形如「同步模型 xxx ...」）
