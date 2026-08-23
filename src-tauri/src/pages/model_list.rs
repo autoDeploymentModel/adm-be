@@ -2183,10 +2183,20 @@ pub async fn stop_model(app: tauri::AppHandle, state: tauri::State<'_, AppState>
                 "MODEL",
                 &format!("[{}] docker stop/rm 超时（20s），改用进程树强杀兜底", container_name),
             );
+            // 容器清理失败才兜底强杀 docker CLI（内部带进程名校验，防 pid 复用误杀会话进程）
+            crate::common::utils::platform::kill_process_tree(pid);
+        } else {
+            crate::common::utils::logger::write_log(
+                "INFO",
+                "MODEL",
+                &format!("[{}] 容器已成功停止，docker CLI 随 stop 退出，跳过进程树强杀", container_name),
+            );
         }
     }
-
-    crate::common::utils::platform::kill_process_tree(pid);
+    // 非容器模式（异常残留状态）：仍按进程名校验兜底强杀
+    if state.running_container.lock().map_err(|e| e.to_string())?.is_none() {
+        crate::common::utils::platform::kill_process_tree(pid);
+    }
 
     {
         let mut pid_lock = state.running_process.lock().map_err(|e| e.to_string())?;

@@ -64,13 +64,52 @@ pub fn spawn_detached(cmd: &mut std::process::Command) -> std::io::Result<std::p
     cmd.spawn()
 }
 
+/// 获取进程可执行文件名（小写）。路径不存在/无权限返回 None。
+#[cfg(target_os = "windows")]
+fn process_image_name(pid: u32) -> Option<String> {
+    let out = create_hidden_command("tasklist")
+        .args(["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"])
+        .output()
+        .ok()?;
+    let line = String::from_utf8_lossy(&out.stdout);
+    let name = line.split(',').next()?.trim_matches('"');
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_lowercase())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn process_image_name(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{}/comm", pid))
+        .ok()
+        .map(|s| s.trim().to_lowercase())
+}
+
+/// 仅当 pid 当前仍指向已知的模型进程（docker/sudo/llama-server/sd-cli）时才强杀。
+/// 防止 pid 失效后被操作系统复用于无关进程（如远程会话组件）导致误杀。
+fn is_known_model_process(pid: u32) -> bool {
+    matches!(
+        process_image_name(pid).as_deref(),
+        Some(
+            "docker" | "docker.exe" | "sudo" | "sudo.exe" | "llama-server" | "llama-server.exe"
+                | "sd-cli" | "sd-cli.exe"
+        )
+    )
+}
+
 /// 强杀整个进程树（含子进程），避免 llama-server / SD 派生的子进程残留为孤儿。
 ///
 /// - Windows: `taskkill /PID <pid> /T /F`
 /// - Unix: 先尝试按进程组（kill -9 -<pgid>），失败再直接 kill PID
+/// - 执行前校验 pid 仍指向已知模型进程（防 pid 复用误杀无关/会话级进程）
 #[cfg(target_os = "windows")]
 pub fn kill_process_tree(pid: u32) {
     use std::os::windows::process::CommandExt;
+    if !is_known_model_process(pid) {
+        return;
+    }
     let _ = std::process::Command::new("taskkill")
         .creation_flags(0x08000000)
         .args(["/PID", &pid.to_string(), "/T", "/F"])
@@ -79,6 +118,9 @@ pub fn kill_process_tree(pid: u32) {
 
 #[cfg(not(target_os = "windows"))]
 pub fn kill_process_tree(pid: u32) {
+    if !is_known_model_process(pid) {
+        return;
+    }
     // 尝试杀掉整个进程组（llama-server 启动时已用 setsid 独立成组）
     let _ = std::process::Command::new("kill")
         .args(["-9", &format!("-{}", pid)])
