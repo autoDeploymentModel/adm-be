@@ -1122,6 +1122,16 @@ fn build_multi_node_args(
                 let k = k.trim().trim_start_matches("--");
                 let v = v.trim();
                 if !k.is_empty() && !v.is_empty() {
+                    // 全大写 + 数字/下划线 = 疑似环境变量误填（如 NCCL_DEBUG=TRACE）：
+                    // 不是 SGLang 参数，跳过并提示，避免 --NCCL_DEBUG 启动失败
+                    if k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') && k.len() > 1 {
+                        crate::common::utils::logger::write_log(
+                            "WARN",
+                            "MODEL",
+                            &format!("extra_args 疑似环境变量误填（已忽略，请填到多机「额外环境变量」）：{}={}", k, v),
+                        );
+                        continue;
+                    }
                     args.push(format!("--{}", k));
                     args.push(v.to_string());
                 }
@@ -1853,6 +1863,15 @@ async fn start_sglang_docker(
                 let k = k.trim().trim_start_matches("--");
                 let v = v.trim();
                 if !k.is_empty() && !v.is_empty() {
+                    // 全大写 + 数字/下划线 = 疑似环境变量误填（如 NCCL_DEBUG=TRACE），跳过并提示
+                    if k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') && k.len() > 1 {
+                        crate::common::utils::logger::write_log(
+                            "WARN",
+                            "MODEL",
+                            &format!("extra_args 疑似环境变量误填（已忽略，请填到多机「额外环境变量」）：{}={}", k, v),
+                        );
+                        continue;
+                    }
                     args.push(format!("--{}", k));
                     args.push(v.to_string());
                 }
