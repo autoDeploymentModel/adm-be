@@ -528,6 +528,13 @@ const template = `
               <div class="param-desc">${_t("启用 ConnectX-7 RoCE RDMA（挂载 /dev/infiniband、放宽内存锁限制）；QSFP 直连建议开启，连接异常时可关闭回退 TCP")}</div>
             </div>
           </div>
+          <div class="param-row" style="align-items:flex-start;">
+            <div class="param-label">${_t("额外环境变量")}<div class="param-key">extra_env</div></div>
+            <div class="param-input" style="max-width:480px;">
+              <textarea id="multi_extra_env" rows="3" style="width:100%;resize:vertical;background:var(--c-panel-2);border:1px solid var(--c-border);border-radius:6px;color:var(--c-text);font-size:13px;padding:8px 12px;font-family:monospace;outline:none;" placeholder="NCCL_DEBUG=TRACE&#10;NCCL_SOCKET_NTHREADS=1&#10;# 注释行以 # 开头会被忽略"></textarea>
+              <div class="param-desc">${_t("每行 KEY=VALUE 注入容器环境变量（docker run -e），NCCL 排查用：NCCL_DEBUG=TRACE / NCCL_SOCKET_NTHREADS=1 / NCCL_IB_GID_INDEX=3 等")}</div>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -731,6 +738,7 @@ function getMultiNodeArgsFromForm() {
     iface: "",
     use_roce: b("multi_roce"),
     ssh_key_path: "",
+    extra_env: s("multi_extra_env"),
   };
 }
 
@@ -925,6 +933,7 @@ async function fillMultiNodeArgsForm(m) {
   set("multi_dist_port", v.dist_init_port || 6464);
   set("multi_nccl_port", v.nccl_port || 0);
   setB("multi_roce", v.use_roce !== undefined ? v.use_roce : true);
+  set("multi_extra_env", v.extra_env || "");
   renderMultiNodeTable();
 }
 
@@ -1018,7 +1027,7 @@ function autoSave() { saveParams(); }
 
 function setupAutoSave() {
   ["ctx_size", "port", "host", "sglang_image", "sglang_shm", "sg_tp", "sg_mem_frac", "sg_dtype", "sg_quant", "sg_kv_dtype", "sg_sched", "sg_max_run", "sg_max_queue", "sg_chunk", "sg_log_level", "sg_log_requests", "sg_metrics", "sg_extra_args",
-   "multi_enabled", "multi_dist_port", "multi_nccl_port", "multi_roce"].forEach(function (id) {
+   "multi_enabled", "multi_dist_port", "multi_nccl_port", "multi_roce", "multi_extra_env"].forEach(function (id) {
     var el = document.getElementById(id);
     if (el) el.addEventListener("change", autoSave);
   });

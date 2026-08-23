@@ -112,6 +112,9 @@ pub struct MultiNodeArgs {
     /// SSH 私钥路径（-i 指定；空 = 使用 ssh-agent / 默认 key）
     #[serde(default)]
     pub ssh_key_path: String,
+    /// 额外容器环境变量（每行 KEY=VALUE，注入 docker run -e KEY=VALUE；如 NCCL_DEBUG=TRACE / NCCL_SOCKET_NTHREADS=1）
+    #[serde(default)]
+    pub extra_env: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]

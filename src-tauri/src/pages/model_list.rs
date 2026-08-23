@@ -1036,6 +1036,21 @@ fn build_multi_node_args(
             format!("GLOO_SOCKET_IFNAME={}", iface_name.trim()),
         ]);
     }
+    // 额外容器环境变量（每行 KEY=VALUE → -e KEY=VALUE；用于 NCCL 排查如 NCCL_DEBUG=TRACE / NCCL_SOCKET_NTHREADS=1）
+    for line in mn.extra_env.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            let k = k.trim();
+            let v = v.trim();
+            if !k.is_empty() && !v.is_empty() {
+                args.push("-e".to_string());
+                args.push(format!("{}={}", k, v));
+            }
+        }
+    }
     args.push("-v".to_string());
     args.push(format!(
         "{}:{}{}",
