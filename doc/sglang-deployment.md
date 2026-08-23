@@ -241,7 +241,7 @@ MTP（Multi-Token Prediction）：模型目录有 `model_mtp.safetensors` 时自
 | RoCE | QSFP 直连建议开启（挂载 `/dev/infiniband` + 放宽 memlock）；异常可关闭回退 TCP |
 | 测试连通 | 节点行「测试连通」按钮：SSH 检查远端 Docker / GPU / **镜像（是否已下载本机当前使用的 sglang 镜像，设置页镜像为准）** / 模型目录。远端网卡不再探测——SSH 可达即互联已通 |
 | 同步镜像 | 「同步镜像到直连节点」独立一行：**流式管道** `docker save <img> \| [pv -s <size>] \| gzip -1 \| ssh 直连IP 'gunzip \| docker load'`，不落地临时 tar、直接复用光口 200G 带宽；镜像 = 模型启动参数当前选择；进度事件 `image-push-progress`（stderr 解析 pv 百分比），完成自动重新测试连通 |
-| 同步模型 | 「同步模型到直连节点」独立一行：点击后**先监测远端是否已同步**（`<model_dir>/.done` 存在则跳过），未同步则全量同步本机模型（主模型 = 正在运行的模型，无则第一个已下载模型；**rsync 增量** `--info=progress2`，无 rsync 时 scp -r 回退），完成后校验远端 `.done`；进度事件 `model-sync-progress`（rsync progress2 百分比） |
+| 同步模型 | 「同步模型到直连节点」独立一行：**全量同步本机所有已下载模型**（运行中的模型优先）；逐模型先监测远端是否已同步（`<model_dir>/.done` 存在则跳过），未同步则 **rsync 增量** `--info=progress2`（无 rsync 时 scp -r 回退），完成后校验远端 `.done`；远端目标 = 设置页「模型目录」列（留空自动 `/home/<SSH用户>/models/<模型ID>`，填写则作为根目录）；进度事件 `model-sync-progress`（rsync progress2 百分比） |
 
 > SSH 互信：节点 0 需能免密 SSH 到远端（`~/.ssh/id_ed25519` 公钥加入远端 `authorized_keys`；如无密钥可用 `ssh-keygen -t ed25519` 生成，后端 `ensure_ssh_key` 命令幂等保证）
 

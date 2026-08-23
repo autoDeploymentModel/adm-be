@@ -896,10 +896,11 @@ pub async fn push_image_to_remote(
     Ok(format!("镜像 {} 已流式同步到 {}", image, ip))
 }
 
-/// 一键同步本机模型到直连节点（rsync 增量优先，无 rsync 回退 scp -r；
+/// 一键同步本机所有已下载模型到直连节点（rsync 增量优先，无 rsync 回退 scp -r；
 /// 进度经 `model-sync-progress` 事件上报；完成校验远端 .done）。
-/// 本机主模型自动选取：正在运行的模型 → 第一个完整模型。
-/// 先监测直连节点是否已同步（远端 .done 存在）——已同步则跳过，未同步则全量同步过去。
+/// 全量同步：遍历本机全部完整模型，正在运行的模型排最前；
+/// 远端目标 = 设置页模型目录（留空自动 /home/<SSH用户>/models/<模型ID>），
+/// 已同步（远端 .done 存在）的模型自动跳过。
 #[tauri::command]
 pub async fn sync_model_to_remote(
     app: tauri::AppHandle,
@@ -934,87 +935,103 @@ pub async fn sync_model_to_remote(
     if local_models.is_empty() {
         return Err(AppError::msg("本机没有已下载完成的模型，请先下载模型".to_string()));
     }
-    // 主模型：正在运行的模型优先，否则第一个
-    let running_id = app.state::<AppState>()
-        .running_model_id.lock().map(|l| l.clone()).unwrap_or(None);
-    let (model_id, src) = if let Some(rid) = running_id.as_ref() {
-        local_models.iter().find(|(id, _)| id == rid)
-            .cloned()
-            .unwrap_or_else(|| local_models[0].clone())
-    } else {
-        local_models[0].clone()
-    };
-
-    let remote_dir = remote_model_dir.trim();
-    // 留空自动默认 /home/<user>/models/<model_id>（绝对路径，避免波浪号转义问题）
-    let remote_dir = if remote_dir.is_empty() {
-        let u = user.trim();
-        if u.is_empty() {
-            format!("~/models/{}", model_id)
-        } else {
-            format!("/home/{}/models/{}", u, model_id)
+    // 正在运行的模型排最前（优先同步），其余保持顺序
+    if let Ok(guard) = app.state::<AppState>().running_model_id.lock() {
+        if let Some(rid) = guard.as_ref() {
+            if let Some(pos) = local_models.iter().position(|(id, _)| id == rid) {
+                let m = local_models.remove(pos);
+                local_models.insert(0, m);
+            }
         }
-    } else {
-        remote_dir.to_string()
-    };
+    }
+
     let ssh_port = if port == 0 { 22 } else { port };
     let key_ref = key.as_deref().filter(|k| !k.trim().is_empty()).map(str::trim);
     let opts = ssh_opts(ssh_port, key_ref);
 
-    // 监测：远端是否已同步（.done 存在）
-    let chk_q = crate::common::ssh::quote_remote_path(&remote_dir);
-    let chk = format!("test -d {}/.done && echo MODEL_OK || echo MODEL_MISSING", chk_q);
-    let (cok, cout, _) = crate::common::ssh::ssh_run(&ip, &user, ssh_port, key_ref, &chk, std::time::Duration::from_secs(20)).await?;
-    if cok && cout.contains("MODEL_OK") {
-        return Ok(format!("直连节点已同步模型（{}），无需重复同步", model_id));
-    }
-
-    pipe_emit(&app, &ip, "model-sync-progress", "save", 0, &format!("同步模型 {} ...", model_id));
-    let src_str = format!("{}/", src.to_string_lossy());
-    // 先远端建目录（rsync 不会自动创建不存在的多级父目录），再增量 rsync；无 rsync 回退 scp -r
-    let remote_dir_q = crate::common::ssh::quote_remote_path(&remote_dir);
-    let script = format!(
-        "ssh {} '{}@{}' 'mkdir -p {}' 2>&1 && \
-         if command -v rsync >/dev/null 2>&1; then \
-           rsync -a --info=progress2 --no-inc-recursive -e 'ssh {}' '{}' '{}@{}:{}' 2>&1; \
-         else \
-           scp -r -o BatchMode=yes -o ConnectTimeout=5 '{}' '{}@{}:{}' 2>&1; \
-         fi",
-        opts,
-        user.trim(),
-        ip.trim(),
-        remote_dir_q,
-        opts,
-        src_str,
-        user.trim(),
-        ip.trim(),
-        crate::common::ssh::quote_remote_path(&format!("{}/", remote_dir)),
-        src_str,
-        user.trim(),
-        ip.trim(),
-        crate::common::ssh::quote_remote_path(&format!("{}/", remote_dir)),
-    );
-
-    let (ok, _, err_tail) = run_pipe_with_progress(&app, &ip, "model-sync-progress", &script, std::time::Duration::from_secs(3600)).await
-        .map_err(|e| {
-            if e.to_string().contains("超时") {
-                AppError::msg(format!("{}\n（模型同步超时，请检查光口连通与磁盘空间）", e))
-            } else {
-                e
-            }
-        })?;
-    if !ok {
-        if !err_tail.trim().is_empty() {
-            return Err(AppError::msg(format!("模型同步失败：\n{}", err_tail.trim())));
+    // 远端模型根目录：留空自动 /home/<user>/models（user 空时 ~/models），填写则按填写值
+    let base = remote_model_dir.trim();
+    let base = if base.is_empty() {
+        let u = user.trim();
+        if u.is_empty() {
+            "~/models".to_string()
+        } else {
+            format!("/home/{}/models", u)
         }
-        return Err(AppError::msg("模型同步失败，请检查直连节点磁盘空间与目录权限".to_string()));
-    }
+    } else {
+        base.to_string()
+    };
 
-    // 校验远端 .done
-    let (cok2, cout2, _) = crate::common::ssh::ssh_run(&ip, &user, ssh_port, key_ref, &chk, std::time::Duration::from_secs(20)).await?;
-    if !cok2 || !cout2.contains("MODEL_OK") {
-        return Err(AppError::msg("同步已完成但远端校验失败（.done 缺失），请确认远端模型目录路径正确".to_string()));
+    let mut synced = 0usize;
+    let mut skipped = 0usize;
+    for (model_id, src) in &local_models {
+        let remote_dir = format!("{}/{}", base, model_id);
+        let chk_q = crate::common::ssh::quote_remote_path(&remote_dir);
+        // 监测：远端是否已同步（.done 是文件，用 -e 而非 -d）
+        let chk = format!("test -e {}/.done && echo MODEL_OK || echo MODEL_MISSING", chk_q);
+        let (cok, cout, _) = crate::common::ssh::ssh_run(&ip, &user, ssh_port, key_ref, &chk, std::time::Duration::from_secs(20)).await?;
+        if cok && cout.contains("MODEL_OK") {
+            skipped += 1;
+            continue;
+        }
+
+        pipe_emit(&app, &ip, "model-sync-progress", "save", 0, &format!("同步模型 {} ...", model_id));
+        let src_str = format!("{}/", src.to_string_lossy());
+        // 先远端建目录（rsync 不会自动创建不存在的多级父目录），再增量 rsync；无 rsync 回退 scp -r
+        let remote_dir_q = crate::common::ssh::quote_remote_path(&remote_dir);
+        let script = format!(
+            "ssh {} '{}@{}' 'mkdir -p {}' 2>&1 && \
+             if command -v rsync >/dev/null 2>&1; then \
+               rsync -a --info=progress2 --no-inc-recursive -e 'ssh {}' '{}' '{}@{}:{}' 2>&1; \
+             else \
+               scp -r -o BatchMode=yes -o ConnectTimeout=5 '{}' '{}@{}:{}' 2>&1; \
+             fi",
+            opts,
+            user.trim(),
+            ip.trim(),
+            remote_dir_q,
+            opts,
+            src_str,
+            user.trim(),
+            ip.trim(),
+            crate::common::ssh::quote_remote_path(&format!("{}/", remote_dir)),
+            src_str,
+            user.trim(),
+            ip.trim(),
+            crate::common::ssh::quote_remote_path(&format!("{}/", remote_dir)),
+        );
+
+        let (ok, _, err_tail) = run_pipe_with_progress(&app, &ip, "model-sync-progress", &script, std::time::Duration::from_secs(3600)).await
+            .map_err(|e| {
+                if e.to_string().contains("超时") {
+                    AppError::msg(format!("{}\n（模型同步超时，请检查光口连通与磁盘空间）", e))
+                } else {
+                    e
+                }
+            })?;
+        if !ok {
+            let detail = if err_tail.trim().is_empty() {
+                "请检查直连节点磁盘空间与目录权限".to_string()
+            } else {
+                err_tail.trim().to_string()
+            };
+            return Err(AppError::msg(format!("同步模型 {} 失败：\n{}", model_id, detail)));
+        }
+
+        // 校验远端 .done
+        let (cok2, cout2, _) = crate::common::ssh::ssh_run(&ip, &user, ssh_port, key_ref, &chk, std::time::Duration::from_secs(20)).await?;
+        if !cok2 || !cout2.contains("MODEL_OK") {
+            return Err(AppError::msg(format!(
+                "模型 {} 已传输但远端校验失败（.done 缺失），请确认远端模型目录路径正确",
+                model_id
+            )));
+        }
+        synced += 1;
     }
     pipe_emit(&app, &ip, "model-sync-progress", "done", 100, "模型同步完成");
-    Ok(format!("模型 {} 已同步到 {}:{}", model_id, ip, remote_dir))
+    if synced == 0 {
+        Ok(format!("全部模型已同步，无需重复（跳过 {} 个已存在）", skipped))
+    } else {
+        Ok(format!("模型同步完成：新同步 {} 个，跳过 {} 个已同步", synced, skipped))
+    }
 }

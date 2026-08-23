@@ -141,7 +141,7 @@ pub fn probe_script(model_dir: &str, image: &str) -> String {
         "echo 'GPU:'; nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1; \
          echo 'DOCKER:'; docker info --format '{{{{.ServerVersion}}}}' 2>/dev/null || echo DOCKER_ERR; \
          echo 'IMAGE:'; docker image inspect {} >/dev/null 2>&1 && echo IMAGE_OK || echo IMAGE_MISSING; \
-         echo 'MODEL:'; if [ -d {} ] && [ -d {}/.done ]; then echo MODEL_OK; else echo MODEL_MISSING; fi",
+         echo 'MODEL:'; if [ -d {} ] && [ -e {}/.done ]; then echo MODEL_OK; else echo MODEL_MISSING; fi",
         sh_quote(image),
         quote_remote_path(model_dir),
         quote_remote_path(model_dir)
