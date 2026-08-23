@@ -1381,13 +1381,13 @@ async fn start_multi_node(
         let mut poll_fail = 0usize;
         for _ in 0..15 {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let chk = format!("(sudo -n docker ps -a --filter name={} --format '{{{{\"n\": .Names, \"s\": .Status}}}}' 2>/dev/null || docker ps -a --filter name={} --format '{{{{\"n\": .Names, \"s\": .Status}}}}' 2>/dev/null)", crate::common::ssh::sh_quote(&container), crate::common::ssh::sh_quote(&container));
+            let chk = format!("(sudo -n docker ps -a --filter name={} --format '{{{{.Names}}}} {{{{.Status}}}}' 2>/dev/null || docker ps -a --filter name={} --format '{{{{.Names}}}} {{{{.Status}}}}' 2>/dev/null)", crate::common::ssh::sh_quote(&container), crate::common::ssh::sh_quote(&container));
             match crate::common::ssh::ssh_run(
                 &node.ip, &node.ssh_user, node.ssh_port, key_ref, &chk,
                 std::time::Duration::from_secs(10),
             ).await {
                 Ok((_, out2, _)) => {
-                    if out2.contains(&format!("\"n\":\"{}\"", container)) && out2.contains("\"s\":\"Up") {
+                    if out2.contains(&container) && out2.contains("Up") {
                         up = true;
                         break;
                     }
@@ -1617,7 +1617,7 @@ async fn start_multi_node(
                 for (i, node) in mn_c.nodes.iter().enumerate().skip(1) {
                     if node.is_self { continue; }
                     let c = multi_container_name(&mid, i);
-                    let chk = format!("(sudo -n docker ps --filter name={} --format '{{{{\"n\": .Names, \"s\": .Status}}}}' 2>/dev/null || docker ps --filter name={} --format '{{{{\"n\": .Names, \"s\": .Status}}}}' 2>/dev/null)", crate::common::ssh::sh_quote(&c), crate::common::ssh::sh_quote(&c));
+                    let chk = format!("(sudo -n docker ps --filter name={} --format '{{{{.Names}}}} {{{{.Status}}}}' 2>/dev/null || docker ps --filter name={} --format '{{{{.Names}}}} {{{{.Status}}}}' 2>/dev/null)", crate::common::ssh::sh_quote(&c), crate::common::ssh::sh_quote(&c));
                     let status = crate::common::ssh::ssh_run_blocking(
                         &node.ip, &node.ssh_user, node.ssh_port, key_ref, &chk,
                         std::time::Duration::from_secs(3),
@@ -1643,7 +1643,7 @@ async fn start_multi_node(
                                 "source": "stderr",
                             })).ok();
                         }
-                        Ok((_, out, _)) if out.contains("\"s\":\"Up") => {
+                        Ok((_, out, _)) if out.contains("Up") => {
                             all_down = false;
                             checked = true;
                         }
