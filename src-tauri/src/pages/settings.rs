@@ -342,6 +342,19 @@ pub async fn open_log_dir() -> Result<(), AppError> {
     Ok(())
 }
 
+/// 获取当前系统用户名（DGX直连配置本机行 SSH 用户名自动回填）
+#[tauri::command]
+pub async fn get_local_username() -> Result<String, AppError> {
+    for var in ["USER", "LOGNAME", "USERNAME"] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.trim().is_empty() {
+                return Ok(v);
+            }
+        }
+    }
+    Err(AppError::msg("无法获取当前用户名，请在设置中手动填写".to_string()))
+}
+
 /// 将当前用户加入 docker 组（Linux 权限修复）。
 /// 优先用 pkexec 弹出系统原生 GUI 密码框；pkexec 不可用时回退到终端命令提示。
 #[tauri::command]

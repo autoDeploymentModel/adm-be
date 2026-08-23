@@ -415,46 +415,6 @@ const template = `
         <div class="param-group">
           <div class="param-group-title">${_t("模型解析与日志")}</div>
           <div class="param-row">
-            <div class="param-label">${_t("推理解析器")}<div class="param-key">--reasoning-parser</div></div>
-            <div class="param-input">
-              <select id="sg_reasoning">
-                <option value="">${_t("无")}</option>
-                <option value="deepseek-r1">deepseek-r1</option>
-                <option value="deepseek-v3">deepseek-v3</option>
-                <option value="glm45">glm45</option>
-                <option value="gpt-oss">gpt-oss</option>
-                <option value="kimi">kimi</option>
-                <option value="qwen3">qwen3</option>
-                <option value="qwen3-thinking">qwen3-thinking</option>
-                <option value="step3">step3</option>
-              </select>
-              <div class="param-desc">${_t("推理模型（DeepSeek/Qwen3 等）专用，分离思考内容")}</div>
-            </div>
-          </div>
-          <div class="param-row">
-            <div class="param-label">${_t("工具调用解析器")}<div class="param-key">--tool-call-parser</div></div>
-            <div class="param-input">
-              <select id="sg_tool">
-                <option value="">${_t("无")}</option>
-                <option value="qwen">qwen</option>
-                <option value="qwen25">qwen25</option>
-                <option value="qwen3_coder">qwen3_coder</option>
-                <option value="deepseekv3">deepseekv3</option>
-                <option value="deepseekv31">deepseekv31</option>
-                <option value="glm">glm</option>
-                <option value="glm45">glm45</option>
-                <option value="glm47">glm47</option>
-                <option value="gpt-oss">gpt-oss</option>
-                <option value="kimi_k2">kimi_k2</option>
-                <option value="llama3">llama3</option>
-                <option value="mistral">mistral</option>
-                <option value="pythonic">pythonic</option>
-                <option value="step3">step3</option>
-                <option value="gigachat3">gigachat3</option>
-              </select>
-            </div>
-          </div>
-          <div class="param-row">
             <div class="param-label">${_t("日志级别")}<div class="param-key">--log-level</div></div>
             <div class="param-input">
               <select id="sg_log_level">
@@ -702,12 +662,11 @@ function renderMultiNodeTable() {
     } else {
       statusHtml = '<span style="color:#f44336;">' + _t("失败") + '</span><div style="font-size:11px;color:#f44336;max-width:200px;">' + escHtml(p.detail) + '</div>';
     }
-    const userDisabled = i === 0 ? ' disabled' : "";
     const portDisabled = i === 0 ? ' disabled' : "";
     return "<tr>" +
       '<td style="text-align:center;font-size:12px;color:var(--c-text-2);">' + i + '</td>' +
       '<td><input class="mn-cell" data-field="ip" data-rank="' + i + '" value="' + escHtml(n.ip) + '" placeholder="192.168.100.1（光口 IP）"></td>' +
-      '<td><input class="mn-cell" data-field="sshUser" data-rank="' + i + '" value="' + escHtml(n.sshUser) + '" placeholder="user"' + userDisabled + '></td>' +
+      '<td><input class="mn-cell" data-field="sshUser" data-rank="' + i + '" value="' + escHtml(n.sshUser) + '" placeholder="user"></td>' +
       '<td><input class="mn-cell" data-field="sshPort" data-rank="' + i + '" type="number" min="1" max="65535" value="' + (n.sshPort || 22) + '" style="width:70px;"' + portDisabled + '></td>' +
       '<td><input class="mn-cell" data-field="modelDir" data-rank="' + i + '" value="' + escHtml(n.modelDir) + '" placeholder="' + (i === 0 ? "/data/models（自动）" : "/home/user/models/模型ID（留空自动）") + '" style="min-width:170px;"></td>' +
       '<td style="min-width:110px;">' + statusHtml + '</td>' +
@@ -909,6 +868,13 @@ async function fillMultiNodeArgsForm(m) {
       mnNodes[0].modelDir = String(dataDir) + "/models";
     } catch (_) {}
   }
+  // 本机（rank0）SSH 用户名：留空或仍为旧默认值时自动获取当前系统用户名（用户手改的值不会被覆盖）
+  if (!mnNodes[0].sshUser.trim() || mnNodes[0].sshUser.trim() === "user") {
+    try {
+      const localUser = await invoke()("get_local_username");
+      if (localUser) mnNodes[0].sshUser = String(localUser);
+    } catch (_) {}
+  }
   mnProbeState = {};
   const set = function (id, val) { const el = document.getElementById(id); if (el) el.value = val; };
   const setB = function (id, val) { const el = document.getElementById(id); if (el) el.checked = !!val; };
@@ -941,8 +907,6 @@ function getSglangArgsFromForm() {
     log_level: str("sg_log_level"),
     log_requests: bool("sg_log_requests"),
     enable_metrics: bool("sg_metrics"),
-    reasoning_parser: str("sg_reasoning"),
-    tool_call_parser: str("sg_tool"),
     extra_args: "",
   };
 }
@@ -965,8 +929,6 @@ function fillSglangArgsForm(a) {
   set("sg_log_level", v.log_level || "");
   setB("sg_log_requests", v.log_requests);
   setB("sg_metrics", v.enable_metrics);
-  set("sg_reasoning", v.reasoning_parser || "");
-  set("sg_tool", v.tool_call_parser || "");
 }
 
 function getParamsFromForm() {
@@ -1013,7 +975,7 @@ function resetParams() {
 function autoSave() { saveParams(); }
 
 function setupAutoSave() {
-  ["ctx_size", "port", "host", "sglang_image", "sglang_shm", "sg_tp", "sg_mem_frac", "sg_dtype", "sg_quant", "sg_kv_dtype", "sg_sched", "sg_max_run", "sg_max_queue", "sg_chunk", "sg_log_level", "sg_reasoning", "sg_tool", "sg_log_requests", "sg_metrics",
+  ["ctx_size", "port", "host", "sglang_image", "sglang_shm", "sg_tp", "sg_mem_frac", "sg_dtype", "sg_quant", "sg_kv_dtype", "sg_sched", "sg_max_run", "sg_max_queue", "sg_chunk", "sg_log_level", "sg_log_requests", "sg_metrics",
    "multi_enabled", "multi_dist_port", "multi_nccl_port", "multi_iface", "multi_roce", "multi_ssh_key"].forEach(function (id) {
     var el = document.getElementById(id);
     if (el) el.addEventListener("change", autoSave);

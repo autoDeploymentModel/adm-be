@@ -17,7 +17,6 @@
         "model_support_devices": [
             "dgx-spark-128G"
         ],
-        "sglang_version": "lmsysorg/sglang:dev-qwen38-27b-dflash2",
         "sglang_flags": [
             "--trust-remote-code",
             "--kv-cache-dtype fp8_e4m3",
@@ -28,11 +27,43 @@
             "--tool-call-parser qwen3_coder",
             "--enable-linear-replayssm-spec"
         ],
+        "sglang_version": "lmsysorg/sglang:dev-cu13-qwen38-27b-dflash2",
         "model_size": "23.4 GB",
         "model_type": "视觉多模态理解",
         "model_description": "支持对话,推理,图片识别",
         "support_tools": true,
         "support_reasoning": true,
         "support_images": true
+    },
+    {
+        "model_id": "DeepSeek-V4-Flash-0731-CRACK",
+        "model_download_files": [
+            "https://huggingface.co/dealignai/DeepSeek-V4-Flash-0731-CRACK-NVFP4/resolve/main/model-00001-of-00048.safetensors",
+            "https://huggingface.co/dealignai/DeepSeek-V4-Flash-0731-CRACK-NVFP4/resolve/main/model.safetensors.index.json",
+            "https://huggingface.co/dealignai/DeepSeek-V4-Flash-0731-CRACK-NVFP4/resolve/main/tokenizer.json",
+            "https://huggingface.co/dealignai/DeepSeek-V4-Flash-0731-CRACK-NVFP4/resolve/main/tokenizer_config.json",
+            "https://huggingface.co/dealignai/DeepSeek-V4-Flash-0731-CRACK-NVFP4/resolve/main/config.json",
+            "https://huggingface.co/dealignai/DeepSeek-V4-Flash-0731-CRACK-NVFP4/resolve/main/generation_config.json"
+        ],
+        "model_support_devices": [
+            "dgx-spark-128G"
+        ],
+        "sglang_flags": [
+            "--trust-remote-code",
+            "--kv-cache-dtype fp8_e4m3",
+            "--mem-fraction-static 0.80",
+            "--attention-backend flashinfer",
+            "--chunked-prefill-size 2048",
+            "--reasoning-parser deepseek-v4",
+            "--tool-call-parser deepseekv4",
+            "--enable-linear-replayssm-spec"
+        ],
+        "sglang_version": "lmsysorg/sglang:latest-cu130",
+        "model_size": "167 GB",
+        "model_type": "纯文本",
+        "model_description": "支持对话,推理",
+        "support_tools": true,
+        "support_reasoning": true,
+        "support_images": false
     }
 ]

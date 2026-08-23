@@ -195,6 +195,7 @@ pub fn run() {
             settings::push_image_to_remote,
             settings::sync_model_to_remote,
             settings::get_app_data_dir,
+            settings::get_local_username,
             // benchmark.rs
             benchmark::start_benchmark,
             benchmark::get_benchmark_status,
