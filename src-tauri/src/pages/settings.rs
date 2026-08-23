@@ -822,6 +822,110 @@ async fn run_pipe_with_progress(
     }
 }
 
+/// 镜像推送专用管道：Rust 中继 `docker save` 输出到远端 ssh（docker load），
+/// 逐块计数并实时上报进度（不依赖本机 pv；size 为 0 时改报已传输字节数）。
+/// 返回 (status_ok, stdout, stderr_tail)。
+async fn run_image_push(
+    app: &tauri::AppHandle,
+    ip: &str,
+    save_cmd: &str,
+    ssh_cmd: &str,
+    size_bytes: u64,
+    timeout: std::time::Duration,
+) -> Result<(bool, String, String), AppError> {
+    let mut p1 = tokio::process::Command::new("sh")
+        .arg("-c").arg(save_cmd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| AppError::msg(format!("启动 docker save 失败: {}", e)))?;
+    let mut p2 = tokio::process::Command::new("sh")
+        .arg("-c").arg(ssh_cmd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| AppError::msg(format!("启动 ssh 管道失败: {}", e)))?;
+
+    let result = tokio::time::timeout(timeout, async {
+        let mut stdin = p2.stdin.take().expect("p2 stdin piped");
+        let mut src = p1.stdout.take().expect("p1 stdout piped");
+        let app_owned = app.clone();
+        let ip_owned = ip.to_string();
+        let count_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 262144];
+            let mut total: u64 = 0;
+            let mut last_pct: u8 = 0;
+            let mut last_mb: u64 = 0;
+            loop {
+                let n = match tokio::io::AsyncReadExt::read(&mut src, &mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                if tokio::io::AsyncWriteExt::write_all(&mut stdin, &buf[..n]).await.is_err() {
+                    break;
+                }
+                total += n as u64;
+                if size_bytes > 0 {
+                    let pct = ((total * 100) / size_bytes).min(99) as u8;
+                    if pct != last_pct {
+                        last_pct = pct;
+                        pipe_emit(&app_owned, &ip_owned, "image-push-progress", "transfer", pct, "");
+                    }
+                } else {
+                    let mb = total / (1024 * 1024);
+                    if mb != last_mb {
+                        last_mb = mb;
+                        pipe_emit(&app_owned, &ip_owned, "image-push-progress", "transfer", 0, &format!("已传输 {} MB", mb));
+                    }
+                }
+            }
+            let _ = tokio::io::AsyncWriteExt::flush(&mut stdin).await;
+        });
+
+        // 收集两端 stderr（尾部 4KB）
+        let mut err_tail = String::new();
+        let tailfy = |s: &mut String, chunk: &str| {
+            s.push_str(chunk);
+            if s.len() > 4096 {
+                *s = s[s.len() - 4096..].to_string();
+            }
+        };
+        let mut e1 = String::new();
+        let mut e2 = String::new();
+        if let Some(mut se) = p1.stderr.take() {
+            let _ = tokio::io::AsyncReadExt::read_to_string(&mut se, &mut e1).await;
+        }
+        if let Some(mut se) = p2.stderr.take() {
+            let _ = tokio::io::AsyncReadExt::read_to_string(&mut se, &mut e2).await;
+        }
+        tailfy(&mut err_tail, &e1);
+        tailfy(&mut err_tail, &e2);
+
+        let mut stdout = String::new();
+        if let Some(mut so) = p2.stdout.take() {
+            let _ = tokio::io::AsyncReadExt::read_to_string(&mut so, &mut stdout).await;
+        }
+        let _ = count_task.await;
+
+        let mut p1_ok = false;
+        let mut p2_ok = false;
+        if let Ok(st) = p1.wait().await { p1_ok = st.success(); }
+        if let Ok(st) = p2.wait().await { p2_ok = st.success(); }
+        Ok::<(bool, String, String), AppError>((p1_ok && p2_ok, stdout, err_tail))
+    })
+    .await;
+
+    match result {
+        Ok(r) => r,
+        Err(_) => {
+            let _ = p1.kill();
+            let _ = p2.kill();
+            Err(AppError::msg(format!("管道执行超时（{}s）", timeout.as_secs())))
+        }
+    }
+}
+
 fn ssh_opts(port: u16, key: Option<&str>) -> String {
     let mut s = format!("-o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new -p {}", port);
     if let Some(k) = key {
@@ -890,12 +994,6 @@ pub async fn push_image_to_remote(
     let remote_sudo = rsok && rcout.contains("SUDO_OK");
     let dk = if local_sudo { "sudo -n docker" } else { "docker" };
     let rdk = if remote_sudo { "sudo -n docker" } else { "docker" };
-    let has_pv = tokio::process::Command::new("sh")
-        .args(["-c", "command -v pv >/dev/null 2>&1 && echo 1 || echo 0"])
-        .output()
-        .await
-        .map(|o| o.stdout.starts_with(b"1"))
-        .unwrap_or(false);
 
     let mut synced = 0usize;
     let mut skipped = 0usize;
@@ -924,38 +1022,23 @@ pub async fn push_image_to_remote(
         }
 
         pipe_emit(&app, &ip, "image-push-progress", "save", 3, &format!("同步镜像 {} ...", image));
-        // 光口直连带宽充足（200GbE），不再 gzip 压缩（单线程 gzip 反而成为瓶颈）；
-        // pv 直接计量原始流，进度实时滚动。
+        // 光口直连带宽充足（200GbE），不做 gzip；Rust 中继计数实时上报进度（不依赖 pv）
         let remote_cmd = format!(
             "{} load && {} image inspect {} >/dev/null 2>&1 && echo LOAD_OK || echo LOAD_FAIL",
             rdk,
             rdk,
             crate::common::ssh::sh_quote(image)
         );
-        let pipe = if has_pv && !size.is_empty() {
-            format!(
-                "{} save {} | pv -f -s {} | ssh {} {}@{} \"{}\"",
-                dk,
-                crate::common::ssh::sh_quote(image),
-                size,
-                ssh_opts(ssh_port, key_ref),
-                user.trim(),
-                ip.trim(),
-                remote_cmd
-            )
-        } else {
-            format!(
-                "{} save {} | ssh {} {}@{} \"{}\"",
-                dk,
-                crate::common::ssh::sh_quote(image),
-                ssh_opts(ssh_port, key_ref),
-                user.trim(),
-                ip.trim(),
-                remote_cmd
-            )
-        };
+        let save_cmd = format!("{} save {}", dk, crate::common::ssh::sh_quote(image));
+        let ssh_cmd = format!(
+            "ssh {} {}@{} \"{}\"",
+            ssh_opts(ssh_port, key_ref),
+            user.trim(),
+            ip.trim(),
+            remote_cmd
+        );
 
-        let (ok, stdout, err_tail) = run_pipe_with_progress(&app, &ip, "image-push-progress", &pipe, std::time::Duration::from_secs(600)).await
+        let (ok, stdout, err_tail) = run_image_push(&app, &ip, &save_cmd, &ssh_cmd, size.parse().unwrap_or(0), std::time::Duration::from_secs(600)).await
             .map_err(|e| {
                 if e.to_string().contains("超时") {
                     AppError::msg(format!("{}\n（同步镜像 {} 超时，请检查光口连通）", e, image))
