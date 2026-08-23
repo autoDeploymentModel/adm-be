@@ -682,11 +682,7 @@ function renderMultiNodeTable() {
 async function probeNode(rank) {
   const n = mnNodes[rank];
   if (!n || rank === 0) return;
-  if (!n.modelDir.trim()) {
-    mnProbeState[rank] = { ok: false, detail: _t("模型目录未填写，将自动使用 /home/<SSH用户>/models/<模型ID>（可先同步模型）") };
-    renderMultiNodeTable();
-    return;
-  }
+  // 模型目录留空不提前拦截：后端按默认 /home/<SSH用户>/models 根目录探测
   mnProbeState[rank] = { probing: true };
   renderMultiNodeTable();
   const keyEl = document.getElementById("multi_ssh_key");
@@ -699,10 +695,10 @@ async function probeNode(rank) {
       modelDir: n.modelDir,
     });
     if (res.ok) {
-      const detail = "GPU:" + (res.gpu || "?") + " Docker:" + (res.docker || "?") + (res.imageOk ? "" : " · " + _t("镜像缺失")) + (res.modelExists ? "" : " · " + _t("模型目录不存在"));
+      const detail = "GPU:" + (res.gpu || "?") + " Docker:" + (res.docker || "?") + (res.imageOk ? "" : " · " + _t("镜像缺失")) + (res.modelExists ? "" : " · " + _t("模型未同步，请先同步模型"));
       mnProbeState[rank] = { ok: true, detail: detail };
     } else {
-      const modelWarn = !res.modelExists ? " · " + _t("模型目录不存在") : "";
+      const modelWarn = !res.modelExists ? " · " + _t("模型未同步，请先同步模型") : "";
       mnProbeState[rank] = { ok: false, detail: res.error + modelWarn };
     }
   } catch (e) {

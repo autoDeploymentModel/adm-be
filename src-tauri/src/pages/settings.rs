@@ -447,7 +447,16 @@ pub async fn multi_node_probe(
         }
     }
 
-    let cmd = crate::common::ssh::probe_script(model_dir.as_deref().unwrap_or(""), &image);
+    // 模型目录留空：按默认根目录探测（/home/<user>/models 或 ~/models），存在且含已同步模型即 OK
+    let raw_model_dir = model_dir.as_deref().unwrap_or("").trim();
+    let root_mode = raw_model_dir.is_empty();
+    let probe_model_dir = if root_mode {
+        let u = user.trim();
+        if u.is_empty() { "~/models".to_string() } else { format!("/home/{}/models", u) }
+    } else {
+        raw_model_dir.to_string()
+    };
+    let cmd = crate::common::ssh::probe_script(&probe_model_dir, &image, root_mode);
     let (ok, stdout, stderr) = crate::common::ssh::ssh_run(
         &ip, &user, if port == 0 { 22 } else { port },
         key.as_deref(), &cmd, std::time::Duration::from_secs(20),

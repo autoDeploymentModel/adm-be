@@ -1237,7 +1237,7 @@ async fn start_multi_node(
     for (i, node) in mn.nodes.iter().enumerate().skip(1) {
         let node_model_dir = effective_remote_model_dir(&node.model_dir, &node.ssh_user, model_id);
         // 预检：docker daemon / GPU / 本机所用镜像 / 模型目录（含 .done）
-        let probe = crate::common::ssh::probe_script(&node_model_dir, &image);
+        let probe = crate::common::ssh::probe_script(&node_model_dir, &image, false);
         let (ok, out, err) = crate::common::ssh::ssh_run(
             &node.ip, &node.ssh_user, node.ssh_port, key_ref, &probe,
             std::time::Duration::from_secs(20),

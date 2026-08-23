@@ -78,7 +78,7 @@ const EN = {
   "本机": "This machine",
   "正常": "OK",
   "失败": "Failed",
-  "模型目录不存在": "Model directory not found",
+  "模型未同步，请先同步模型": "Model not synced, sync it first",
   "镜像缺失": "Image missing",
   "仅 rank 0（第 1 行）可为本机": "Only rank 0 (first row) can be the local machine",
   "至少保留 1 个节点（本机）": "Keep at least 1 node (local machine)",

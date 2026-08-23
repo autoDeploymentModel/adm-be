@@ -135,16 +135,30 @@ pub async fn ssh_run(
 /// `GPU:` 行 GPU 名（无 GPU 时为空）；`DOCKER:` 行 docker ServerVersion（异常时 "DOCKER_ERR"）；
 /// `IMAGE:` 行 "IMAGE_OK" / "IMAGE_MISSING"（远端是否已下载 `image`）；
 /// `MODEL:` 行 "MODEL_OK" / "MODEL_MISSING"。
+/// `root_mode=true`：model_dir 为模型根目录（探活时留空自动 `~/models` 或 `/home/<user>/models`），
+/// 目录存在且其中含已同步模型（任一子目录有 `.done`）即 MODEL_OK；
+/// `root_mode=false`：model_dir 为精确模型目录，目录存在且自身有 `.done` 才 MODEL_OK。
 /// 注：远端无需探测网卡——SSH 可达即说明互联已通。
-pub fn probe_script(model_dir: &str, image: &str) -> String {
+pub fn probe_script(model_dir: &str, image: &str, root_mode: bool) -> String {
+    let dir_q = quote_remote_path(model_dir);
+    let model_chk = if root_mode {
+        format!(
+            "if [ -d {} ] && ( [ -e {}/.done ] 2>/dev/null || ls {}/*/.done >/dev/null 2>&1 ); then echo MODEL_OK; else echo MODEL_MISSING; fi",
+            dir_q, dir_q, dir_q
+        )
+    } else {
+        format!(
+            "if [ -d {} ] && [ -e {}/.done ]; then echo MODEL_OK; else echo MODEL_MISSING; fi",
+            dir_q, dir_q
+        )
+    };
     format!(
         "echo 'GPU:'; nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1; \
          echo 'DOCKER:'; docker info --format '{{{{.ServerVersion}}}}' 2>/dev/null || echo DOCKER_ERR; \
          echo 'IMAGE:'; docker image inspect {} >/dev/null 2>&1 && echo IMAGE_OK || echo IMAGE_MISSING; \
-         echo 'MODEL:'; if [ -d {} ] && [ -e {}/.done ]; then echo MODEL_OK; else echo MODEL_MISSING; fi",
+         echo 'MODEL:'; {}",
         sh_quote(image),
-        quote_remote_path(model_dir),
-        quote_remote_path(model_dir)
+        model_chk
     )
 }
 
