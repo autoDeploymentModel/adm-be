@@ -1346,6 +1346,13 @@ async fn start_multi_node(
         );
         let container = multi_container_name(model_id, i);
         let log_path = format!("/tmp/adm_sglang_{}_rank_{}.log", model_id, i);
+        // 清理远端同名残留容器（上次启动失败/手动残留，与 rank 0 的 docker rm -f 对齐），
+        // 否则 docker run --name 立即失败且不会出现在 docker ps 中
+        let clean_script = crate::common::ssh::stop_container_script(&container);
+        let _ = crate::common::ssh::ssh_run(
+            &node.ip, &node.ssh_user, node.ssh_port, key_ref, &clean_script,
+            std::time::Duration::from_secs(20),
+        ).await;
         // 远端 docker 权限探测：免密 sudo 可用时 docker run 加 sudo -n（非 docker 组环境兜底）
         let (rsok, rcout, _) = crate::common::ssh::ssh_run(
             &node.ip, &node.ssh_user, node.ssh_port, key_ref,
@@ -1368,34 +1375,62 @@ async fn start_multi_node(
         }
 
         // 快速就绪确认：30s 内容器进入 Up（多数启动失败（镜像缺失/参数错）会立即 Exited）
+        // 注意需用 docker ps -a 轮询：容器 Exited 后普通 docker ps 不再列出，漏检会误报「未进入运行状态」
         let mut up = false;
         let mut tail = String::new();
+        let mut poll_fail = 0usize;
         for _ in 0..15 {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let chk = format!("(sudo -n docker ps --filter name={} --format '{{{{\"n\": .Names, \"s\": .Status}}}}' 2>/dev/null || docker ps --filter name={} --format '{{{{\"n\": .Names, \"s\": .Status}}}}' 2>/dev/null)", crate::common::ssh::sh_quote(&container), crate::common::ssh::sh_quote(&container));
-            if let Ok((_, out2, _)) = crate::common::ssh::ssh_run(
+            let chk = format!("(sudo -n docker ps -a --filter name={} --format '{{{{\"n\": .Names, \"s\": .Status}}}}' 2>/dev/null || docker ps -a --filter name={} --format '{{{{\"n\": .Names, \"s\": .Status}}}}' 2>/dev/null)", crate::common::ssh::sh_quote(&container), crate::common::ssh::sh_quote(&container));
+            match crate::common::ssh::ssh_run(
                 &node.ip, &node.ssh_user, node.ssh_port, key_ref, &chk,
                 std::time::Duration::from_secs(10),
             ).await {
-                if out2.contains(&format!("\"n\":\"{}\"", container)) && out2.contains("\"s\":\"Up") {
-                    up = true;
-                    break;
-                }
-                if out2.contains("Exited") || out2.contains("Dead") {
-                    if let Ok((_, t2, _)) = crate::common::ssh::ssh_run(
-                        &node.ip, &node.ssh_user, node.ssh_port, key_ref,
-                        &format!("tail -n 30 {}", crate::common::ssh::sh_quote(&log_path)),
-                        std::time::Duration::from_secs(10),
-                    ).await {
-                        tail = t2;
+                Ok((_, out2, _)) => {
+                    if out2.contains(&format!("\"n\":\"{}\"", container)) && out2.contains("\"s\":\"Up") {
+                        up = true;
+                        break;
                     }
-                    break;
+                    // Exited / Dead / Restarting（崩溃循环）都是启动失败，抓日志尾部定位原因
+                    if out2.contains("Exited") || out2.contains("Dead") || out2.contains("Restarting") {
+                        if let Ok((_, t2, _)) = crate::common::ssh::ssh_run(
+                            &node.ip, &node.ssh_user, node.ssh_port, key_ref,
+                            &format!("tail -n 50 {}", crate::common::ssh::sh_quote(&log_path)),
+                            std::time::Duration::from_secs(10),
+                        ).await {
+                            tail = t2;
+                        }
+                        break;
+                    }
                 }
+                Err(_) => poll_fail += 1,
             }
         }
         if !up {
             let _ = stop_remote_containers(app, &mn, key_ref, model_id, 1).await;
-            let detail = if tail.is_empty() { "30s 内未进入运行状态".to_string() } else { tail };
+            // 兜底抓取容器状态与日志尾部，给出真实失败原因（而非笼统「未进入运行状态」）
+            let ps_a = crate::common::ssh::ssh_run(
+                &node.ip, &node.ssh_user, node.ssh_port, key_ref,
+                &format!("(sudo -n docker ps -a --filter name={} --format '{{{{.Names}}}} {{{{.Status}}}}' 2>/dev/null || docker ps -a --filter name={} --format '{{{{.Names}}}} {{{{.Status}}}}' 2>/dev/null)", crate::common::ssh::sh_quote(&container), crate::common::ssh::sh_quote(&container)),
+                std::time::Duration::from_secs(10),
+            ).await.ok().map(|(_, o, _)| o.trim().to_string()).filter(|o| !o.is_empty());
+            if tail.trim().is_empty() {
+                if let Ok((_, t2, _)) = crate::common::ssh::ssh_run(
+                    &node.ip, &node.ssh_user, node.ssh_port, key_ref,
+                    &format!("tail -n 50 {}", crate::common::ssh::sh_quote(&log_path)),
+                    std::time::Duration::from_secs(10),
+                ).await {
+                    tail = t2;
+                }
+            }
+            let detail = if !tail.trim().is_empty() {
+                tail
+            } else if let Some(st) = ps_a {
+                format!("容器状态：{}（日志为空，docker run 阶段即失败，可在远端查看 /tmp/adm_sglang_{}_rank_{}.log）", st, model_id, i)
+            } else {
+                let hint = if poll_fail > 0 { format!("远端 SSH 轮询失败 {} 次；", poll_fail) } else { String::new() };
+                format!("{}30s 内未进入运行状态（未看到容器，docker run 可能立即失败，可在远端查看 /tmp/adm_sglang_{}_rank_{}.log）", hint, model_id, i)
+            };
             crate::common::utils::logger::write_log("ERROR", "MODEL", &format!("[{}] 远端节点 {} 容器启动失败:\n{}", model_id, node.ip, detail));
             bail!("远端节点 {}（rank {}）容器启动失败，已回滚停止已启动节点：\n{}", node.ip, i, detail);
         }
@@ -2052,6 +2087,23 @@ pub async fn start_model(
     sglang_version: Option<String>,
     sglang_flags: Option<Vec<String>>,
 ) -> Result<(), AppError> {
+    // 统一捕获启动失败并写入本地日志
+    let result = start_model_inner(&app, &state, &model_id, params, device, sglang_version, sglang_flags).await;
+    if let Err(ref e) = result {
+        crate::common::utils::logger::write_log("ERROR", "MODEL", &format!("[{}] 启动失败: {}", model_id, e));
+    }
+    result
+}
+
+async fn start_model_inner(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, AppState>,
+    model_id: &str,
+    params: LaunchParams,
+    device: Option<String>,
+    sglang_version: Option<String>,
+    sglang_flags: Option<Vec<String>>,
+) -> Result<(), AppError> {
     {
         let pid_lock = state.running_process.lock().map_err(|e| e.to_string())?;
         if pid_lock.is_some() {
@@ -2059,20 +2111,20 @@ pub async fn start_model(
         }
     }
 
-    let data_dir = config::get_data_dir(Some(&app))?;
+    let data_dir = config::get_data_dir(Some(app))?;
     let models_dir = data_dir.join("models");
-    let model_dir = models_dir.join(&model_id);
+    let model_dir = models_dir.join(model_id);
 
     // ===== 新格式（safetensors 目录模型）：SGLang Docker 启动 =====
     let is_dir_model = model_dir.join(".done").exists()
         || (model_dir.join("config.json").exists() && model_dir.join("model.safetensors").exists());
     if is_dir_model {
         // 多机互联：设置页启用且节点数 >= 2 时走集群启动（单机路径不变）
-        let (mn, _) = load_multi_node_config(&app);
+        let (mn, _) = load_multi_node_config(app);
         if mn.enabled && mn.nodes.len() >= 2 {
-            return start_multi_node(&app, &state, &model_id, &model_dir, params, sglang_version, sglang_flags).await;
+            return start_multi_node(app, state, model_id, &model_dir, params, sglang_version, sglang_flags).await;
         }
-        return start_sglang_docker(&app, &state, &model_id, &model_dir, params, device, sglang_version, sglang_flags).await;
+        return start_sglang_docker(app, state, model_id, &model_dir, params, device, sglang_version, sglang_flags).await;
     }
 
     // 仅支持 SGLang Docker 部署（safetensors 目录模型）

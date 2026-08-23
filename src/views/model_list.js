@@ -530,7 +530,7 @@ function showToast(message) {
   toast.className = "error-toast";
   toast.textContent = message;
   document.body.appendChild(toast);
-  setTimeout(() => toast.remove(), 3000);
+  setTimeout(() => toast.remove(), 10000);
 }
 
 function getFilteredModelList() {
@@ -863,6 +863,7 @@ async function handleStart(btn) {
     console.error("[model_list] 启动失败:", e);
     S().startingModelId = null;
     var errMsg = String(e);
+    try { invoke()("write_app_log", { level: "ERROR", tag: "MODEL", message: "[启动失败] " + errMsg }); } catch (_) {}
     if (errMsg.indexOf("DOCKER_PERMISSION_DENIED") !== -1) {
       showDockerPermissionDialog();
     } else {

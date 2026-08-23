@@ -264,6 +264,6 @@ MTP（Multi-Token Prediction）：模型目录有 `model_mtp.safetensors` 时自
 | 现象 | 排查 |
 |---|---|
 | 启动报"远端节点探活失败" | 检查 SSH 免密/私钥、远端 docker 可用、模型目录含 `.done` |
-| 远端容器启动失败 | 看 `/tmp/adm_sglang_<model>_rank_<R>.log`（启动报错会带回尾部） |
+| 启动报"远端节点容器启动失败" | 报错已带回远端日志尾部/容器状态；常见为 docker run 立即失败（同名残留容器已被自动清理、参数错误、端口冲突），也可直接看 `/tmp/adm_sglang_<model>_rank_<R>.log` |
 | NCCL 卡死/不收敛 | 依次尝试：`--disable-cuda-graph` → `NCCL_IB_GID_INDEX=3` → 指定互连网卡 → 关 RoCE（TCP 回退） |
 | 模型目录不存在（远端） | 各节点需各自下载一份模型（迭代二规划 rsync 自动分发） |
