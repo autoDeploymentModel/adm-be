@@ -4,6 +4,51 @@
 
 use crate::common::error::AppError;
 
+/// 校验光口 IP 格式（IPv4 点分十进制 / IPv6）。SSH 客户端对非法主机名只会笼统报
+/// "hostname contains invalid characters"，这里提前给出带实际值的友好提示。
+/// 节点清单字段为「光口 IP」，不接受主机名。
+pub fn validate_host(host: &str) -> Result<(), AppError> {
+    let h = host.trim();
+    if h.is_empty() {
+        return Err(AppError::msg("节点 IP 为空".to_string()));
+    }
+    let ok = is_ipv4(h) || is_ipv6(h);
+    if !ok {
+        return Err(AppError::msg(format!(
+            "节点 IP「{}」不是合法的 IP 地址（光口 IP 需为 IPv4 点分十进制，如 192.168.100.2；或 IPv6）",
+            h
+        )));
+    }
+    Ok(())
+}
+
+/// IPv4 点分十进制：4 段、每段 0-255 的十进制数
+fn is_ipv4(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() != 4 {
+        return false;
+    }
+    parts.iter().all(|p| {
+        !p.is_empty()
+            && p.len() <= 3
+            && p.bytes().all(|b| b.is_ascii_digit())
+            && p.parse::<u16>().map(|v| v <= 255).unwrap_or(false)
+    })
+}
+
+/// IPv6（宽松）：含 `:` 的十六进制/冒号/点组合，至多一个 `::`，可带 `%` 接口名
+fn is_ipv6(s: &str) -> bool {
+    let body = s.split('%').next().unwrap_or(s);
+    if !body.contains(':') {
+        return false;
+    }
+    body.split("::").count() <= 2
+        && body.matches(':').count() <= 7
+        && body
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
+}
+
 /// 在远端执行命令，返回 (status_success, stdout, stderr)。
 ///
 /// - `key`：私钥路径（`-i`），None 时用 ssh-agent / 默认 key

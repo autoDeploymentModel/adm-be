@@ -433,6 +433,7 @@ pub async fn multi_node_probe(
     key: Option<String>,
     model_dir: Option<String>,
 ) -> Result<ProbeResult, AppError> {
+    crate::common::ssh::validate_host(&ip)?;
     // 本机当前使用的镜像：设置页配置优先，缺省默认
     let mut image = "lmsysorg/sglang:v0.5.17".to_string();
     if let Ok(settings_path) = config::get_data_dir(Some(&app)).map(|d| d.join("config.json")) {
@@ -823,6 +824,7 @@ pub async fn push_image_to_remote(
     key: Option<String>,
     image: String,
 ) -> Result<String, AppError> {
+    crate::common::ssh::validate_host(&ip)?;
     let image = image.trim();
     if image.is_empty() {
         return Err(AppError::msg("镜像名为空".to_string()));
@@ -905,6 +907,7 @@ pub async fn sync_model_to_remote(
     key: Option<String>,
     remote_model_dir: String,
 ) -> Result<String, AppError> {
+    crate::common::ssh::validate_host(&ip)?;
     let data_dir = config::get_data_dir(Some(&app))?;
     let models_root = data_dir.join("models");
 
