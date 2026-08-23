@@ -1003,6 +1003,8 @@ fn build_multi_node_args(
         "run".to_string(),
         "-e".to_string(),
         "PYTHONWARNINGS=ignore::FutureWarning".to_string(),
+        "-e".to_string(),
+        "NCCL_DEBUG=INFO".to_string(),
         "--name".to_string(),
         container_name,
         "--gpus".to_string(),
