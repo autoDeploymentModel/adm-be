@@ -69,7 +69,6 @@ const EN = {
   "无 IP": "no IP",
   "已复制公钥": "Public key copied",
   "SSH Key 生成失败: ": "SSH key generation failed: ",
-  "RoCE 加速": "RoCE acceleration",
   "SSH 私钥": "SSH private key",
   "添加节点": "Add node",
   "全部测试": "Test all",

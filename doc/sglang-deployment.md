@@ -238,7 +238,7 @@ MTP（Multi-Token Prediction）：模型目录有 `model_mtp.safetensors` 时自
 | 引导端口 | `--dist-init-addr <节点0IP>:<端口>`（默认 6464，与 SGLang 官方默认一致），不得与模型服务端口冲突 |
 | NCCL 端口 | 0 = 随机；固定端口便于防火墙放行 |
 | 互连网卡 | 下拉自动扫描**本机物理网卡**，并合并**探活到的远端网卡**（datalist 可手输）；留空 = NCCL 自动发现（推荐）。注意所有节点需统一同名网卡（DGX Spark 同款硬件通常一致，如 CX-7 口 `enp1s0f0np0`/`enp1s0f1np1`） |
-| RoCE | QSFP 直连建议开启（挂载 `/dev/infiniband` + 放宽 memlock）；异常可关闭回退 TCP |
+| RoCE | 自动检测：host 有 `/dev/infiniband` 时挂载（DGX Spark），无则跳过（TCP 回退）。`memlock`/`IPC_LOCK` 无条件开启 |
 | 测试连通 | 节点行「测试连通」按钮：SSH 检查远端 Docker / GPU / **镜像（是否已下载本机当前使用的 sglang 镜像，设置页镜像为准）** / 模型目录。远端网卡不再探测——SSH 可达即互联已通 |
 | 同步镜像 | 「同步镜像到直连节点」独立一行：**全量同步本机所有推理引擎镜像**（仓库名含 sglang，当前设置页选择的镜像优先；远端已存在的自动跳过）；逐镜像**流式管道** `docker save <img> \| [pv -s <size>] \| ssh 直连IP '<docker> load'`，直连光口带宽充足**不做 gzip**（避免单线程压缩成为瓶颈），不落地临时 tar；进度事件 `image-push-progress`（stderr 解析 pv 百分比），失败时自动提示 docker 权限配置（docker 组 / 免密 sudo） |
 | 同步模型 | 「同步模型到直连节点」独立一行：**全量同步本机所有已下载模型**（运行中的模型优先）；逐模型先监测远端是否已同步（`<model_dir>/.done` 存在则跳过），未同步则 **rsync 增量** `--info=progress2`（无 rsync 时 scp -r 回退），完成后校验远端 `.done`；远端目标 = 设置页「模型目录」列（留空自动 `/home/<SSH用户>/models/<模型ID>`，填写则作为根目录）；进度事件 `model-sync-progress`（rsync progress2 百分比） |
@@ -265,6 +265,6 @@ MTP（Multi-Token Prediction）：模型目录有 `model_mtp.safetensors` 时自
 |---|---|
 | 启动报"远端节点探活失败" | 检查 SSH 免密/私钥、远端 docker 可用、模型目录含 `.done` |
 | 启动报"远端节点容器启动失败" | 报错已带回远端日志尾部/容器状态；常见为 docker run 立即失败（同名残留容器已被自动清理、参数错误、端口冲突），也可直接看 `/tmp/adm_sglang_<model>_rank_<R>.log` |
-| NCCL 卡死/不收敛（两节点日志停在 `Channel 0X/0` 建立后无 `NCCL INFO comm` 行） | **首选 `--disable-cuda-graph`**（设置页「更多启动参数」填 `disable-cuda-graph`，实测可解多机 TP 与 CUDA Graph 互锁）；无效再依次：`NCCL_IB_GID_INDEX=3` → 指定互连网卡 → 关 RoCE（TCP 回退）。网络层自检（防火墙关闭时）：两端 `grep "NET/Socket : Using"` 确认网卡/IP 配对 → `ethtool <iface>` 链路与速率 → `ping -M do -s 8972/-s 1472` 排除 MTU 问题。`--nccl-port` 仅控制 NCCL rendezvous 单端口（默认随机），数据面端口由 NCCL 动态分配（默认 50000+），防火墙需放行整段 |
+| NCCL 卡死/不收敛（两节点日志停在 `Channel 0X/0` 建立后无 `NCCL INFO comm` 行） | **首选 `--disable-cuda-graph`**（设置页「更多启动参数」填 `disable-cuda-graph`，实测可解多机 TP 与 CUDA Graph 互锁）；无效再依次：`NCCL_IB_GID_INDEX=3` → 指定互连网卡 → `NCCL_P2P_DISABLE=1`（TCP 回退）。网络层自检（防火墙关闭时）：两端 `grep "NET/Socket : Using"` 确认网卡/IP 配对 → `ethtool <iface>` 链路与速率 → `ping -M do -s 8972/-s 1472` 排除 MTU 问题。`--nccl-port` 仅控制 NCCL rendezvous 单端口（默认随机），数据面端口由 NCCL 动态分配（默认 50000+），防火墙需放行整段 |
 | 权重加载阶段停住（`CustomAllreduce` 提示后无新日志，几 GB 权重永不传输完） | 数据面卡死实锤：`ip -s link show <互连网卡> | grep -A1 RX` 间隔 5s 对比，**字节数不动 = NCCL 数据 socket 未工作**。先分两层：`ethtool <iface>`（Speed 应为 100000/200000Mb/s）+ `iperf3` 实测吞吐（Gb/s 正常）；链路正常则属 NCCL 软件层（GB10 + 镜像 NCCL 版本 TCP socket 问题），用「额外环境变量」加 `NCCL_DEBUG=TRACE` 复跑抓 socket 卡点，或试 `NCCL_P2P_DISABLE=1` / `NCCL_SOCKET_NTHREADS=1` |
 | 模型目录不存在（远端） | 各节点需各自下载一份模型（迭代二规划 rsync 自动分发） |
