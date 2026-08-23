@@ -76,7 +76,7 @@ WPRCS=$(docker top "$CID" 2>/dev/null | awk 'NR>1 && $0 ~ /python/ {print $2}' |
 if [ -n "$WPRCS" ]; then
   for WPID in $WPRCS; do
     echo "-- python pid=$WPID（容器内）--"
-    docker exec -i "$CID" sh -c "tr '\\0' '\\n' < /proc/$WPID/environ" 2>/dev/null \
+docker exec -i "$CID" sh -c "tr '\\000' '\\n' < /proc/$WPID/environ" 2>/dev/null \
       | grep -E "^(NCCL|CUDA_VISIBLE|CUMEM|NVLS|GDR|SGLANG|MASTER|RANK|WORLD|LOCAL_|OMPI|PMI|TORCH|NVIDIA)" \
       | sort || echo "(读取失败——容器内无权限或进程已退出)"
   done
