@@ -237,6 +237,7 @@ MTP（Multi-Token Prediction）：模型目录有 `model_mtp.safetensors` 时自
 | 节点清单 | 按下标即 rank，**第 1 条必须是本机**；每行填光口 IP / SSH 用户 / SSH 端口 / 模型目录 |
 | 引导端口 | `--dist-init-addr <节点0IP>:<端口>`（默认 6464，与 SGLang 官方默认一致），不得与模型服务端口冲突 |
 | NCCL 端口 | 0 = 随机；固定端口便于防火墙放行 |
+| 并行模式 | TP（张量并行，默认）/ PP（流水线并行）—— DGX Spark (GB10) 双机 TP=2 存在 NCCL all-reduce 死锁（平台级 bug），PP=2 可绕过 |
 | 互连网卡 | 下拉自动扫描**本机物理网卡**，并合并**探活到的远端网卡**（datalist 可手输）；留空 = NCCL 自动发现（推荐）。注意所有节点需统一同名网卡（DGX Spark 同款硬件通常一致，如 CX-7 口 `enp1s0f0np0`/`enp1s0f1np1`） |
 | RoCE | 自动检测：host 有 `/dev/infiniband` 时挂载（DGX Spark），无则跳过（TCP 回退）。`memlock`/`IPC_LOCK` 无条件开启 |
 | 测试连通 | 节点行「测试连通」按钮：SSH 检查远端 Docker / GPU / **镜像（是否已下载本机当前使用的 sglang 镜像，设置页镜像为准）** / 模型目录。远端网卡不再探测——SSH 可达即互联已通 |

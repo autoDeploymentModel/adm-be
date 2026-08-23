@@ -1205,10 +1205,16 @@ fn build_multi_node_args(
         }
     }
 
-    // ===== 多机参数（最后追加，跨节点 TP 拓扑不可被覆盖）=====
+    // ===== 多机参数（最后追加，跨节点并行拓扑不可被覆盖）=====
     let n_nodes = mn.nodes.len();
+    let is_pp = mn.parallel_mode.trim().eq_ignore_ascii_case("pp");
+    let parallel_flag = if is_pp {
+        "--pipeline-parallel-size"
+    } else {
+        "--tensor-parallel-size"
+    };
     args.extend([
-        "--tensor-parallel-size".to_string(),
+        parallel_flag.to_string(),
         n_nodes.to_string(),
         "--nnodes".to_string(),
         n_nodes.to_string(),
@@ -1321,14 +1327,16 @@ async fn start_multi_node(
         }
     }
 
+    let is_pp = mn.parallel_mode.trim().eq_ignore_ascii_case("pp");
+    let mode_label = if is_pp { "PP" } else { "TP" };
     crate::common::utils::logger::write_log(
         "INFO",
         "MODEL",
-        &format!("[{}] 多机模式启动：{} 个节点（TP={}），镜像 {}，节点0={}", model_id, n_nodes, n_nodes, image, mn.nodes[0].ip),
+        &format!("[{}] 多机模式启动：{} 个节点（{}={}），镜像 {}，节点0={}", model_id, n_nodes, mode_label, n_nodes, image, mn.nodes[0].ip),
     );
     let _ = app.emit("model-log", serde_json::json!({
         "model_id": model_id,
-        "line": format!("[多机] 启动 {} 节点集群（TP={}，rank0={}），镜像 {}", n_nodes, n_nodes, mn.nodes[0].ip, image),
+        "line": format!("[多机] 启动 {} 节点集群（{}={}，rank0={}），镜像 {}", n_nodes, mode_label, n_nodes, mn.nodes[0].ip, image),
         "source": "stdout",
     }));
 

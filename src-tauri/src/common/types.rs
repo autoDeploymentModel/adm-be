@@ -112,6 +112,14 @@ pub struct MultiNodeArgs {
     /// 额外容器环境变量（每行 KEY=VALUE，注入 docker run -e KEY=VALUE；如 NCCL_DEBUG=TRACE / NCCL_SOCKET_NTHREADS=1）
     #[serde(default)]
     pub extra_env: String,
+    /// 并行模式："tp"（张量并行，默认）或 "pp"（流水线并行）
+    /// DGX Spark (GB10) 双机 TP=2 存在 NCCL all-reduce 死锁（平台级 bug），PP=2 可绕过
+    #[serde(default = "default_parallel_mode")]
+    pub parallel_mode: String,
+}
+
+fn default_parallel_mode() -> String {
+    "tp".to_string()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]

@@ -521,6 +521,16 @@ const template = `
             <div class="param-label">${_t("NCCL 端口")}<div class="param-key">--nccl-port</div></div>
             <div class="param-input"><input type="number" id="multi_nccl_port" value="0" min="0" max="65535" style="max-width:160px;"><div class="param-desc">${_t("0 = 随机端口；固定端口便于防火墙放行")}</div></div>
           </div>
+          <div class="param-row">
+            <div class="param-label">${_t("并行模式")}<div class="param-key">parallel_mode</div></div>
+            <div class="param-input">
+              <select id="multi_parallel_mode" style="max-width:160px;">
+                <option value="tp">${_t("张量并行 (TP)")}</option>
+                <option value="pp">${_t("流水线并行 (PP)")}</option>
+              </select>
+              <div class="param-desc">${_t("DGX Spark (GB10) 双机 TP 存在 NCCL 死锁（平台级 bug），PP 可绕过；单机或无死锁时用 TP")}</div>
+            </div>
+          </div>
           <div class="param-row" style="align-items:flex-start;">
             <div class="param-label">${_t("额外环境变量")}<div class="param-key">extra_env</div></div>
             <div class="param-input" style="max-width:480px;">
@@ -731,6 +741,7 @@ function getMultiNodeArgsFromForm() {
     iface: "",
     ssh_key_path: "",
     extra_env: s("multi_extra_env"),
+    parallel_mode: s("multi_parallel_mode") || "tp",
   };
 }
 
@@ -924,6 +935,7 @@ async function fillMultiNodeArgsForm(m) {
   setB("multi_enabled", v.enabled);
   set("multi_dist_port", v.dist_init_port || 6464);
   set("multi_nccl_port", v.nccl_port || 0);
+  set("multi_parallel_mode", v.parallel_mode || "tp");
   set("multi_extra_env", v.extra_env || "");
   renderMultiNodeTable();
 }
@@ -1018,7 +1030,7 @@ function autoSave() { saveParams(); }
 
 function setupAutoSave() {
   ["ctx_size", "port", "host", "sglang_image", "sglang_shm", "sg_tp", "sg_mem_frac", "sg_dtype", "sg_quant", "sg_kv_dtype", "sg_sched", "sg_max_run", "sg_max_queue", "sg_chunk", "sg_log_level", "sg_log_requests", "sg_metrics", "sg_extra_args",
-   "multi_enabled", "multi_dist_port", "multi_nccl_port", "multi_extra_env"].forEach(function (id) {
+   "multi_enabled", "multi_dist_port", "multi_nccl_port", "multi_parallel_mode", "multi_extra_env"].forEach(function (id) {
     var el = document.getElementById(id);
     if (el) el.addEventListener("change", autoSave);
   });
