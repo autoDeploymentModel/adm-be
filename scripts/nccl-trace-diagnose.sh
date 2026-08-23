@@ -71,14 +71,22 @@ echo "==== 5) 卡点现场：日志最后 25 行 ===="
 tail -25 /tmp/sg_trace.log
 
 echo
-echo "==== 5.1) SGLang worker 进程环境（与裸 nccl_test 对比，抓 SGLang 注入的差异项）===="
-WPRCS=$(docker top "$CID" 2>/dev/null | awk 'NR>1 && $0 ~ /python/ {print $2}' | head -5)
+echo "==== 5.1) SGLang worker 进程（容器内 PID）状态与环境 ===="
+# 注意：docker top 的 PID 是宿主命名空间，容器 /proc 读不到；须用容器内 ps 取容器 PID
+WPRCS=$(docker exec "$CID" sh -c 'ps -eo pid,comm 2>/dev/null | grep -iE "[p]ython" | awk "{print \$1}"' 2>/dev/null | head -5)
+if [ -z "$WPRCS" ]; then
+  echo "(容器内 ps 不可用，退用 docker top（宿主 PID，环境读不了）)"
+  WPRCS=$(docker top "$CID" 2>/dev/null | awk 'NR>1 && $0 ~ /python/ {print $2}' | head -5)
+fi
 if [ -n "$WPRCS" ]; then
   for WPID in $WPRCS; do
-    echo "-- python pid=$WPID（容器内）--"
-docker exec -i "$CID" sh -c "tr '\\000' '\\n' < /proc/$WPID/environ" 2>/dev/null \
+    echo "-- pid=$WPID --"
+    docker exec -i "$CID" sh -c "tr '\\000' '\\n' < /proc/$WPID/environ" 2>/dev/null \
       | grep -E "^(NCCL|CUDA_VISIBLE|CUMEM|NVLS|GDR|SGLANG|MASTER|RANK|WORLD|LOCAL_|OMPI|PMI|TORCH|NVIDIA)" \
-      | sort || echo "(读取失败——容器内无权限或进程已退出)"
+      | sort || true
+    echo "  wchan=$(docker exec "$CID" sh -c "cat /proc/$WPID/wchan 2>/dev/null")"
+    docker exec "$CID" sh -c "grep -E '^(State|Threads|Cpus_allowed_list):' /proc/$WPID/status 2>/dev/null" \
+      | sed 's/^/  /' || true
   done
 else
   echo "(未找到 python 进程)"
