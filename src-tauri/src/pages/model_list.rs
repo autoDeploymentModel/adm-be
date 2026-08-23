@@ -1292,7 +1292,16 @@ async fn start_multi_node(
         );
         let container = multi_container_name(model_id, i);
         let log_path = format!("/tmp/adm_sglang_{}_rank_{}.log", model_id, i);
-        let script = crate::common::ssh::start_container_script(&container, &args, &log_path);
+        // 远端 docker 权限探测：免密 sudo 可用时 docker run 加 sudo -n（非 docker 组环境兜底）
+        let (rsok, rcout, _) = crate::common::ssh::ssh_run(
+            &node.ip, &node.ssh_user, node.ssh_port, key_ref,
+            "sudo -n true 2>/dev/null && echo SUDO_OK || echo SUDO_NO",
+            std::time::Duration::from_secs(15),
+        ).await.map_err(|e| {
+            AppError::msg(format!("远端节点 {}（rank {}）探活失败: {}", node.ip, i, e))
+        })?;
+        let use_sudo = rsok && rcout.contains("SUDO_OK");
+        let script = crate::common::ssh::start_container_script(&container, &args, &log_path, use_sudo);
         let (sok, _sout, serr) = crate::common::ssh::ssh_run(
             &node.ip, &node.ssh_user, node.ssh_port, key_ref, &script,
             std::time::Duration::from_secs(30),
@@ -1309,7 +1318,7 @@ async fn start_multi_node(
         let mut tail = String::new();
         for _ in 0..15 {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let chk = format!("docker ps --filter name={} --format '{{{{\"n\": .Names, \"s\": .Status}}}}' 2>/dev/null", crate::common::ssh::sh_quote(&container));
+            let chk = format!("(sudo -n docker ps --filter name={} --format '{{{{\"n\": .Names, \"s\": .Status}}}}' 2>/dev/null || docker ps --filter name={} --format '{{{{\"n\": .Names, \"s\": .Status}}}}' 2>/dev/null)", crate::common::ssh::sh_quote(&container), crate::common::ssh::sh_quote(&container));
             if let Ok((_, out2, _)) = crate::common::ssh::ssh_run(
                 &node.ip, &node.ssh_user, node.ssh_port, key_ref, &chk,
                 std::time::Duration::from_secs(10),
@@ -1510,7 +1519,7 @@ async fn start_multi_node(
                 for (i, node) in mn_c.nodes.iter().enumerate().skip(1) {
                     if node.is_self { continue; }
                     let c = multi_container_name(&mid, i);
-                    let chk = format!("docker ps --filter name={} --format '{{{{\"n\": .Names, \"s\": .Status}}}}' 2>/dev/null", crate::common::ssh::sh_quote(&c));
+                    let chk = format!("(sudo -n docker ps --filter name={} --format '{{{{\"n\": .Names, \"s\": .Status}}}}' 2>/dev/null || docker ps --filter name={} --format '{{{{\"n\": .Names, \"s\": .Status}}}}' 2>/dev/null)", crate::common::ssh::sh_quote(&c), crate::common::ssh::sh_quote(&c));
                     let status = crate::common::ssh::ssh_run_blocking(
                         &node.ip, &node.ssh_user, node.ssh_port, key_ref, &chk,
                         std::time::Duration::from_secs(3),

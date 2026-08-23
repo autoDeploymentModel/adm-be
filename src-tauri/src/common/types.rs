@@ -97,7 +97,7 @@ pub struct MultiNodeArgs {
     /// 节点清单（按下标即 rank；[0] 必须是本机 is_self=true）
     #[serde(default)]
     pub nodes: Vec<NodeInfo>,
-    /// 分布式引导端口（--dist-init-addr 端口，默认 20000，不得与服务端口冲突）
+    /// 分布式引导端口（--dist-init-addr 端口，默认 6464 与 SGLang 官方一致，不得与服务端口冲突）
     #[serde(default = "default_dist_init_port")]
     pub dist_init_port: u16,
     /// NCCL 通信端口（0 = 自动）
@@ -130,7 +130,7 @@ pub struct NodeInfo {
 }
 
 fn default_dist_init_port() -> u16 {
-    20000
+    6464
 }
 
 fn default_ssh_port() -> u16 {

@@ -1,14 +1,42 @@
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
-/// 创建一个 docker 命令（统一入口，各平台直接用 docker，需用户在 docker 组）。
+/// 探测免密 sudo（sudo -n true）是否可用：可用则本机 docker 命令自动加 sudo -n 前缀
+/// （docker 非 docker 组环境兜底，如 DGX Spark 默认用户）。结果缓存，仅首次探测。
+fn sudo_available() -> bool {
+    static SUDO_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUDO_OK.get_or_init(|| {
+        std::process::Command::new("sudo")
+            .args(["-n", "true"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
+/// 创建一个 docker 命令（统一入口）：免密 sudo 可用时自动 `sudo -n docker`，
+/// 否则直接用 docker（需用户在 docker 组）。
 pub fn docker_cmd() -> std::process::Command {
-    std::process::Command::new("docker")
+    if sudo_available() {
+        let mut c = std::process::Command::new("sudo");
+        c.arg("-n").arg("docker");
+        c
+    } else {
+        std::process::Command::new("docker")
+    }
 }
 
 /// 创建一个 docker 命令（tokio 版）。
 pub fn docker_cmd_tokio() -> tokio::process::Command {
-    tokio::process::Command::new("docker")
+    if sudo_available() {
+        let mut c = tokio::process::Command::new("sudo");
+        c.arg("-n").arg("docker");
+        c
+    } else {
+        tokio::process::Command::new("docker")
+    }
 }
 
 #[cfg(target_os = "windows")]

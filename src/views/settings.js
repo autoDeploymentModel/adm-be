@@ -504,7 +504,7 @@ const template = `
           <div class="param-group-title">${_t("互联参数")}</div>
           <div class="param-row">
             <div class="param-label">${_t("引导端口")}<div class="param-key">--dist-init-addr</div></div>
-            <div class="param-input"><input type="number" id="multi_dist_port" value="20000" min="1" max="65535" style="max-width:160px;"><div class="param-desc">${_t("SGLang 分布式引导 TCP 端口（所有节点通过节点 0 的该端口握手），不得与模型服务端口冲突")}</div></div>
+            <div class="param-input"><input type="number" id="multi_dist_port" value="6464" min="1" max="65535" style="max-width:160px;"><div class="param-desc">${_t("SGLang 分布式引导 TCP 端口（所有节点通过节点 0 的该端口握手），不得与模型服务端口冲突")}</div></div>
           </div>
           <div class="param-row">
             <div class="param-label">${_t("NCCL 端口")}<div class="param-key">--nccl-port</div></div>
@@ -749,7 +749,7 @@ function getMultiNodeArgsFromForm() {
     nodes: mnNodes.slice(0, 2).map(function (x) {
       return { ip: x.ip.trim(), ssh_user: x.sshUser.trim(), ssh_port: x.sshPort || 22, is_self: !!x.isSelf, model_dir: x.modelDir.trim() };
     }),
-    dist_init_port: n("multi_dist_port", 20000),
+    dist_init_port: n("multi_dist_port", 6464),
     nccl_port: n("multi_nccl_port", 0),
     iface: s("multi_iface"),
     use_roce: b("multi_roce"),
@@ -811,9 +811,10 @@ async function pushImageToRemote() {
     showToast(String(res));
     probeNode(1);
   } catch (e) {
-    if (statusEl) statusEl.textContent = "";
-    mnImgSyncStatus = "";
-    showToast(_t("同步失败: ") + e, true);
+    const failMsg = _t("同步失败: ") + e;
+    if (statusEl) statusEl.textContent = failMsg;
+    mnImgSyncStatus = failMsg;
+    showToast(failMsg, true);
   } finally {
     mnImgSyncBusy = false;
     setMnBtnBusy(btn, false);
@@ -845,9 +846,10 @@ async function syncModelToRemote() {
     showToast(String(res));
     probeNode(1);
   } catch (e) {
-    if (statusEl) statusEl.textContent = "";
-    mnModelSyncStatus = "";
-    showToast(_t("同步失败: ") + e, true);
+    const failMsg = _t("同步失败: ") + e;
+    if (statusEl) statusEl.textContent = failMsg;
+    mnModelSyncStatus = failMsg;
+    showToast(failMsg, true);
   } finally {
     mnModelSyncBusy = false;
     setMnBtnBusy(btn, false);
@@ -935,7 +937,7 @@ async function fillMultiNodeArgsForm(m) {
   const set = function (id, val) { const el = document.getElementById(id); if (el) el.value = val; };
   const setB = function (id, val) { const el = document.getElementById(id); if (el) el.checked = !!val; };
   setB("multi_enabled", v.enabled);
-  set("multi_dist_port", v.dist_init_port || 20000);
+  set("multi_dist_port", v.dist_init_port || 6464);
   set("multi_nccl_port", v.nccl_port || 0);
   set("multi_iface", v.iface || "");
   setB("multi_roce", v.use_roce);

@@ -76,7 +76,7 @@ ADM-BE 目前只在单台 DGX Spark（GB10，单 GPU，128GB 统一内存）上�
 pub struct MultiNodeArgs {
     pub enabled: bool,            // 总开关：false = 现有单机路径
     pub nodes: Vec<NodeInfo>,     // 按下标即 rank；[0] 必须是本机 is_self=true
-    pub dist_init_port: u16,      // --dist-init-addr 端口，默认 20000，不得与服务端口冲突
+    pub dist_init_port: u16,      // --dist-init-addr 端口，默认 6464，不得与服务端口冲突
     pub nccl_port: u16,           // NCCL 通信端口（0 = 自动）
     pub iface: String,            // 互连网卡（NCCL_SOCKET_IFNAME / GLOO_SOCKET_IFNAME，空 = 自动）
     pub use_roce: bool,           // 启用 RoCE（追加 --device /dev/infiniband 等 flag）

@@ -235,7 +235,7 @@ MTP（Multi-Token Prediction）：模型目录有 `model_mtp.safetensors` 时自
 |---|---|
 | 总开关 | 关闭 = 单机模式不变 |
 | 节点清单 | 按下标即 rank，**第 1 条必须是本机**；每行填光口 IP / SSH 用户 / SSH 端口 / 模型目录 |
-| 引导端口 | `--dist-init-addr <节点0IP>:<端口>`（默认 20000），不得与模型服务端口冲突 |
+| 引导端口 | `--dist-init-addr <节点0IP>:<端口>`（默认 6464，与 SGLang 官方默认一致），不得与模型服务端口冲突 |
 | NCCL 端口 | 0 = 随机；固定端口便于防火墙放行 |
 | 互连网卡 | 下拉自动扫描**本机物理网卡**，并合并**探活到的远端网卡**（datalist 可手输）；留空 = NCCL 自动发现（推荐）。注意所有节点需统一同名网卡（DGX Spark 同款硬件通常一致，如 CX-7 口 `enp1s0f0np0`/`enp1s0f1np1`） |
 | RoCE | QSFP 直连建议开启（挂载 `/dev/infiniband` + 放宽 memlock）；异常可关闭回退 TCP |

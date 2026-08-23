@@ -154,9 +154,10 @@ pub fn probe_script(model_dir: &str, image: &str, root_mode: bool) -> String {
     };
     format!(
         "echo 'GPU:'; nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1; \
-         echo 'DOCKER:'; docker info --format '{{{{.ServerVersion}}}}' 2>/dev/null || echo DOCKER_ERR; \
-         echo 'IMAGE:'; docker image inspect {} >/dev/null 2>&1 && echo IMAGE_OK || echo IMAGE_MISSING; \
+         echo 'DOCKER:'; (sudo -n docker info --format '{{{{.ServerVersion}}}}' 2>/dev/null || docker info --format '{{{{.ServerVersion}}}}' 2>/dev/null) || echo DOCKER_ERR; \
+         echo 'IMAGE:'; (sudo -n docker image inspect {} >/dev/null 2>&1 || docker image inspect {} >/dev/null 2>&1) && echo IMAGE_OK || echo IMAGE_MISSING; \
          echo 'MODEL:'; {}",
+        sh_quote(image),
         sh_quote(image),
         model_chk
     )
@@ -177,26 +178,30 @@ pub fn quote_remote_path(s: &str) -> String {
 }
 
 /// 远端停止/删除容器（多机停止用）：docker stop -t 5 + docker rm -f。
+/// 自动尝试 sudo -n，失败回退普通 docker（兼容非 docker 组远端）。
 pub fn stop_container_script(container_name: &str) -> String {
     let c = sh_quote(container_name);
     format!(
-        "docker stop -t 5 {} >/dev/null 2>&1; docker rm -f {} >/dev/null 2>&1; echo DONE",
-        c, c
+        "(sudo -n docker stop -t 5 {} 2>/dev/null || docker stop -t 5 {} 2>/dev/null); (sudo -n docker rm -f {} 2>/dev/null || docker rm -f {} 2>/dev/null); echo DONE",
+        c, c, c, c
     )
 }
 
 /// 远端启动容器脚本：nohup 后台运行 docker run，日志落盘，立即回显 STARTED。
 /// 所有参数 token 经单引号转义后拼入远端 shell 命令行（~ 路径前缀保持可展开）。
-pub fn start_container_script(container_name: &str, docker_args: &[String], log_path: &str) -> String {
-    let mut cmd = format!("docker");
+/// `use_sudo=true` 时 docker 命令加 `sudo -n` 前缀（远端非 docker 组环境）。
+pub fn start_container_script(container_name: &str, docker_args: &[String], log_path: &str, use_sudo: bool) -> String {
+    let dk = if use_sudo { "sudo -n docker" } else { "docker" };
+    let mut cmd = format!("{dk}");
     for a in docker_args {
         cmd.push(' ');
         cmd.push_str(&quote_remote_path(a));
     }
     format!(
-        "nohup {} > {} 2>&1 < /dev/null & echo STARTED; sleep 1; docker ps --filter name={} --format '{{{{.Names}}}} {{{{.Status}}}}' || true",
+        "nohup {} > {} 2>&1 < /dev/null & echo STARTED; sleep 1; {} ps --filter name={} --format '{{{{.Names}}}} {{{{.Status}}}}' || true",
         cmd,
         sh_quote(log_path),
+        dk,
         sh_quote(container_name)
     )
 }

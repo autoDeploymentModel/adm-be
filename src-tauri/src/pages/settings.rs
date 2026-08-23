@@ -843,13 +843,26 @@ pub async fn push_image_to_remote(
     let ssh_port = if port == 0 { 22 } else { port };
     let key_ref = key.as_deref().filter(|k| !k.trim().is_empty()).map(str::trim);
 
-    // 镜像总大小（供 pv -s 显示总进度）；pv 不存在时跳过
-    let mut size = String::new();
-    if let Ok(out) = tokio::process::Command::new("docker")
-        .args(["image", "inspect", "--format", "{{.Size}}", &image])
+    // docker 权限探测：本机/远端各自支持免密 sudo（sudo -n）时命令自动加 sudo（非 docker 组环境兜底）
+    let local_sudo = tokio::process::Command::new("sh")
+        .args(["-c", "sudo -n true 2>/dev/null && echo 1 || echo 0"])
         .output()
         .await
-    {
+        .map(|o| o.stdout.starts_with(b"1"))
+        .unwrap_or(false);
+    let (rsok, rcout, _) = crate::common::ssh::ssh_run(
+        &ip, &user, ssh_port, key_ref,
+        "sudo -n true 2>/dev/null && echo SUDO_OK || echo SUDO_NO",
+        std::time::Duration::from_secs(15),
+    ).await?;
+    let remote_sudo = rsok && rcout.contains("SUDO_OK");
+    let dk = if local_sudo { "sudo -n docker" } else { "docker" };
+    let rdk = if remote_sudo { "sudo -n docker" } else { "docker" };
+
+    // 镜像总大小（供 pv -s 显示总进度）；pv 不存在时跳过
+    let mut size = String::new();
+    let size_cmd = format!("{} image inspect --format '{{{{.Size}}}}' {}", dk, crate::common::ssh::sh_quote(&image));
+    if let Ok(out) = tokio::process::Command::new("sh").arg("-c").arg(&size_cmd).output().await {
         if out.status.success() {
             size = String::from_utf8_lossy(&out.stdout).trim().to_string();
         }
@@ -863,12 +876,15 @@ pub async fn push_image_to_remote(
 
     pipe_emit(&app, &ip, "image-push-progress", "save", 3, "导出并流式传输中...");
     let remote_cmd = format!(
-        "gunzip | docker load && docker image inspect {} >/dev/null 2>&1 && echo LOAD_OK || echo LOAD_FAIL",
+        "gunzip | {} load && {} image inspect {} >/dev/null 2>&1 && echo LOAD_OK || echo LOAD_FAIL",
+        rdk,
+        rdk,
         crate::common::ssh::sh_quote(&image)
     );
     let pipe = if has_pv && !size.is_empty() {
         format!(
-            "docker save {} | pv -f -s {} | gzip -1 | ssh {} {}@{} \"{}\"",
+            "{} save {} | pv -f -s {} | gzip -1 | ssh {} {}@{} \"{}\"",
+            dk,
             crate::common::ssh::sh_quote(&image),
             size,
             ssh_opts(ssh_port, key_ref),
@@ -878,7 +894,8 @@ pub async fn push_image_to_remote(
         )
     } else {
         format!(
-            "docker save {} | gzip -1 | ssh {} {}@{} \"{}\"",
+            "{} save {} | gzip -1 | ssh {} {}@{} \"{}\"",
+            dk,
             crate::common::ssh::sh_quote(&image),
             ssh_opts(ssh_port, key_ref),
             user.trim(),
