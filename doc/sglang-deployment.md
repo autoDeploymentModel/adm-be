@@ -266,4 +266,5 @@ MTP（Multi-Token Prediction）：模型目录有 `model_mtp.safetensors` 时自
 | 启动报"远端节点探活失败" | 检查 SSH 免密/私钥、远端 docker 可用、模型目录含 `.done` |
 | 启动报"远端节点容器启动失败" | 报错已带回远端日志尾部/容器状态；常见为 docker run 立即失败（同名残留容器已被自动清理、参数错误、端口冲突），也可直接看 `/tmp/adm_sglang_<model>_rank_<R>.log` |
 | NCCL 卡死/不收敛（两节点日志停在 `Channel 0X/0` 建立后无 `NCCL INFO comm` 行） | **首选 `--disable-cuda-graph`**（设置页「更多启动参数」填 `disable-cuda-graph`，实测可解多机 TP 与 CUDA Graph 互锁）；无效再依次：`NCCL_IB_GID_INDEX=3` → 指定互连网卡 → 关 RoCE（TCP 回退）。网络层自检（防火墙关闭时）：两端 `grep "NET/Socket : Using"` 确认网卡/IP 配对 → `ethtool <iface>` 链路与速率 → `ping -M do -s 8972/-s 1472` 排除 MTU 问题。`--nccl-port` 仅控制 NCCL rendezvous 单端口（默认随机），数据面端口由 NCCL 动态分配（默认 50000+），防火墙需放行整段 |
+| 权重加载阶段停住（`CustomAllreduce` 提示后无新日志，几 GB 权重永不传输完） | 数据面卡死实锤：`ip -s link show <互连网卡> | grep -A1 RX` 间隔 5s 对比，**字节数不动 = NCCL 数据 socket 未工作**。先分两层：`ethtool <iface>`（Speed 应为 100000/200000Mb/s）+ `iperf3` 实测吞吐（Gb/s 正常）；链路正常则属 NCCL 软件层（GB10 + 镜像 NCCL 版本 TCP socket 问题），用「额外环境变量」加 `NCCL_DEBUG=TRACE` 复跑抓 socket 卡点，或试 `NCCL_P2P_DISABLE=1` / `NCCL_SOCKET_NTHREADS=1` |
 | 模型目录不存在（远端） | 各节点需各自下载一份模型（迭代二规划 rsync 自动分发） |
