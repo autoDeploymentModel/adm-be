@@ -447,16 +447,18 @@ pub async fn multi_node_probe(
         }
     }
 
-    // 模型目录留空：按默认根目录探测（/home/<user>/models 或 ~/models），存在且含已同步模型即 OK
+    // 模型目录：留空时按默认根目录探测（/home/<user>/models 或 ~/models）。
+    // 无论用户是否填写模型目录，都按根目录模式（root_mode=true）检查：
+    // sync_model_to_remote 总是以 modelDir 为根目录，在其中创建 <model_id>/.done 子目录，
+    // 所以探活时要检查子目录中的 .done，而非目录自身。
     let raw_model_dir = model_dir.as_deref().unwrap_or("").trim();
-    let root_mode = raw_model_dir.is_empty();
-    let probe_model_dir = if root_mode {
+    let probe_model_dir = if raw_model_dir.is_empty() {
         let u = user.trim();
         if u.is_empty() { "~/models".to_string() } else { format!("/home/{}/models", u) }
     } else {
         raw_model_dir.to_string()
     };
-    let cmd = crate::common::ssh::probe_script(&probe_model_dir, &image, root_mode);
+    let cmd = crate::common::ssh::probe_script(&probe_model_dir, &image, true);
     let (ok, stdout, stderr) = crate::common::ssh::ssh_run(
         &ip, &user, if port == 0 { 22 } else { port },
         key.as_deref(), &cmd, std::time::Duration::from_secs(20),
@@ -504,11 +506,14 @@ pub async fn multi_node_probe(
             error: "远端 Docker daemon 不可用或未安装".to_string(),
         });
     }
+    // 检查顺序：SSH → Docker daemon → 镜像 → 模型，任一失败即返回 ok=false
     if !image_ok {
         let mut err = format!("远端未下载本机使用的镜像 {}（请先在远端 docker pull 或配置镜像加速）", image);
         if !image_err.is_empty() {
-            // 附带真实失败原因（权限/daemon 等），便于定位
             err.push_str(&format!("\n{}", image_err));
+        }
+        if !model_exists {
+            err.push_str("\n · 模型未同步，请先同步模型");
         }
         return Ok(ProbeResult {
             ok: false,
@@ -517,6 +522,16 @@ pub async fn multi_node_probe(
             image_ok,
             model_exists,
             error: err,
+        });
+    }
+    if !model_exists {
+        return Ok(ProbeResult {
+            ok: false,
+            gpu,
+            docker,
+            image_ok,
+            model_exists,
+            error: "远端模型未同步，请先点击「同步模型到直连节点」".to_string(),
         });
     }
     Ok(ProbeResult {
@@ -529,144 +544,7 @@ pub async fn multi_node_probe(
     })
 }
 
-/// 列出本机物理网卡（「互连网卡」下拉/datalist 用）。
-/// Linux：/sys/class/net 过滤虚拟接口；Windows：PowerShell Get-NetAdapter（仅开发/探活场景）。
-#[tauri::command]
-pub async fn list_network_interfaces() -> Result<Vec<String>, AppError> {
-    #[cfg(target_os = "windows")]
-    {
-        let out = tokio::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                "Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {$_.Status -eq 'Up'} | Select-Object -ExpandProperty Name",
-            ])
-            .output()
-            .await
-            .map_err(|e| AppError::msg(format!("枚举网卡失败: {}", e)))?;
-        Ok(String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect())
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let out = tokio::process::Command::new("sh")
-            .args(["-c", "ls /sys/class/net 2>/dev/null"])
-            .output()
-            .await
-            .map_err(|e| AppError::msg(format!("枚举网卡失败: {}", e)))?;
-        let mut res = Vec::new();
-        for name in String::from_utf8_lossy(&out.stdout).split_whitespace() {
-            if name.starts_with("lo")
-                || name.starts_with("docker")
-                || name.starts_with("veth")
-                || name.starts_with("br-")
-                || name.starts_with("virbr")
-                || name.starts_with("tun")
-                || name.starts_with("tap")
-            {
-                continue;
-            }
-            res.push(name.to_string());
-        }
-        Ok(res)
-    }
-}
-
-// ===== 多机互联：本机网络信息 + SSH 密钥 =====
-
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NetIface {
-    pub name: String,
-    /// IPv4 地址（空 = 未配置）
-    pub ip: String,
-    pub is_up: bool,
-    /// ConnectX-7 网卡（enp1s0f0np0 / enp1s0f1np1 / enP2p1s0f0np0 / enP2p1s0f1np1）
-    pub is_connectx: bool,
-    /// RJ45 管理口（enP* 命名，如 enP7s7）
-    pub is_manage: bool,
-}
-
-/// 扫描本机物理网卡详情：名称 / IPv4 / up-down / ConnectX-7 标记 / 管理口标记。
-/// 「多机互联」Tab 主节点配置用：管理网卡自动读取局域网 IP，ConnectX-7 网卡下拉显示状态。
-#[tauri::command]
-pub async fn get_local_network_info() -> Result<Vec<NetIface>, AppError> {
-    #[cfg(target_os = "windows")]
-    {
-        // Windows 仅开发/探活场景：PowerShell 枚举（无 ConnectX-7 / enP* 命名）
-        let out = tokio::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                "Get-NetAdapter | ForEach-Object { $ip=(Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1).IPAddress; \\\"$($_.Name)|$($_.Status)|$ip\\\" }",
-            ])
-            .output()
-            .await
-            .map_err(|e| AppError::msg(format!("枚举网卡失败: {}", e)))?;
-        let mut res = Vec::new();
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
-            let parts: Vec<&str> = line.split('|').collect();
-            if parts.len() < 2 {
-                continue;
-            }
-            res.push(NetIface {
-                name: parts[0].trim().to_string(),
-                ip: parts.get(2).unwrap_or(&"").trim().to_string(),
-                is_up: parts.get(1).unwrap_or(&"").trim().eq_ignore_ascii_case("Up"),
-                is_connectx: false,
-                is_manage: false,
-            });
-        }
-        Ok(res)
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let out = tokio::process::Command::new("sh")
-            .args([
-                "-c",
-                "for d in /sys/class/net/*; do n=${d##*/}; case \"$n\" in lo|docker*|veth*|br-*|virbr*|tun*|tap*) continue;; esac; s=$(cat $d/operstate 2>/dev/null); ip=$(ip -o -4 addr show dev $n 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1); echo \"$n|$s|$ip\"; done",
-            ])
-            .output()
-            .await
-            .map_err(|e| AppError::msg(format!("扫描网卡失败: {}", e)))?;
-
-        let mut res = Vec::new();
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
-            let parts: Vec<&str> = line.split('|').collect();
-            if parts.is_empty() || parts[0].trim().is_empty() {
-                continue;
-            }
-            let name = parts[0].trim().to_string();
-            let is_up = parts.get(1).unwrap_or(&"").trim() == "up";
-            let ip = parts.get(2).unwrap_or(&"").trim().to_string();
-            // ConnectX-7：BDF 子口命名（s<slot>f<func> + np 后缀）或 enP2p* 别名
-            let is_connectx = (name.starts_with("enp") || name.starts_with("enP2p"))
-                && (name.ends_with("np0") || name.ends_with("np1") || name.contains("s0f"));
-            // RJ45 管理口：enP\n+s\n+ 命名（如 enP7s7）
-            let is_manage = name.starts_with("enP")
-                && !name.starts_with("enP2p")
-                && name[3..].chars().all(|c| c.is_ascii_digit() || c == 'p' || c == 's');
-            if is_connectx || is_manage || name.starts_with("en")
-                || name.starts_with("eth")
-                || name.starts_with("wl")
-            {
-                res.push(NetIface {
-                    name,
-                    ip,
-                    is_up,
-                    is_connectx,
-                    is_manage,
-                });
-            }
-        }
-        Ok(res)
-    }
-}
+// ===== 多机互联：SSH 密钥 =====
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -845,7 +723,10 @@ async fn run_image_push(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| AppError::msg(format!("启动 ssh 管道失败: {}", e)))?;
+        .map_err(|e| {
+            let _ = p1.start_kill();
+            AppError::msg(format!("启动 ssh 管道失败: {}", e))
+        })?;
 
     let result = tokio::time::timeout(timeout, async {
         let mut stdin = p2.stdin.take().expect("p2 stdin piped");
@@ -866,7 +747,7 @@ async fn run_image_push(
                     break;
                 }
                 total += n as u64;
-                if size_bytes > 0 {
+                if size_bytes > 0 && total <= size_bytes {
                     let pct = ((total * 100) / size_bytes).min(99) as u8;
                     if pct != last_pct {
                         last_pct = pct;
@@ -883,28 +764,43 @@ async fn run_image_push(
             let _ = tokio::io::AsyncWriteExt::flush(&mut stdin).await;
         });
 
-        // 收集两端 stderr（尾部 4KB）
+        // 并发收集两端 stderr + p2 stdout，避免管道缓冲区满时死锁
+        let p1_stderr = p1.stderr.take();
+        let p2_stderr = p2.stderr.take();
+        let p2_stdout = p2.stdout.take();
+        let (e1, e2, stdout) = tokio::join!(
+            async {
+                let mut s = String::new();
+                if let Some(mut se) = p1_stderr {
+                    let _ = tokio::io::AsyncReadExt::read_to_string(&mut se, &mut s).await;
+                }
+                s
+            },
+            async {
+                let mut s = String::new();
+                if let Some(mut se) = p2_stderr {
+                    let _ = tokio::io::AsyncReadExt::read_to_string(&mut se, &mut s).await;
+                }
+                s
+            },
+            async {
+                let mut s = String::new();
+                if let Some(mut so) = p2_stdout {
+                    let _ = tokio::io::AsyncReadExt::read_to_string(&mut so, &mut s).await;
+                }
+                s
+            },
+        );
+        // 尾部 4KB，按 UTF-8 字符边界安全截断（避免多字节字符中间切片 panic）
         let mut err_tail = String::new();
-        let tailfy = |s: &mut String, chunk: &str| {
-            s.push_str(chunk);
-            if s.len() > 4096 {
-                *s = s[s.len() - 4096..].to_string();
+        err_tail.push_str(&e1);
+        err_tail.push_str(&e2);
+        if err_tail.len() > 4096 {
+            let mut start = err_tail.len() - 4096;
+            while start < err_tail.len() && !err_tail.is_char_boundary(start) {
+                start += 1;
             }
-        };
-        let mut e1 = String::new();
-        let mut e2 = String::new();
-        if let Some(mut se) = p1.stderr.take() {
-            let _ = tokio::io::AsyncReadExt::read_to_string(&mut se, &mut e1).await;
-        }
-        if let Some(mut se) = p2.stderr.take() {
-            let _ = tokio::io::AsyncReadExt::read_to_string(&mut se, &mut e2).await;
-        }
-        tailfy(&mut err_tail, &e1);
-        tailfy(&mut err_tail, &e2);
-
-        let mut stdout = String::new();
-        if let Some(mut so) = p2.stdout.take() {
-            let _ = tokio::io::AsyncReadExt::read_to_string(&mut so, &mut stdout).await;
+            err_tail = err_tail[start..].to_string();
         }
         let _ = count_task.await;
 
@@ -919,8 +815,10 @@ async fn run_image_push(
     match result {
         Ok(r) => r,
         Err(_) => {
-            let _ = p1.kill();
-            let _ = p2.kill();
+            let _ = p1.start_kill();
+            let _ = p2.start_kill();
+            let _ = p1.wait().await;
+            let _ = p2.wait().await;
             Err(AppError::msg(format!("管道执行超时（{}s）", timeout.as_secs())))
         }
     }

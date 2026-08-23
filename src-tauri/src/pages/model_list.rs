@@ -901,7 +901,8 @@ fn validate_multi_node(mn: &MultiNodeArgs, port: u16) -> Result<(), AppError> {
 }
 
 /// 远端模型目录：留空时自动默认 /home/<ssh_user>/models/<model_id>（绝对路径，无波浪号转义问题；
-/// SSH 用户为空时回退 ~/models/<model_id>，远端 shell 可展开 ~）
+/// SSH 用户为空时回退 ~/models/<model_id>，远端 shell 可展开 ~）。
+/// 用户填写时视为模型根目录，追加 /<model_id> 子目录（与 sync_model_to_remote 一致）。
 fn effective_remote_model_dir(model_dir: &str, user: &str, model_id: &str) -> String {
     let t = model_dir.trim();
     if t.is_empty() {
@@ -912,7 +913,7 @@ fn effective_remote_model_dir(model_dir: &str, user: &str, model_id: &str) -> St
             format!("/home/{}/models/{}", u, model_id)
         }
     } else {
-        t.to_string()
+        format!("{}/{}", t, model_id)
     }
 }
 
@@ -937,12 +938,52 @@ fn spec_user_defined(sglang_args: &SglangArgs, sglang_flags: &[String]) -> bool 
     }) || sglang_flags.iter().any(|f| f.contains("speculative-algorithm"))
 }
 
+/// 本机通过 IP 反查网卡名：`ip -o -4 addr show to <IP>` 取接口名。
+/// 仅 Linux 多机模式调用；Windows 开发环境返回 None（不影响开发）。
+fn detect_local_iface(ip: &str) -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = ip;
+        None
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let out = std::process::Command::new("sh")
+            .args(["-c", &format!("ip -o -4 addr show to {} 2>/dev/null | awk '{{print $2}}' | head -1", ip)])
+            .output()
+            .ok()?;
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if name.is_empty() { None } else { Some(name) }
+    }
+}
+
+/// 远端通过 SSH 反查网卡名：SSH 执行 `ip -o -4 addr show to <IP>`。
+async fn detect_remote_iface(
+    ip: &str, user: &str, port: u16, key: Option<&str>,
+    target_ip: &str,
+) -> Option<String> {
+    let cmd = format!(
+        "ip -o -4 addr show to {} 2>/dev/null | awk '{{print $2}}' | head -1",
+        target_ip
+    );
+    let (ok, stdout, _) = crate::common::ssh::ssh_run(
+        ip, user, port, key, &cmd, std::time::Duration::from_secs(10),
+    )
+    .await
+    .ok()?;
+    if !ok { return None; }
+    let name = stdout.trim().to_string();
+    if name.is_empty() { None } else { Some(name) }
+}
+
 /// 构建某 rank 的完整 docker run 参数（多机模式）。
 ///
 /// 与单机的差异：`--network host`（替代 -p 端口映射，NCCL 跨机必需）；
 /// 多机参数（--tp N --nnodes N --node-rank R --dist-init-addr）置于命令**最后**，
 /// 保证跨节点 TP 拓扑不被设置页/模型清单的同名参数覆盖。
 /// 设置页 sglang_args / MTP 自动启用 / 模型清单 sglang_flags 拼接规则与单机一致。
+/// `iface`：自动从节点 IP 反查的网卡名，注入 NCCL_SOCKET_IFNAME / GLOO_SOCKET_IFNAME；
+///          None 时不注入（NCCL 自动发现）。
 fn build_multi_node_args(
     model_id: &str,
     model_dir: &std::path::Path,
@@ -954,6 +995,7 @@ fn build_multi_node_args(
     mn: &MultiNodeArgs,
     rank: usize,
     node0_ip: &str,
+    iface: Option<&str>,
 ) -> Vec<String> {
     let container_name = format!("adm-sglang-{}-rank-{}", model_id, rank);
     let mount_dst = format!("/models/{}", model_id);
@@ -984,12 +1026,12 @@ fn build_multi_node_args(
             "IPC_LOCK".to_string(),
         ]);
     }
-    if !mn.iface.trim().is_empty() {
+    if let Some(iface_name) = iface.filter(|s| !s.trim().is_empty()) {
         args.extend([
             "-e".to_string(),
-            format!("NCCL_SOCKET_IFNAME={}", mn.iface.trim()),
+            format!("NCCL_SOCKET_IFNAME={}", iface_name.trim()),
             "-e".to_string(),
-            format!("GLOO_SOCKET_IFNAME={}", mn.iface.trim()),
+            format!("GLOO_SOCKET_IFNAME={}", iface_name.trim()),
         ]);
     }
     args.push("-v".to_string());
@@ -1278,6 +1320,17 @@ async fn start_multi_node(
         }));
 
         // 启动：nohup docker run 后台运行，日志落盘 /tmp/adm_sglang_<model>_rank_<i>.log
+        // 自动从节点 IP 反查互连网卡名
+        let remote_iface = detect_remote_iface(
+            &node.ip, &node.ssh_user, node.ssh_port, key_ref, &node.ip,
+        ).await;
+        if let Some(ref iface_name) = remote_iface {
+            let _ = app.emit("model-log", serde_json::json!({
+                "model_id": model_id,
+                "line": format!("[多机] 节点 {}（rank {}）互连网卡：{}", node.ip, i, iface_name),
+                "source": "stdout",
+            }));
+        }
         let args = build_multi_node_args(
             model_id,
             &std::path::Path::new(&node_model_dir),
@@ -1289,6 +1342,7 @@ async fn start_multi_node(
             &mn,
             i,
             &node0_ip,
+            remote_iface.as_deref(),
         );
         let container = multi_container_name(model_id, i);
         let log_path = format!("/tmp/adm_sglang_{}_rank_{}.log", model_id, i);
@@ -1358,8 +1412,17 @@ async fn start_multi_node(
     let _ = crate::common::utils::platform::docker_cmd()
         .args(["rm", "-f", &container0])
         .output();
+    // 自动从本机节点 IP 反查互连网卡名
+    let local_iface = detect_local_iface(&node0_ip);
+    if let Some(ref iface_name) = local_iface {
+        let _ = app.emit("model-log", serde_json::json!({
+            "model_id": model_id,
+            "line": format!("[多机] 本机（rank 0）互连网卡：{}", iface_name),
+            "source": "stdout",
+        }));
+    }
     let args0 = build_multi_node_args(
-        model_id, model_dir, &image, &shm_size, port, &sglang_args, &sglang_flags, &mn, 0, &node0_ip,
+        model_id, model_dir, &image, &shm_size, port, &sglang_args, &sglang_flags, &mn, 0, &node0_ip, local_iface.as_deref(),
     );
 
     dbg_log!("[DEBUG] sglang multi-node docker args (rank0): {:?}", args0);

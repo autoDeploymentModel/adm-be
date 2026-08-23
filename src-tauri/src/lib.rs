@@ -189,8 +189,6 @@ pub fn run() {
             settings::get_docker_mirror_config,
             settings::save_docker_mirror_config,
             settings::multi_node_probe,
-            settings::list_network_interfaces,
-            settings::get_local_network_info,
             settings::ensure_ssh_key,
             settings::push_image_to_remote,
             settings::sync_model_to_remote,

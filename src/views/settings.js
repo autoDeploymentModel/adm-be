@@ -511,23 +511,11 @@ const template = `
             <div class="param-input"><input type="number" id="multi_nccl_port" value="0" min="0" max="65535" style="max-width:160px;"><div class="param-desc">${_t("0 = 随机端口；固定端口便于防火墙放行")}</div></div>
           </div>
           <div class="param-row">
-            <div class="param-label">${_t("互连网卡")}<div class="param-key">NCCL_SOCKET_IFNAME</div></div>
-            <div class="param-input">
-              <input type="text" id="multi_iface" list="mn-iface-list" placeholder="${_t("自动（不指定）")}" style="max-width:260px;">
-              <datalist id="mn-iface-list"></datalist>
-              <div class="param-desc">${_t("下拉为本机网卡 + 探活到的远端网卡（自动合并）。留空 = NCCL 自动发现（推荐）；直连或异常时指定互连网卡（如管理口 enP7s7 或 CX-7 口 enp1s0f0np0）。注意各节点需为同名网卡")}</div>
-            </div>
-          </div>
-          <div class="param-row">
             <div class="param-label">${_t("RoCE 加速")}<div class="param-key">/dev/infiniband</div></div>
             <div class="param-input">
               <div class="checkbox-wrap"><input type="checkbox" id="multi_roce" style="width:16px;height:16px;cursor:pointer;accent-color:var(--c-accent);"></div>
               <div class="param-desc">${_t("启用 ConnectX-7 RoCE RDMA（挂载 /dev/infiniband、放宽内存锁限制）；QSFP 直连建议开启，连接异常时可关闭回退 TCP")}</div>
             </div>
-          </div>
-          <div class="param-row">
-            <div class="param-label">${_t("SSH 私钥")}<div class="param-key">ssh_key_path</div></div>
-            <div class="param-input"><input type="text" id="multi_ssh_key" placeholder="~/.ssh/id_ed25519" style="max-width:380px;"><div class="param-desc">${_t("留空 = 使用 ssh-agent / 默认 key；私钥公钥需已加入各远端节点 authorized_keys")}</div></div>
           </div>
         </div>
       </div>
@@ -685,21 +673,19 @@ async function probeNode(rank) {
   // 模型目录留空不提前拦截：后端按默认 /home/<SSH用户>/models 根目录探测
   mnProbeState[rank] = { probing: true };
   renderMultiNodeTable();
-  const keyEl = document.getElementById("multi_ssh_key");
   try {
     const res = await invoke()("multi_node_probe", {
       ip: n.ip,
       user: n.sshUser,
       port: n.sshPort || 22,
-      key: keyEl && keyEl.value.trim() ? keyEl.value.trim() : null,
+      key: null,
       modelDir: n.modelDir,
     });
     if (res.ok) {
-      const detail = "GPU:" + (res.gpu || "?") + " Docker:" + (res.docker || "?") + (res.imageOk ? "" : " · " + _t("镜像缺失")) + (res.modelExists ? "" : " · " + _t("模型未同步，请先同步模型"));
+      const detail = "GPU:" + (res.gpu || "?") + " Docker:" + (res.docker || "?");
       mnProbeState[rank] = { ok: true, detail: detail };
     } else {
-      const modelWarn = !res.modelExists ? " · " + _t("模型未同步，请先同步模型") : "";
-      mnProbeState[rank] = { ok: false, detail: res.error + modelWarn };
+      mnProbeState[rank] = { ok: false, detail: res.error };
     }
   } catch (e) {
     mnProbeState[rank] = { ok: false, detail: String(e) };
@@ -707,27 +693,7 @@ async function probeNode(rank) {
   renderMultiNodeTable();
 }
 
-// 往「互连网卡」datalist 追加选项（去重）
-function addIfaceOptions(names) {
-  const dl = document.getElementById("mn-iface-list");
-  if (!dl || !names || names.length === 0) return;
-  const existing = Array.prototype.map.call(dl.options || [], function (o) { return o.value; });
-  const added = [];
-  names.forEach(function (name) {
-    if (name && existing.indexOf(name) === -1) {
-      const opt = document.createElement("option");
-      opt.value = name;
-      dl.appendChild(opt);
-      existing.push(name);
-      added.push(name);
-    }
-  });
-  // 当前输入为空时自动带入首个探活到的网卡（减少手输）
-  const input = document.getElementById("multi_iface");
-  if (input && !input.value.trim() && added.length > 0) {
-    input.value = added[0];
-  }
-}
+// 往「互连网卡」datalist 追加选项（去重）— 已移除，网卡自动从节点 IP 反查
 
 async function probeAllNodes() {
   const ranks = [];
@@ -751,9 +717,9 @@ function getMultiNodeArgsFromForm() {
     }),
     dist_init_port: n("multi_dist_port", 6464),
     nccl_port: n("multi_nccl_port", 0),
-    iface: s("multi_iface"),
+    iface: "",
     use_roce: b("multi_roce"),
-    ssh_key_path: s("multi_ssh_key"),
+    ssh_key_path: "",
   };
 }
 
@@ -797,13 +763,12 @@ async function pushImageToRemote() {
   mnImgSyncName = image;
   mnImgSyncStatus = _t("正在同步") + " " + image;
   if (statusEl) statusEl.textContent = mnImgSyncStatus;
-  const keyEl = document.getElementById("multi_ssh_key");
   try {
     const res = await invoke()("push_image_to_remote", {
       ip: n.ip,
       user: n.sshUser,
       port: n.sshPort || 22,
-      key: keyEl && keyEl.value.trim() ? keyEl.value.trim() : null,
+      key: null,
       image: image,
     });
     if (statusEl) statusEl.textContent = String(res);
@@ -832,13 +797,12 @@ async function syncModelToRemote() {
   setMnBtnBusy(btn, true, _t("模型同步中..."));
   mnModelSyncStatus = _t("检测中...");
   if (statusEl) statusEl.textContent = mnModelSyncStatus;
-  const keyEl = document.getElementById("multi_ssh_key");
   try {
     const res = await invoke()("sync_model_to_remote", {
       ip: n.ip,
       user: n.sshUser,
       port: n.sshPort || 22,
-      key: keyEl && keyEl.value.trim() ? keyEl.value.trim() : null,
+      key: null,
       remoteModelDir: n.modelDir.trim(),
     });
     if (statusEl) statusEl.textContent = String(res);
@@ -949,9 +913,7 @@ async function fillMultiNodeArgsForm(m) {
   setB("multi_enabled", v.enabled);
   set("multi_dist_port", v.dist_init_port || 6464);
   set("multi_nccl_port", v.nccl_port || 0);
-  set("multi_iface", v.iface || "");
-  setB("multi_roce", v.use_roce);
-  set("multi_ssh_key", v.ssh_key_path || "");
+  setB("multi_roce", v.use_roce !== undefined ? v.use_roce : true);
   renderMultiNodeTable();
 }
 
@@ -1044,7 +1006,7 @@ function autoSave() { saveParams(); }
 
 function setupAutoSave() {
   ["ctx_size", "port", "host", "sglang_image", "sglang_shm", "sg_tp", "sg_mem_frac", "sg_dtype", "sg_quant", "sg_kv_dtype", "sg_sched", "sg_max_run", "sg_max_queue", "sg_chunk", "sg_log_level", "sg_log_requests", "sg_metrics",
-   "multi_enabled", "multi_dist_port", "multi_nccl_port", "multi_iface", "multi_roce", "multi_ssh_key"].forEach(function (id) {
+   "multi_enabled", "multi_dist_port", "multi_nccl_port", "multi_roce"].forEach(function (id) {
     var el = document.getElementById(id);
     if (el) el.addEventListener("change", autoSave);
   });
@@ -1454,15 +1416,7 @@ export default {
     if (mnProbeAllBtn) {
       mnProbeAllBtn.addEventListener("click", probeAllNodes);
     }
-    // 「互连网卡」下拉候选：本机物理网卡（进入设置页时加载）
-    (async function () {
-      try {
-        const ifaces = await invoke()("list_network_interfaces");
-        addIfaceOptions(ifaces || []);
-      } catch (e) {
-        console.error("[settings] 枚举本机网卡失败:", e);
-      }
-    })();
+    // 「互连网卡」已移除：后端自动从节点 IP 反查网卡名注入 NCCL_SOCKET_IFNAME
     // 同步入口：镜像（整体按钮）+ 模型（下拉选择本地模型）
     var mnPushImgBtn = document.getElementById("mn-push-img-btn");
     if (mnPushImgBtn) {

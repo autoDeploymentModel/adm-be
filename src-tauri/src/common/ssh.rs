@@ -131,9 +131,10 @@ pub async fn ssh_run(
 }
 
 /// 远端探活脚本：nvidia-smi 简版 + docker 版本 + 本机所用镜像存在性 + 模型目录存在性。
-/// 输出解析约定（换行分隔）：
+/// 输出解析约定（每行 `LABEL:VALUE` 格式，label 和 value 在同一行）：
 /// `GPU:` 行 GPU 名（无 GPU 时为空）；`DOCKER:` 行 docker ServerVersion（异常时 "DOCKER_ERR"）；
 /// `IMAGE:` 行 "IMAGE_OK" / "IMAGE_MISSING"（远端是否已下载 `image`）；
+/// `IMG_ERR:` 行镜像检查失败原因（仅 IMAGE_MISSING 时输出）；
 /// `MODEL:` 行 "MODEL_OK" / "MODEL_MISSING"。
 /// `root_mode=true`：model_dir 为模型根目录（探活时留空自动 `~/models` 或 `/home/<user>/models`），
 /// 目录存在且其中含已同步模型（任一子目录有 `.done`）即 MODEL_OK；
@@ -143,25 +144,26 @@ pub fn probe_script(model_dir: &str, image: &str, root_mode: bool) -> String {
     let dir_q = quote_remote_path(model_dir);
     let model_chk = if root_mode {
         format!(
-            "if [ -d {} ] && ( [ -e {}/.done ] 2>/dev/null || ls {}/*/.done >/dev/null 2>&1 ); then echo MODEL_OK; else echo MODEL_MISSING; fi",
-            dir_q, dir_q, dir_q
+            "if [ -d {d} ] && ( [ -e {d}/.done ] 2>/dev/null || ls {d}/*/.done >/dev/null 2>&1 ); then echo MODEL_OK; else echo MODEL_MISSING; fi",
+            d = dir_q
         )
     } else {
         format!(
-            "if [ -d {} ] && [ -e {}/.done ]; then echo MODEL_OK; else echo MODEL_MISSING; fi",
-            dir_q, dir_q
+            "if [ -d {d} ] && [ -e {d}/.done ]; then echo MODEL_OK; else echo MODEL_MISSING; fi",
+            d = dir_q
         )
     };
+    let img = sh_quote(image);
+    // 使用 echo "LABEL:$(...)" 确保 label 和 value 在同一行，
+    // 解析端用 strip_prefix("LABEL:") 即可提取 value。
     format!(
-        "echo 'GPU:'; nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1; \
-         echo 'DOCKER:'; (sudo -n docker info --format '{{{{.ServerVersion}}}}' 2>/dev/null || docker info --format '{{{{.ServerVersion}}}}' 2>/dev/null) || echo DOCKER_ERR; \
-         echo 'IMAGE:'; if sudo -n docker image inspect {} >/dev/null 2>&1 || docker image inspect {} >/dev/null 2>&1; then echo IMAGE_OK; else echo IMAGE_MISSING; echo 'IMG_ERR:'; (sudo -n docker image inspect {} 2>&1 || docker image inspect {} 2>&1) | tail -1; fi; \
-         echo 'MODEL:'; {}",
-        sh_quote(image),
-        sh_quote(image),
-        sh_quote(image),
-        sh_quote(image),
-        model_chk
+        "echo \"GPU:$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)\"; \
+         echo \"DOCKER:$(sudo -n docker info --format '{{{{.ServerVersion}}}}' 2>/dev/null || docker info --format '{{{{.ServerVersion}}}}' 2>/dev/null || echo DOCKER_ERR)\"; \
+         echo \"IMAGE:$(sudo -n docker image inspect {img} >/dev/null 2>&1 || docker image inspect {img} >/dev/null 2>&1 && echo IMAGE_OK || echo IMAGE_MISSING)\"; \
+         if ! (sudo -n docker image inspect {img} >/dev/null 2>&1 || docker image inspect {img} >/dev/null 2>&1); then echo \"IMG_ERR:$( (sudo -n docker image inspect {img} 2>&1 || docker image inspect {img} 2>&1) | tail -1 )\"; fi; \
+         echo \"MODEL:$({chk})\"",
+        img = img,
+        chk = model_chk
     )
 }
 

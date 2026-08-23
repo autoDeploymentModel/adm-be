@@ -107,7 +107,7 @@ pub struct MultiNodeArgs {
     #[serde(default)]
     pub iface: String,
     /// 启用 RoCE（追加 --device /dev/infiniband、--ulimit memlock=-1:-1、--cap-add IPC_LOCK）
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub use_roce: bool,
     /// SSH 私钥路径（-i 指定；空 = 使用 ssh-agent / 默认 key）
     #[serde(default)]
@@ -131,6 +131,10 @@ pub struct NodeInfo {
 
 fn default_dist_init_port() -> u16 {
     6464
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_ssh_port() -> u16 {
