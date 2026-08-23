@@ -965,21 +965,22 @@ pub async fn sync_model_to_remote(
 
     pipe_emit(&app, &ip, "model-sync-progress", "save", 0, &format!("同步模型 {} ...", model_id));
     let src_str = format!("{}/", src.to_string_lossy());
-    // rsync 增量；无 rsync 时 scp -r 回退（先远端 mkdir）
+    // 先远端建目录（rsync 不会自动创建不存在的多级父目录），再增量 rsync；无 rsync 回退 scp -r
+    let remote_dir_q = crate::common::ssh::quote_remote_path(&remote_dir);
     let script = format!(
-        "if command -v rsync >/dev/null 2>&1; then \
+        "ssh {} 'mkdir -p {}' 2>&1 && \
+         if command -v rsync >/dev/null 2>&1; then \
            rsync -a --info=progress2 --no-inc-recursive -e 'ssh {}' '{}' '{}@{}:{}' 2>&1; \
          else \
-           ssh {} 'mkdir -p {}' 2>/dev/null && \
            scp -r -o BatchMode=yes -o ConnectTimeout=5 '{}' '{}@{}:{}' 2>&1; \
          fi",
+        opts,
+        remote_dir_q,
         opts,
         src_str,
         user.trim(),
         ip.trim(),
         crate::common::ssh::quote_remote_path(&format!("{}/", remote_dir)),
-        opts,
-        crate::common::ssh::quote_remote_path(&remote_dir),
         src_str,
         user.trim(),
         ip.trim(),
