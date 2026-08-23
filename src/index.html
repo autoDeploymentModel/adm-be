@@ -631,7 +631,7 @@
     st.downloadingVae = st.downloadingVae || {};
 
     if (typeof listen === "function") {
-      var globalEvents = ["download-progress", "download-complete", "download-error", "model-pull-progress", "model-started", "model-stopped", "model-error"];
+      var globalEvents = ["download-progress", "download-complete", "download-error", "model-pull-progress", "model-started", "model-stopped", "model-error", "image-push-progress", "model-sync-progress"];
       globalEvents.forEach(function(ev) {
         listen(ev, function(event) {
           var p = event.payload || {};

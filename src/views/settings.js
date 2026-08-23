@@ -157,6 +157,26 @@ const template = `
   .version-table td:first-child { color: var(--c-text-2); width: 140px; }
   .version-table td:last-child { color: var(--c-text); font-weight: 500; }
 
+  /* 多机互联：节点清单表 */
+  .mn-table { width: 100%; border-collapse: collapse; }
+  .mn-table th { text-align: left; font-size: 12px; color: var(--c-text-3); font-weight: 500; padding: 8px 6px; border-bottom: 1px solid var(--c-border); white-space: nowrap; }
+  .mn-table td { padding: 6px; border-bottom: 1px solid var(--c-border-soft); vertical-align: middle; }
+  .mn-table input.mn-cell {
+    padding: 0 8px;
+    height: 28px;
+    line-height: 1.15;
+    background: var(--c-panel-2);
+    border: 1px solid var(--c-border);
+    border-radius: 5px;
+    color: var(--c-text);
+    font-size: 12px;
+    outline: none;
+    width: 100%;
+    box-sizing: border-box;
+  }
+  .mn-table input.mn-cell:focus { border-color: var(--c-accent); }
+  .mn-table .mn-self-chk { width: 16px; height: 16px; cursor: pointer; accent-color: var(--c-accent); }
+
   /* 镜像管理表：自适应宽度，不限制最大宽度 */
   .version-table.engine-table { max-width: none; table-layout: auto; }
   .version-table.engine-table th { padding: 6px 10px; font-size: 12px; color: var(--c-text-3); font-weight: 500; }
@@ -240,6 +260,7 @@ const template = `
     <nav id="settings-nav">
       <div class="nav-item active" data-panel="launch-params" id="nav-launch-params">${_t("模型启动参数")}</div>
       <div class="nav-item" data-panel="docker-mirror" id="nav-docker-mirror">${_t("Docker 镜像配置")}</div>
+      <div class="nav-item" data-panel="multinode" id="nav-multinode">${_t("DGX直连配置")}</div>
       <div class="nav-item" data-panel="appearance" id="nav-appearance">${_t("外观主题")}</div>
       <div class="nav-item" data-panel="logs" id="nav-logs">${_t("运行日志")}</div>
       <div class="nav-item" data-panel="version" id="nav-version">${_t("系统版本号")}</div>
@@ -485,6 +506,72 @@ const template = `
         </div>
       </div>
 
+      <div id="panel-multinode" class="panel">
+        <div class="panel-title">${_t("DGX直连配置")}</div>
+
+        <div class="param-group">
+          <div class="param-group-title">${_t("总开关")}</div>
+          <div class="param-row">
+            <div class="param-label">${_t("启用多机模式")}<div class="param-key">multiNodeArgs.enabled</div></div>
+            <div class="param-input">
+              <div class="checkbox-wrap"><input type="checkbox" id="multi_enabled" style="width:16px;height:16px;cursor:pointer;accent-color:var(--c-accent);"></div>
+              <div class="param-desc">${_t("开启后启动模型走多节点集群（2+ 台 DGX Spark 组成 TP=N 推理集群）；关闭 = 单机模式不变")}</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="param-group">
+          <div class="param-group-title">${_t("直连节点")}</div>
+          <div class="param-desc" style="margin-bottom:10px;">
+            ${_t("按下标即 rank；第 1 行自动为主节点（本机），第 2 行为直连节点。")}
+            <span style="color:#f44336;font-weight:600;">${_t("重点：IP 请填写已配置好的光口（ConnectX-7 QSFP）互连 IP，不是 RJ45 网卡的局域网 IP！")}</span>
+          </div>
+          <table class="mn-table">
+            <thead><tr><th>rank</th><th>${_t("光口 IP")}</th><th>SSH 用户</th><th>SSH 端口</th><th>${_t("模型目录")}</th><th>${_t("状态")}</th><th>${_t("操作")}</th></tr></thead>
+            <tbody id="mn-tbody"></tbody>
+          </table>
+          <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            <button class="btn-reset" id="mn-push-img-btn" style="font-size:13px;padding:6px 16px;">${_t("同步镜像到直连节点")}</button>
+            <span id="mn-push-img-status" style="font-size:12px;color:var(--c-text-3);"></span>
+          </div>
+          <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            <button class="btn-reset" id="mn-sync-model-btn" style="font-size:13px;padding:6px 16px;">${_t("同步模型到直连节点")}</button>
+            <span id="mn-sync-model-status" style="font-size:12px;color:var(--c-text-3);"></span>
+          </div>
+        </div>
+
+        <div class="param-group">
+          <div class="param-group-title">${_t("互联参数")}</div>
+          <div class="param-row">
+            <div class="param-label">${_t("引导端口")}<div class="param-key">--dist-init-addr</div></div>
+            <div class="param-input"><input type="number" id="multi_dist_port" value="20000" min="1" max="65535" style="max-width:160px;"><div class="param-desc">${_t("SGLang 分布式引导 TCP 端口（所有节点通过节点 0 的该端口握手），不得与模型服务端口冲突")}</div></div>
+          </div>
+          <div class="param-row">
+            <div class="param-label">${_t("NCCL 端口")}<div class="param-key">--nccl-port</div></div>
+            <div class="param-input"><input type="number" id="multi_nccl_port" value="0" min="0" max="65535" style="max-width:160px;"><div class="param-desc">${_t("0 = 随机端口；固定端口便于防火墙放行")}</div></div>
+          </div>
+          <div class="param-row">
+            <div class="param-label">${_t("互连网卡")}<div class="param-key">NCCL_SOCKET_IFNAME</div></div>
+            <div class="param-input">
+              <input type="text" id="multi_iface" list="mn-iface-list" placeholder="${_t("自动（不指定）")}" style="max-width:260px;">
+              <datalist id="mn-iface-list"></datalist>
+              <div class="param-desc">${_t("下拉为本机网卡 + 探活到的远端网卡（自动合并）。留空 = NCCL 自动发现（推荐）；直连或异常时指定互连网卡（如管理口 enP7s7 或 CX-7 口 enp1s0f0np0）。注意各节点需为同名网卡")}</div>
+            </div>
+          </div>
+          <div class="param-row">
+            <div class="param-label">${_t("RoCE 加速")}<div class="param-key">/dev/infiniband</div></div>
+            <div class="param-input">
+              <div class="checkbox-wrap"><input type="checkbox" id="multi_roce" style="width:16px;height:16px;cursor:pointer;accent-color:var(--c-accent);"></div>
+              <div class="param-desc">${_t("启用 ConnectX-7 RoCE RDMA（挂载 /dev/infiniband、放宽内存锁限制）；QSFP 直连建议开启，连接异常时可关闭回退 TCP")}</div>
+            </div>
+          </div>
+          <div class="param-row">
+            <div class="param-label">${_t("SSH 私钥")}<div class="param-key">ssh_key_path</div></div>
+            <div class="param-input"><input type="text" id="multi_ssh_key" placeholder="~/.ssh/id_ed25519" style="max-width:380px;"><div class="param-desc">${_t("留空 = 使用 ssh-agent / 默认 key；私钥公钥需已加入各远端节点 authorized_keys")}</div></div>
+          </div>
+        </div>
+      </div>
+
       <div id="panel-appearance" class="panel">
         <div class="panel-title">${_t("外观主题")}</div>
         <div class="param-group">
@@ -590,6 +677,250 @@ function showToast(message, isError) {
   setTimeout(() => toast.remove(), 3000);
 }
 
+// ===== 多机互联（DGX Spark 集群）=====
+// 节点清单内存态：mnNodes（每项 { ip, sshUser, sshPort, isSelf, modelDir }）；
+// 输入 change 时写回并触发 autoSave，探活结果存 mnProbeState（rank -> { probing | ok, detail }）。
+let mnNodes = [];
+let mnProbeState = {};
+
+function defaultMnNode(isSelf) {
+  return { ip: "", sshUser: isSelf ? "" : "user", sshPort: 22, isSelf: !!isSelf, modelDir: "" };
+}
+
+function renderMultiNodeTable() {
+  const tbody = document.getElementById("mn-tbody");
+  if (!tbody) return;
+  tbody.innerHTML = mnNodes.map(function (n, i) {
+    const p = mnProbeState[i];
+    let statusHtml;
+    if (!p) {
+      statusHtml = '<span style="color:var(--c-text-4);">' + _t("未测试") + '</span>';
+    } else if (p.probing) {
+      statusHtml = '<span style="color:var(--c-text-3);">' + _t("测试中...") + '</span>';
+    } else if (p.ok) {
+      statusHtml = '<span style="color:#4caf50;">' + _t("正常") + '</span><div style="font-size:11px;color:var(--c-text-3);max-width:200px;">' + escHtml(p.detail) + '</div>';
+    } else {
+      statusHtml = '<span style="color:#f44336;">' + _t("失败") + '</span><div style="font-size:11px;color:#f44336;max-width:200px;">' + escHtml(p.detail) + '</div>';
+    }
+    const userDisabled = i === 0 ? ' disabled' : "";
+    const portDisabled = i === 0 ? ' disabled' : "";
+    return "<tr>" +
+      '<td style="text-align:center;font-size:12px;color:var(--c-text-2);">' + i + '</td>' +
+      '<td><input class="mn-cell" data-field="ip" data-rank="' + i + '" value="' + escHtml(n.ip) + '" placeholder="192.168.100.1（光口 IP）"></td>' +
+      '<td><input class="mn-cell" data-field="sshUser" data-rank="' + i + '" value="' + escHtml(n.sshUser) + '" placeholder="user"' + userDisabled + '></td>' +
+      '<td><input class="mn-cell" data-field="sshPort" data-rank="' + i + '" type="number" min="1" max="65535" value="' + (n.sshPort || 22) + '" style="width:70px;"' + portDisabled + '></td>' +
+      '<td><input class="mn-cell" data-field="modelDir" data-rank="' + i + '" value="' + escHtml(n.modelDir) + '" placeholder="' + (i === 0 ? "/data/models（自动）" : "/home/user/models/模型ID（留空自动）") + '" style="min-width:170px;"></td>' +
+      '<td style="min-width:110px;">' + statusHtml + '</td>' +
+      '<td style="white-space:nowrap;vertical-align:middle;">' +
+        (i > 0
+          ? '<button class="btn-reset mn-probe-btn" data-rank="' + i + '" style="font-size:12px;padding:0 10px;height:24px;line-height:22px;margin-top:2px;box-sizing:border-box;vertical-align:middle;display:inline-block;">' + _t("测试连通") + '</button>'
+          : '<span style="color:var(--c-text-4);font-size:12px;line-height:28px;vertical-align:middle;display:inline-block;">' + _t("本机") + '</span>') +
+      '</td>' +
+    "</tr>";
+  }).join("");
+}
+
+async function probeNode(rank) {
+  const n = mnNodes[rank];
+  if (!n || rank === 0) return;
+  if (!n.modelDir.trim()) {
+    mnProbeState[rank] = { ok: false, detail: _t("模型目录未填写，将自动使用 /home/<SSH用户>/models/<模型ID>（可先同步模型）") };
+    renderMultiNodeTable();
+    return;
+  }
+  mnProbeState[rank] = { probing: true };
+  renderMultiNodeTable();
+  const keyEl = document.getElementById("multi_ssh_key");
+  try {
+    const res = await invoke()("multi_node_probe", {
+      ip: n.ip,
+      user: n.sshUser,
+      port: n.sshPort || 22,
+      key: keyEl && keyEl.value.trim() ? keyEl.value.trim() : null,
+      modelDir: n.modelDir,
+    });
+    if (res.ok) {
+      const detail = "GPU:" + (res.gpu || "?") + " Docker:" + (res.docker || "?") + (res.imageOk ? "" : " · " + _t("镜像缺失")) + (res.modelExists ? "" : " · " + _t("模型目录不存在"));
+      mnProbeState[rank] = { ok: true, detail: detail };
+    } else {
+      const modelWarn = !res.modelExists ? " · " + _t("模型目录不存在") : "";
+      mnProbeState[rank] = { ok: false, detail: res.error + modelWarn };
+    }
+  } catch (e) {
+    mnProbeState[rank] = { ok: false, detail: String(e) };
+  }
+  renderMultiNodeTable();
+}
+
+// 往「互连网卡」datalist 追加选项（去重）
+function addIfaceOptions(names) {
+  const dl = document.getElementById("mn-iface-list");
+  if (!dl || !names || names.length === 0) return;
+  const existing = Array.prototype.map.call(dl.options || [], function (o) { return o.value; });
+  const added = [];
+  names.forEach(function (name) {
+    if (name && existing.indexOf(name) === -1) {
+      const opt = document.createElement("option");
+      opt.value = name;
+      dl.appendChild(opt);
+      existing.push(name);
+      added.push(name);
+    }
+  });
+  // 当前输入为空时自动带入首个探活到的网卡（减少手输）
+  const input = document.getElementById("multi_iface");
+  if (input && !input.value.trim() && added.length > 0) {
+    input.value = added[0];
+  }
+}
+
+async function probeAllNodes() {
+  const ranks = [];
+  for (let i = 1; i < mnNodes.length; i++) ranks.push(i);
+  if (ranks.length === 0) {
+    showToast(_t("请先配置远端节点"), true);
+    return;
+  }
+  await Promise.all(ranks.map(function (r) { return probeNode(r); }));
+}
+
+function getMultiNodeArgsFromForm() {
+  const b = function (id) { const el = document.getElementById(id); return el ? el.checked : false; };
+  const s = function (id) { const el = document.getElementById(id); return el ? el.value.trim() : ""; };
+  const n = function (id, def) { const el = document.getElementById(id); const v = parseInt(el ? el.value : ""); return v > 0 ? v : def; };
+  return {
+    enabled: b("multi_enabled"),
+    // 双机直连 v1：只保留本机 + 1 台直连节点
+    nodes: mnNodes.slice(0, 2).map(function (x) {
+      return { ip: x.ip.trim(), ssh_user: x.sshUser.trim(), ssh_port: x.sshPort || 22, is_self: !!x.isSelf, model_dir: x.modelDir.trim() };
+    }),
+    dist_init_port: n("multi_dist_port", 20000),
+    nccl_port: n("multi_nccl_port", 0),
+    iface: s("multi_iface"),
+    use_roce: b("multi_roce"),
+    ssh_key_path: s("multi_ssh_key"),
+  };
+}
+
+// 流式同步本机镜像到直连节点（docker save | gzip | ssh | docker load，不落盘）
+async function pushImageToRemote() {
+  const btn = document.getElementById("mn-push-img-btn");
+  const statusEl = document.getElementById("mn-push-img-status");
+  const n = mnNodes[1];
+  if (!n) return;
+  const imageEl = document.getElementById("sglang_image");
+  const image = imageEl ? imageEl.value.trim() : "";
+  if (!image) {
+    showToast(_t("请先在模型启动参数中选择镜像"), true);
+    return;
+  }
+  if (btn) btn.disabled = true;
+  if (statusEl) statusEl.textContent = _t("导出中...");
+  const keyEl = document.getElementById("multi_ssh_key");
+  try {
+    const res = await invoke()("push_image_to_remote", {
+      ip: n.ip,
+      user: n.sshUser,
+      port: n.sshPort || 22,
+      key: keyEl && keyEl.value.trim() ? keyEl.value.trim() : null,
+      image: image,
+    });
+    if (statusEl) statusEl.textContent = String(res);
+    showToast(String(res));
+    probeNode(1);
+  } catch (e) {
+    if (statusEl) statusEl.textContent = "";
+    showToast(_t("同步失败: ") + e, true);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// 同步本机模型到直连节点：先监测远端是否已同步，未同步则全量同步（模型目录留空自动 ~/models/<模型ID>）
+async function syncModelToRemote() {
+  const btn = document.getElementById("mn-sync-model-btn");
+  const statusEl = document.getElementById("mn-sync-model-status");
+  const n = mnNodes[1];
+  if (!n) return;
+  if (btn) btn.disabled = true;
+  if (statusEl) statusEl.textContent = _t("检测中...");
+  const keyEl = document.getElementById("multi_ssh_key");
+  try {
+    const res = await invoke()("sync_model_to_remote", {
+      ip: n.ip,
+      user: n.sshUser,
+      port: n.sshPort || 22,
+      key: keyEl && keyEl.value.trim() ? keyEl.value.trim() : null,
+      remoteModelDir: n.modelDir.trim(),
+    });
+    if (statusEl) statusEl.textContent = String(res);
+    showToast(String(res));
+    probeNode(1);
+  } catch (e) {
+    if (statusEl) statusEl.textContent = "";
+    showToast(_t("同步失败: ") + e, true);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// 同步进度事件（index.html 全局监听转发）→ 更新对应状态文本
+const MN_SYNC_PHASE_TEXT = {
+  save: null, // 阶段文案由事件 detail 决定
+};
+function syncPhaseText(phase) {
+  const map = {
+    save: _t("导出中..."),
+    transfer: _t("传输中..."),
+    load: _t("导入中..."),
+    done: _t("完成"),
+  };
+  return map[phase] || _t("同步中...");
+}
+
+function handleTauriEvent(type, payload) {
+  if ((type !== "image-push-progress" && type !== "model-sync-progress") || !payload || payload.ip === undefined) return;
+  const statusEl = type === "image-push-progress"
+    ? document.getElementById("mn-push-img-status")
+    : document.getElementById("mn-sync-model-status");
+  if (!statusEl) return;
+  const txt = syncPhaseText(payload.phase) + (payload.detail ? " · " + payload.detail : "");
+  statusEl.textContent = payload.percent != null && payload.percent > 0 && payload.percent < 100
+    ? txt + " " + payload.percent + "%"
+    : txt;
+}
+
+async function fillMultiNodeArgsForm(m) {
+  const v = m || {};
+  // 双机直连 v1：固定 2 个节点（rank0 本机 + rank1 远端）
+  mnNodes = (v.nodes || []).slice(0, 2).map(function (x) {
+    return { ip: x.ip || "", sshUser: x.ssh_user || "", sshPort: x.ssh_port || 22, isSelf: !!x.is_self, modelDir: x.model_dir || "" };
+  });
+  if (mnNodes.length < 2) {
+    mnNodes.push(defaultMnNode(false));
+  }
+  // 首行必须是本机
+  mnNodes[0].isSelf = true;
+  mnNodes[1].isSelf = false;
+  // 本机模型目录：留空自动填软件数据目录（config.json / models 所在位置）
+  if (!mnNodes[0].modelDir.trim()) {
+    try {
+      const dataDir = await invoke()("get_app_data_dir");
+      mnNodes[0].modelDir = String(dataDir) + "/models";
+    } catch (_) {}
+  }
+  mnProbeState = {};
+  const set = function (id, val) { const el = document.getElementById(id); if (el) el.value = val; };
+  const setB = function (id, val) { const el = document.getElementById(id); if (el) el.checked = !!val; };
+  setB("multi_enabled", v.enabled);
+  set("multi_dist_port", v.dist_init_port || 20000);
+  set("multi_nccl_port", v.nccl_port || 0);
+  set("multi_iface", v.iface || "");
+  setB("multi_roce", v.use_roce);
+  set("multi_ssh_key", v.ssh_key_path || "");
+  renderMultiNodeTable();
+}
+
 function getSglangArgsFromForm() {
   const num = function (id) { return parseInt(document.getElementById(id).value) || 0; };
   const str = function (id) { const el = document.getElementById(id); return el ? el.value.trim() : ""; };
@@ -663,6 +994,7 @@ async function saveParams() {
     let s = await invoke()("load_settings");
     s.launch_params = params;
     s.sglang_args = getSglangArgsFromForm();
+    s.multi_node_args = getMultiNodeArgsFromForm();
     await invoke()("save_settings", { settings: s });
     console.log("[settings] 保存成功");
     showToast(_t("设置已保存，重启模型后生效"));
@@ -681,7 +1013,8 @@ function resetParams() {
 function autoSave() { saveParams(); }
 
 function setupAutoSave() {
-  ["ctx_size", "port", "host", "sglang_image", "sglang_shm", "sg_tp", "sg_mem_frac", "sg_dtype", "sg_quant", "sg_kv_dtype", "sg_sched", "sg_max_run", "sg_max_queue", "sg_chunk", "sg_log_level", "sg_reasoning", "sg_tool", "sg_log_requests", "sg_metrics"].forEach(function (id) {
+  ["ctx_size", "port", "host", "sglang_image", "sglang_shm", "sg_tp", "sg_mem_frac", "sg_dtype", "sg_quant", "sg_kv_dtype", "sg_sched", "sg_max_run", "sg_max_queue", "sg_chunk", "sg_log_level", "sg_reasoning", "sg_tool", "sg_log_requests", "sg_metrics",
+   "multi_enabled", "multi_dist_port", "multi_nccl_port", "multi_iface", "multi_roce", "multi_ssh_key"].forEach(function (id) {
     var el = document.getElementById(id);
     if (el) el.addEventListener("change", autoSave);
   });
@@ -1061,6 +1394,55 @@ export default {
     renderThemeGrid();
     loadEngineImages();
 
+    // ===== 多机互联：节点表交互（tbody 事件委托，change 写回并自动保存）=====
+    var mnTbody = document.getElementById("mn-tbody");
+    if (mnTbody) {
+      mnTbody.addEventListener("change", function (e) {
+        var el = e.target;
+        if (!el.dataset || el.dataset.rank === undefined || !el.dataset.field) return;
+        var i = parseInt(el.dataset.rank);
+        if (!mnNodes[i]) return;
+        var field = el.dataset.field;
+        if (field === "sshPort") {
+          mnNodes[i].sshPort = parseInt(el.value) || 22;
+        } else {
+          mnNodes[i][field] = el.value;
+        }
+        autoSave();
+      });
+      mnTbody.addEventListener("click", function (e) {
+        var btn = e.target.closest ? e.target.closest("button") : null;
+        if (!btn || !btn.dataset || btn.dataset.rank === undefined) return;
+        var i = parseInt(btn.dataset.rank);
+        if (btn.classList.contains("mn-probe-btn")) {
+          probeNode(i);
+        }
+      });
+    }
+    var mnAddBtn = null;
+    var mnProbeAllBtn = document.getElementById("mn-probe-all-btn");
+    if (mnProbeAllBtn) {
+      mnProbeAllBtn.addEventListener("click", probeAllNodes);
+    }
+    // 「互连网卡」下拉候选：本机物理网卡（进入设置页时加载）
+    (async function () {
+      try {
+        const ifaces = await invoke()("list_network_interfaces");
+        addIfaceOptions(ifaces || []);
+      } catch (e) {
+        console.error("[settings] 枚举本机网卡失败:", e);
+      }
+    })();
+    // 同步入口：镜像（整体按钮）+ 模型（下拉选择本地模型）
+    var mnPushImgBtn = document.getElementById("mn-push-img-btn");
+    if (mnPushImgBtn) {
+      mnPushImgBtn.addEventListener("click", pushImageToRemote);
+    }
+    var mnSyncModelBtn = document.getElementById("mn-sync-model-btn");
+    if (mnSyncModelBtn) {
+      mnSyncModelBtn.addEventListener("click", syncModelToRemote);
+    }
+
     var engineRefresh = document.getElementById("engine-refresh-btn");
     if (engineRefresh) engineRefresh.addEventListener("click", loadEngineImages);
     // 下拉切换镜像：setupAutoSave 已负责保存，这里仅联动刷新列表标注
@@ -1075,6 +1457,8 @@ export default {
         if (settings && params) fillFormFromParams(params);
         // SGLang 详细参数回填
         if (settings && settings.sglang_args) fillSglangArgsForm(settings.sglang_args);
+        // 多机互联配置回填
+        if (settings) await fillMultiNodeArgsForm(settings.multi_node_args);
         // 参数回填后再刷一次镜像列表，保证"当前配置镜像/已配置"标记准确
         loadEngineImages();
       } catch (e) {
@@ -1086,5 +1470,6 @@ export default {
   unmount() {
     console.log("[settings] unmount()");
     stopLogPolling();
-  }
+  },
+  handleTauriEvent
 };

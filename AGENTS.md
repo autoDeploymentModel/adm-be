@@ -61,10 +61,11 @@
 - 图标：`python scripts/generate-icons.py` 从 `src-tauri/icons/source.png` 生成。
 
 ## 注意事项
-- SGLang 部署流程完整文档：`doc/sglang-deployment.md`（架构 / 前置条件 / 镜像策略 / 模型清单格式 / 下载 / 启动命令 / 参数表 / 排查）。
+- SGLang 部署流程完整文档：`doc/sglang-deployment.md`（架构 / 前置条件 / 镜像策略 / 模型清单格式 / 下载 / 启动命令 / 参数表 / 排查）。当新的功能发生变化时候即时更新文档
+- 多机互联（2+ 台 DGX Spark 集群）：v1 已实现（设置页「多机互联」Tab）。关键注意：总开关 + 节点清单（首条必须本机）；多机容器必须 `--network host`（无 `-p`）；容器名 `adm-sglang-<model>-rank-<R>`（据此识别多机停止）；远端经 SSH `nohup docker run` 启动、日志落盘 `/tmp/adm_sglang_<model>_rank_<R>.log`；多机参数（--tp/--nnodes/--node-rank/--dist-init-addr）放命令最后。细节见 `doc/sglang-deployment.md` §10 与 `doc/dgx-spark-multinode-plan.md`
 - 模型列表远端配置 `https://adm.tuduoduo.top/b/model.json`（本地示例 `doc/model_list.json`）：新格式 `model_download_files` + `model_support_devices`。
 - **已移除功能**：llama.cpp 方案（llamacpp 下载/版本/删除命令、llama-server 启动分支、VC++ 运行库与 LLamaCPP 更新弹窗）、Agent 聊天页（含 admAgent server 集成、多 workspace、微信 Bot/iLink、技能管理）。相关代码均已删除，不要再按旧文档引用。
 - **项目结构**：
   - `src/` + `src-tauri/` — Tauri 桌面端（vanilla JS 前端 + Rust 后端）
   - `website/` — 营销网站
-  - `scripts/` — 工具脚本（图标生成 / 签名）
+  - `scripts/` — 工具脚本（图标生成 / 签名 / 旧版数据迁移 migrate-data.sh（仅 Ubuntu/Linux：~/.local/share/com.adm.admapp -> com.adm.be））

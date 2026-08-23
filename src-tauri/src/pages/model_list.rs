@@ -827,6 +827,730 @@ fn parse_pull_percent(raw: &str) -> Option<u8> {
     Some(pct.min(99))
 }
 
+// ===== 多机互联（2+ 台 DGX Spark 集群）=====
+// 设计文档：doc/dgx-spark-multinode-plan.md。
+// 原则：单机路径（start_sglang_docker）零改动；仅当设置页 multi_node_args.enabled 且节点数 >= 2 时走本分支。
+
+/// 前台运行 docker run（多机 rank 0 用）：Windows 直接 spawn，Unix 新建进程组便于整树清理
+#[cfg(target_os = "windows")]
+fn spawn_docker_run(args: &[String]) -> std::io::Result<std::process::Child> {
+    crate::common::utils::platform::docker_cmd()
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn spawn_docker_run(args: &[String]) -> std::io::Result<std::process::Child> {
+    crate::common::utils::platform::spawn_detached(
+        crate::common::utils::platform::docker_cmd()
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+    )
+}
+
+/// 从 config.json 读取多机配置（不存在/解析失败回默认值）
+fn load_multi_node_config(app: &tauri::AppHandle) -> (MultiNodeArgs, SglangArgs) {
+    let mut mn = MultiNodeArgs::default();
+    let mut sa = SglangArgs::default();
+    if let Ok(settings_path) = config::get_data_dir(Some(app)).map(|d| d.join("config.json")) {
+        if let Ok(json) = std::fs::read_to_string(settings_path) {
+            if let Ok(parsed) = serde_json::from_str::<Settings>(&json) {
+                mn = parsed.multi_node_args;
+                sa = parsed.sglang_args;
+            }
+        }
+    }
+    (mn, sa)
+}
+
+/// 多机配置校验（启动前，失败列出具体原因）
+fn validate_multi_node(mn: &MultiNodeArgs, port: u16) -> Result<(), AppError> {
+    // DGX 直连 v1：固定本机 + 1 台直连节点
+    if mn.nodes.len() != 2 {
+        bail!("DGX 直连模式固定 2 台机器（本机 + 1 台直连节点），当前配置 {} 台，请在设置页「DGX直连配置」修正", mn.nodes.len());
+    }
+    if !mn.nodes[0].is_self {
+        bail!("节点清单第 1 条（rank 0）必须勾选「本机」");
+    }
+    if mn.nodes[0].ip.trim().is_empty() {
+        bail!("本机（rank 0）IP 不能为空（其他节点需通过该地址互联）");
+    }
+    if mn.dist_init_port == 0 {
+        bail!("引导端口（--dist-init-addr 端口）不能为 0");
+    }
+    if mn.dist_init_port == port {
+        bail!("引导端口 {} 与模型服务端口冲突，请在设置页修改引导端口", port);
+    }
+    for (i, n) in mn.nodes.iter().enumerate() {
+        if n.ip.trim().is_empty() {
+            bail!("节点 {}（rank {}）IP 为空", i + 1, i);
+        }
+        if !n.is_self && n.ssh_user.trim().is_empty() {
+            bail!("节点 {}（rank {}）SSH 用户为空", i + 1, i);
+        }
+        // 模型目录允许留空：远端自动使用 ~/models/<model_id>
+    }
+    Ok(())
+}
+
+/// 远端模型目录：留空时自动默认 /home/<ssh_user>/models/<model_id>（绝对路径，无波浪号转义问题；
+/// SSH 用户为空时回退 ~/models/<model_id>，远端 shell 可展开 ~）
+fn effective_remote_model_dir(model_dir: &str, user: &str, model_id: &str) -> String {
+    let t = model_dir.trim();
+    if t.is_empty() {
+        let u = user.trim();
+        if u.is_empty() {
+            format!("~/models/{}", model_id)
+        } else {
+            format!("/home/{}/models/{}", u, model_id)
+        }
+    } else {
+        t.to_string()
+    }
+}
+
+/// 模型目录是否含 MTP 权重（文件名含 mtp 且 .safetensors / .bin）
+fn has_mtp_weight(model_dir: &std::path::Path) -> bool {
+    if let Ok(entries) = std::fs::read_dir(model_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if name.contains("mtp") && (name.ends_with(".safetensors") || name.ends_with(".bin")) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 用户（设置页 extra_args 或模型清单 sglang_flags）是否已自定义 speculative-algorithm
+fn spec_user_defined(sglang_args: &SglangArgs, sglang_flags: &[String]) -> bool {
+    sglang_args.extra_args.lines().any(|l| {
+        let t = l.trim();
+        t.starts_with("--speculative-algorithm") || t.starts_with("speculative-algorithm")
+    }) || sglang_flags.iter().any(|f| f.contains("speculative-algorithm"))
+}
+
+/// 构建某 rank 的完整 docker run 参数（多机模式）。
+///
+/// 与单机的差异：`--network host`（替代 -p 端口映射，NCCL 跨机必需）；
+/// 多机参数（--tp N --nnodes N --node-rank R --dist-init-addr）置于命令**最后**，
+/// 保证跨节点 TP 拓扑不被设置页/模型清单的同名参数覆盖。
+/// 设置页 sglang_args / MTP 自动启用 / 模型清单 sglang_flags 拼接规则与单机一致。
+fn build_multi_node_args(
+    model_id: &str,
+    model_dir: &std::path::Path,
+    image: &str,
+    shm_size: &str,
+    port: u16,
+    sglang_args: &SglangArgs,
+    sglang_flags: &Option<Vec<String>>,
+    mn: &MultiNodeArgs,
+    rank: usize,
+    node0_ip: &str,
+) -> Vec<String> {
+    let container_name = format!("adm-sglang-{}-rank-{}", model_id, rank);
+    let mount_dst = format!("/models/{}", model_id);
+    let mut args: Vec<String> = vec![
+        "run".to_string(),
+        "-e".to_string(),
+        "PYTHONWARNINGS=ignore::FutureWarning".to_string(),
+        "--name".to_string(),
+        container_name,
+        "--gpus".to_string(),
+        "all".to_string(),
+        "--shm-size".to_string(),
+        shm_size.to_string(),
+        "--cap-add".to_string(),
+        "SYS_NICE".to_string(),
+        "--ipc".to_string(),
+        "host".to_string(),
+        "--network".to_string(),
+        "host".to_string(),
+    ];
+    if mn.use_roce {
+        args.extend([
+            "--device".to_string(),
+            "/dev/infiniband".to_string(),
+            "--ulimit".to_string(),
+            "memlock=-1:-1".to_string(),
+            "--cap-add".to_string(),
+            "IPC_LOCK".to_string(),
+        ]);
+    }
+    if !mn.iface.trim().is_empty() {
+        args.extend([
+            "-e".to_string(),
+            format!("NCCL_SOCKET_IFNAME={}", mn.iface.trim()),
+            "-e".to_string(),
+            format!("GLOO_SOCKET_IFNAME={}", mn.iface.trim()),
+        ]);
+    }
+    args.push("-v".to_string());
+    args.push(format!(
+        "{}:{}{}",
+        model_dir.to_string_lossy(),
+        mount_dst,
+        ":ro"
+    ));
+    args.push(image.to_string());
+    args.push("python3".to_string());
+    args.push("-m".to_string());
+    args.push("sglang.launch_server".to_string());
+    args.push("--model-path".to_string());
+    args.push(mount_dst);
+    args.push("--host".to_string());
+    args.push("0.0.0.0".to_string());
+    args.push("--port".to_string());
+    args.push(port.to_string());
+
+    // ===== 设置页 SGLang 详细参数（仅非空/非默认值，规则同单机）=====
+    if sglang_args.context_length > 0 {
+        args.extend(["--context-length".to_string(), sglang_args.context_length.to_string()]);
+    }
+    if sglang_args.mem_fraction_static > 0.0 {
+        args.extend(["--mem-fraction-static".to_string(), format!("{}", sglang_args.mem_fraction_static)]);
+    }
+    if !sglang_args.dtype.is_empty() {
+        args.extend(["--dtype".to_string(), sglang_args.dtype.clone()]);
+    }
+    if !sglang_args.quantization.is_empty() {
+        args.extend(["--quantization".to_string(), sglang_args.quantization.clone()]);
+    }
+    if !sglang_args.kv_cache_dtype.is_empty() {
+        args.extend(["--kv-cache-dtype".to_string(), sglang_args.kv_cache_dtype.clone()]);
+    }
+    if !sglang_args.schedule_policy.is_empty() {
+        args.extend(["--schedule-policy".to_string(), sglang_args.schedule_policy.clone()]);
+    }
+    if sglang_args.max_running_requests > 0 {
+        args.extend(["--max-running-requests".to_string(), sglang_args.max_running_requests.to_string()]);
+    }
+    if sglang_args.max_queued_requests > 0 {
+        args.extend(["--max-queued-requests".to_string(), sglang_args.max_queued_requests.to_string()]);
+    }
+    if sglang_args.chunked_prefill_size != 0 {
+        args.extend(["--chunked-prefill-size".to_string(), sglang_args.chunked_prefill_size.to_string()]);
+    }
+    if !sglang_args.log_level.is_empty() && sglang_args.log_level != "info" {
+        args.extend(["--log-level".to_string(), sglang_args.log_level.clone()]);
+    }
+    if sglang_args.log_requests {
+        args.push("--log-requests".to_string());
+    }
+    if sglang_args.enable_metrics {
+        args.push("--enable-metrics".to_string());
+    }
+    if !sglang_args.reasoning_parser.is_empty() {
+        args.extend(["--reasoning-parser".to_string(), sglang_args.reasoning_parser.clone()]);
+    }
+    if !sglang_args.tool_call_parser.is_empty() {
+        args.extend(["--tool-call-parser".to_string(), sglang_args.tool_call_parser.clone()]);
+    }
+    for line in sglang_args.extra_args.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            let k = k.trim().trim_start_matches("--");
+            let v = v.trim();
+            if !k.is_empty() && !v.is_empty() {
+                args.push(format!("--{}", k));
+                args.push(v.to_string());
+            }
+        }
+    }
+
+    // ===== MTP 自动启用（规则同单机）=====
+    let flags = sglang_flags.as_deref().unwrap_or(&[]);
+    if has_mtp_weight(model_dir) && !spec_user_defined(sglang_args, flags) {
+        args.extend([
+            "--speculative-algorithm".to_string(),
+            "EAGLE".to_string(),
+            "--speculative-num-steps".to_string(),
+            "3".to_string(),
+            "--speculative-eagle-topk".to_string(),
+            "1".to_string(),
+            "--speculative-num-draft-tokens".to_string(),
+            "4".to_string(),
+        ]);
+    }
+
+    // ===== 模型清单 sglang_flags（规则同单机，追加即生效）=====
+    if !flags.is_empty() {
+        for raw in flags {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                continue;
+            }
+            let (k, v) = match raw.split_once(char::is_whitespace) {
+                Some((k, v)) => (k, v.trim()),
+                None => (raw, ""),
+            };
+            let k = k.trim_start_matches("--");
+            if k.is_empty() {
+                continue;
+            }
+            args.push(format!("--{}", k));
+            if !v.is_empty() {
+                args.push(v.to_string());
+            }
+        }
+    }
+
+    // ===== 多机参数（最后追加，跨节点 TP 拓扑不可被覆盖）=====
+    let n_nodes = mn.nodes.len();
+    args.extend([
+        "--tensor-parallel-size".to_string(),
+        n_nodes.to_string(),
+        "--nnodes".to_string(),
+        n_nodes.to_string(),
+        "--node-rank".to_string(),
+        rank.to_string(),
+        "--dist-init-addr".to_string(),
+        format!("{}:{}", node0_ip, mn.dist_init_port),
+    ]);
+    if mn.nccl_port > 0 {
+        args.extend(["--nccl-port".to_string(), mn.nccl_port.to_string()]);
+    }
+    args
+}
+
+/// 本机（rank 0）docker run 容器名（多机停止时据此识别多机模式）
+fn multi_container_name(model_id: &str, rank: usize) -> String {
+    format!("adm-sglang-{}-rank-{}", model_id, rank)
+}
+
+/// 停止已启动的远端节点容器（启动失败回滚 / 停止模型共用）
+async fn stop_remote_containers(
+    app: &tauri::AppHandle,
+    mn: &MultiNodeArgs,
+    key: Option<&str>,
+    model_id: &str,
+    ranks_start: usize,
+) {
+    for (i, node) in mn.nodes.iter().enumerate().skip(ranks_start) {
+        if node.is_self {
+            continue;
+        }
+        let container = multi_container_name(model_id, i);
+        let script = crate::common::ssh::stop_container_script(&container);
+        match crate::common::ssh::ssh_run(
+            &node.ip,
+            &node.ssh_user,
+            node.ssh_port,
+            key,
+            &script,
+            std::time::Duration::from_secs(20),
+        )
+        .await
+        {
+            Ok(_) => {
+                crate::common::utils::logger::write_log("INFO", "MODEL", &format!("[{}] 已停止远端节点 {} 容器 {}", model_id, node.ip, container));
+            }
+            Err(e) => {
+                crate::common::utils::logger::write_log("WARN", "MODEL", &format!("[{}] 停止远端节点 {} 失败: {}（可手动执行 docker rm -f {}）", model_id, node.ip, e, container));
+                let _ = app.emit("model-log", serde_json::json!({
+                    "model_id": model_id,
+                    "line": format!("[WARN] 停止远端 {} 失败: {}；可手动执行 docker rm -f {}", node.ip, e, container),
+                    "source": "stderr",
+                }));
+            }
+        }
+    }
+}
+
+/// 多机启动：节点 0（本机）docker run + 远端 SSH nohup docker run，
+/// 全部就绪（本机 Uvicorn running on / 远端容器 Up）前任一失败即回滚。
+async fn start_multi_node(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, AppState>,
+    model_id: &str,
+    model_dir: &std::path::Path,
+    params: LaunchParams,
+    sglang_version: Option<String>,
+    sglang_flags: Option<Vec<String>>,
+) -> Result<(), AppError> {
+    let (mn, sglang_args) = load_multi_node_config(app);
+    let port: u16 = params.port.unwrap_or(5678);
+    validate_multi_node(&mn, port)?;
+    let n_nodes = mn.nodes.len();
+    let key: Option<String> = if mn.ssh_key_path.trim().is_empty() {
+        None
+    } else {
+        Some(mn.ssh_key_path.trim().to_string())
+    };
+    let key_ref = key.as_deref();
+
+    // 镜像 / 共享内存：设置页优先，缺省用机型默认（规则同单机）
+    let default_image = "lmsysorg/sglang:v0.5.17";
+    let default_shm = "64g";
+    let mut image = if sglang_args.image.is_empty() { default_image.to_string() } else { sglang_args.image.clone() };
+    if let Some(ver) = sglang_version.as_deref().map(str::trim) {
+        if !ver.is_empty() {
+            image = if ver.contains('/') || ver.starts_with("lmsysorg/") {
+                ver.to_string()
+            } else {
+                format!("lmsysorg/sglang:{}", ver)
+            };
+        }
+    }
+    let shm_size = if sglang_args.shm_size.is_empty() { default_shm.to_string() } else { sglang_args.shm_size.clone() };
+
+    // 本机 Docker 预检（CLI / daemon / GPU runtime / 镜像，含自动 pull）
+    let image = check_docker_env(app, model_id, &image).await?;
+    // 本机端口占用检查（--network host 下端口直接 bind 宿主机）
+    {
+        let probe = std::net::TcpListener::bind(("0.0.0.0", port));
+        if probe.is_err() {
+            bail!("端口 {} 已被占用，请先关闭占用该端口的进程，或在设置页更换监听端口", port);
+        }
+    }
+    // 引导端口占用检查
+    {
+        let probe = std::net::TcpListener::bind(("0.0.0.0", mn.dist_init_port));
+        if probe.is_err() {
+            bail!("引导端口 {} 已被占用，请在设置页更换引导端口", mn.dist_init_port);
+        }
+    }
+
+    crate::common::utils::logger::write_log(
+        "INFO",
+        "MODEL",
+        &format!("[{}] 多机模式启动：{} 个节点（TP={}），镜像 {}，节点0={}", model_id, n_nodes, n_nodes, image, mn.nodes[0].ip),
+    );
+    let _ = app.emit("model-log", serde_json::json!({
+        "model_id": model_id,
+        "line": format!("[多机] 启动 {} 节点集群（TP={}，rank0={}），镜像 {}", n_nodes, n_nodes, mn.nodes[0].ip, image),
+        "source": "stdout",
+    }));
+
+    // ===== 远端节点：预检 + 启动 + 快速就绪确认（任一失败回滚）=====
+    let node0_ip = mn.nodes[0].ip.clone();
+    for (i, node) in mn.nodes.iter().enumerate().skip(1) {
+        let node_model_dir = effective_remote_model_dir(&node.model_dir, &node.ssh_user, model_id);
+        // 预检：docker daemon / GPU / 本机所用镜像 / 模型目录（含 .done）
+        let probe = crate::common::ssh::probe_script(&node_model_dir, &image);
+        let (ok, out, err) = crate::common::ssh::ssh_run(
+            &node.ip, &node.ssh_user, node.ssh_port, key_ref, &probe,
+            std::time::Duration::from_secs(20),
+        ).await.map_err(|e| {
+            AppError::msg(format!("远端节点 {}（rank {}）探活失败: {}", node.ip, i, e))
+        })?;
+        let mut docker_ok = false;
+        let mut model_ok = false;
+        let mut image_ok = false;
+        let mut gpu = String::new();
+        for line in out.lines().chain(err.lines()) {
+            if let Some(v) = line.strip_prefix("GPU:") {
+                gpu = v.trim().to_string();
+            } else if let Some(v) = line.strip_prefix("DOCKER:") {
+                docker_ok = v.trim() != "DOCKER_ERR" && !v.trim().is_empty();
+            } else if let Some(v) = line.strip_prefix("IMAGE:") {
+                image_ok = v.trim() == "IMAGE_OK";
+            } else if let Some(v) = line.strip_prefix("MODEL:") {
+                model_ok = v.trim() == "MODEL_OK";
+            }
+        }
+        if !ok {
+            bail!("远端节点 {}（rank {}）SSH 执行失败: {}", node.ip, i, if err.is_empty() { "未知错误" } else { err.as_str() });
+        }
+        if !docker_ok {
+            bail!("远端节点 {}（rank {}）Docker daemon 不可用", node.ip, i);
+        }
+        if !image_ok {
+            bail!("远端节点 {}（rank {}）未下载镜像 {}（请先在远端 docker pull 或配置镜像加速）", node.ip, i, image);
+        }
+        if !model_ok {
+            bail!("远端节点 {}（rank {}）模型目录不存在或未下载完成：{}（可先在设置页「同步模型到直连节点」自动同步）", node.ip, i, node_model_dir);
+        }
+        let _ = app.emit("model-log", serde_json::json!({
+            "model_id": model_id,
+            "line": format!("[多机] 节点 {}（rank {}）环境正常：GPU={} Docker={} 镜像={}", node.ip, i, gpu, "OK", "OK"),
+            "source": "stdout",
+        }));
+
+        // 启动：nohup docker run 后台运行，日志落盘 /tmp/adm_sglang_<model>_rank_<i>.log
+        let args = build_multi_node_args(
+            model_id,
+            &std::path::Path::new(&node_model_dir),
+            &image,
+            &shm_size,
+            port,
+            &sglang_args,
+            &sglang_flags,
+            &mn,
+            i,
+            &node0_ip,
+        );
+        let container = multi_container_name(model_id, i);
+        let log_path = format!("/tmp/adm_sglang_{}_rank_{}.log", model_id, i);
+        let script = crate::common::ssh::start_container_script(&container, &args, &log_path);
+        let (sok, _sout, serr) = crate::common::ssh::ssh_run(
+            &node.ip, &node.ssh_user, node.ssh_port, key_ref, &script,
+            std::time::Duration::from_secs(30),
+        ).await.map_err(|e| {
+            AppError::msg(format!("远端节点 {}（rank {}）启动命令执行失败: {}", node.ip, i, e))
+        })?;
+        if !sok {
+            let _ = stop_remote_containers(app, &mn, key_ref, model_id, 1).await;
+            bail!("远端节点 {}（rank {}）docker run 发起失败: {}", node.ip, i, serr);
+        }
+
+        // 快速就绪确认：30s 内容器进入 Up（多数启动失败（镜像缺失/参数错）会立即 Exited）
+        let mut up = false;
+        let mut tail = String::new();
+        for _ in 0..15 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let chk = format!("docker ps --filter name={} --format '{{{{\"n\": .Names, \"s\": .Status}}}}' 2>/dev/null", crate::common::ssh::sh_quote(&container));
+            if let Ok((_, out2, _)) = crate::common::ssh::ssh_run(
+                &node.ip, &node.ssh_user, node.ssh_port, key_ref, &chk,
+                std::time::Duration::from_secs(10),
+            ).await {
+                if out2.contains(&format!("\"n\":\"{}\"", container)) && out2.contains("\"s\":\"Up") {
+                    up = true;
+                    break;
+                }
+                if out2.contains("Exited") || out2.contains("Dead") {
+                    if let Ok((_, t2, _)) = crate::common::ssh::ssh_run(
+                        &node.ip, &node.ssh_user, node.ssh_port, key_ref,
+                        &format!("tail -n 30 {}", crate::common::ssh::sh_quote(&log_path)),
+                        std::time::Duration::from_secs(10),
+                    ).await {
+                        tail = t2;
+                    }
+                    break;
+                }
+            }
+        }
+        if !up {
+            let _ = stop_remote_containers(app, &mn, key_ref, model_id, 1).await;
+            let detail = if tail.is_empty() { "30s 内未进入运行状态".to_string() } else { tail };
+            crate::common::utils::logger::write_log("ERROR", "MODEL", &format!("[{}] 远端节点 {} 容器启动失败:\n{}", model_id, node.ip, detail));
+            bail!("远端节点 {}（rank {}）容器启动失败，已回滚停止已启动节点：\n{}", node.ip, i, detail);
+        }
+        let _ = app.emit("model-log", serde_json::json!({
+            "model_id": model_id,
+            "line": format!("[多机] 远端节点 {}（rank {}）容器已就绪", node.ip, i),
+            "source": "stdout",
+        }));
+    }
+
+    // ===== 本机（rank 0）=====
+    let container0 = multi_container_name(model_id, 0);
+    // 清理同名残留容器
+    let _ = crate::common::utils::platform::docker_cmd()
+        .args(["rm", "-f", &container0])
+        .output();
+    let args0 = build_multi_node_args(
+        model_id, model_dir, &image, &shm_size, port, &sglang_args, &sglang_flags, &mn, 0, &node0_ip,
+    );
+
+    dbg_log!("[DEBUG] sglang multi-node docker args (rank0): {:?}", args0);
+    let _ = app.emit("model-log", serde_json::json!({
+        "model_id": model_id,
+        "line": format!("[多机] 本机（rank 0）启动容器 {}", container0),
+        "source": "stdout",
+    }));
+
+    let mut child = match spawn_docker_run(&args0) {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("启动推理引擎容器失败: {}", e);
+            let _ = app.emit("model-log", serde_json::json!({
+                "model_id": model_id, "line": format!("[ERROR] {}", msg), "source": "stderr",
+            }));
+            // 任一失败回滚：停止已启动的远端节点容器
+            stop_remote_containers(app, &mn, key_ref, model_id, 1).await;
+            return Err(AppError::msg(msg));
+        }
+    };
+
+    let pid = child.id();
+    {
+        let mut pid_lock = state.running_process.lock().map_err(|e| e.to_string())?;
+        *pid_lock = Some(pid);
+    }
+    {
+        let mut model_lock = state.running_model_id.lock().map_err(|e| e.to_string())?;
+        *model_lock = Some(model_id.to_string());
+    }
+    {
+        let mut port_lock = state.running_port.lock().map_err(|e| e.to_string())?;
+        *port_lock = Some(port);
+    }
+    {
+        let mut container_lock = state.running_container.lock().map_err(|e| e.to_string())?;
+        *container_lock = Some(container0.clone());
+    }
+    state.set_model_running(true);
+    state.bump_model_generation();
+
+    let _ = app.emit("model-started", serde_json::json!({ "model_id": model_id, "port": port }));
+
+    // ===== 本机 stdout/stderr 转发 + 退出监控（规则同单机；退出时尽力停止远端）=====
+    let app_clone = app.clone();
+    let model_id_clone = model_id.to_string();
+    let app_clone2 = app.clone();
+    let model_id_clone2 = model_id.to_string();
+    let container_clone0 = container0.clone();
+    let mn_clone = mn.clone();
+    let key_clone = key.clone();
+
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+
+        let stdout_handle = if let Some(stdout) = child.stdout.take() {
+            let app_c = app_clone.clone();
+            let mid = model_id_clone.clone();
+            Some(std::thread::spawn(move || {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines().map_while(Result::ok) {
+                    crate::common::utils::logger::write_log("INFO", "SGLang", &line);
+                    app_c.emit("model-log", serde_json::json!({
+                        "model_id": &mid, "line": line.clone(), "source": "stdout",
+                    })).ok();
+                    if line.contains("Uvicorn running on")
+                        || line.contains("The server is fired up and ready to rock!")
+                    {
+                        app_c.emit("model-started", serde_json::json!({
+                            "model_id": &mid, "port": port,
+                        })).ok();
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+
+        let stderr_handle = if let Some(stderr) = child.stderr.take() {
+            let app_c = app_clone2.clone();
+            let mid = model_id_clone2.clone();
+            Some(std::thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().map_while(Result::ok) {
+                    crate::common::utils::logger::write_log("WARN", "SGLang", &line);
+                    app_c.emit("model-log", serde_json::json!({
+                        "model_id": &mid, "line": line, "source": "stderr",
+                    })).ok();
+                }
+            }))
+        } else {
+            None
+        };
+
+        if let Some(h) = stdout_handle { let _ = h.join(); }
+        if let Some(h) = stderr_handle { let _ = h.join(); }
+        let _ = child.wait();
+
+        // 容器退出：清理本机容器与状态，并尽力停止远端节点
+        let _ = crate::common::utils::platform::docker_cmd()
+            .args(["rm", "-f", &container_clone0])
+            .output();
+        // 远端停止：同步版 SSH（每台最多 3s，尽力而为，失败仅写日志）
+        let key_ref = key_clone.as_deref();
+        for (i, node) in mn_clone.nodes.iter().enumerate().skip(1) {
+            if node.is_self { continue; }
+            let c = multi_container_name(&model_id_clone2, i);
+            let script = crate::common::ssh::stop_container_script(&c);
+            let _ = crate::common::ssh::ssh_run_blocking(
+                &node.ip, &node.ssh_user, node.ssh_port, key_ref, &script,
+                std::time::Duration::from_secs(3),
+            );
+        }
+        app_clone2.emit("model-log", serde_json::json!({
+            "model_id": &model_id_clone2,
+            "line": "[多机] 节点 0 容器已退出，已尝试停止远端节点容器",
+            "source": "stdout",
+        })).ok();
+
+        {
+            let state = app_clone2.state::<AppState>();
+            *state.running_process.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *state.running_model_id.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *state.running_port.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *state.running_container.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            state.set_model_running(false);
+        }
+        app_clone2.emit("model-stopped", serde_json::json!({ "model_id": &model_id_clone2 })).ok();
+    });
+
+    // ===== 远端运行期监控：容器异常退出时转发日志告警（不自动级联停止）=====
+    {
+        let app_c = app.clone();
+        let mid = model_id.to_string();
+        let mn_c = mn.clone();
+        let key_c = key.clone();
+        let container0_c = container0.clone();
+        std::thread::spawn(move || {
+            let key_ref = key_c.as_deref();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                // 模型已停止（stop_model / 本机容器退出已统一清理远端）→ 静默退出，避免停止过程中的误报
+                let still_running = app_c
+                    .state::<AppState>()
+                    .running_container
+                    .lock()
+                    .ok()
+                    .and_then(|l| l.clone())
+                    .map(|c| c == container0_c)
+                    .unwrap_or(false);
+                if !still_running {
+                    break;
+                }
+                let mut all_down = true;
+                let mut checked = false;
+                for (i, node) in mn_c.nodes.iter().enumerate().skip(1) {
+                    if node.is_self { continue; }
+                    let c = multi_container_name(&mid, i);
+                    let chk = format!("docker ps --filter name={} --format '{{{{\"n\": .Names, \"s\": .Status}}}}' 2>/dev/null", crate::common::ssh::sh_quote(&c));
+                    let status = crate::common::ssh::ssh_run_blocking(
+                        &node.ip, &node.ssh_user, node.ssh_port, key_ref, &chk,
+                        std::time::Duration::from_secs(3),
+                    );
+                    match status {
+                        Ok((_, out, _)) if out.is_empty() => {
+                            // 容器不存在（可能已手动停止）：视为 down
+                            checked = true;
+                        }
+                        Ok((_, out, _)) if out.contains("Exited") || out.contains("Dead") => {
+                            checked = true;
+                            let log_path = format!("/tmp/adm_sglang_{}_rank_{}.log", mid, i);
+                            let tail = crate::common::ssh::ssh_run_blocking(
+                                &node.ip, &node.ssh_user, node.ssh_port, key_ref,
+                                &format!("tail -n 30 {}", crate::common::ssh::sh_quote(&log_path)),
+                                std::time::Duration::from_secs(3),
+                            );
+                            let detail = tail.map(|(_, t, _)| t).unwrap_or_default();
+                            crate::common::utils::logger::write_log("ERROR", "MODEL", &format!("[{}] 远端节点 {}（rank {}）容器异常退出:\n{}", mid, node.ip, i, detail));
+                            app_c.emit("model-log", serde_json::json!({
+                                "model_id": &mid,
+                                "line": format!("[ERROR] 远端节点 {}（rank {}）容器异常退出，请查看模型日志并停止模型：\n{}", node.ip, i, detail),
+                                "source": "stderr",
+                            })).ok();
+                        }
+                        Ok((_, out, _)) if out.contains("\"s\":\"Up") => {
+                            all_down = false;
+                            checked = true;
+                        }
+                        _ => {
+                            // SSH 失败等不确定状态：不判定
+                            all_down = false;
+                        }
+                    }
+                }
+                // 所有远端节点均已确认消失/退出时停止监控（节点 0 退出时另有统一清理）
+                if checked && all_down { break; }
+            }
+        });
+    }
+
+    Ok(())
+}
+
 /// SGLang Docker 启动（Ubuntu / DGX Spark 等机型）。
 /// 模型目录以只读方式挂载进容器，容器前台运行（生命周期 = docker run 进程），
 /// 就绪信号：stdout 出现 "Uvicorn running on"（SGLang 启动完成）。
@@ -1267,6 +1991,11 @@ pub async fn start_model(
     let is_dir_model = model_dir.join(".done").exists()
         || (model_dir.join("config.json").exists() && model_dir.join("model.safetensors").exists());
     if is_dir_model {
+        // 多机互联：设置页启用且节点数 >= 2 时走集群启动（单机路径不变）
+        let (mn, _) = load_multi_node_config(&app);
+        if mn.enabled && mn.nodes.len() >= 2 {
+            return start_multi_node(&app, &state, &model_id, &model_dir, params, sglang_version, sglang_flags).await;
+        }
         return start_sglang_docker(&app, &state, &model_id, &model_dir, params, device, sglang_version, sglang_flags).await;
     }
 
@@ -1275,7 +2004,7 @@ pub async fn start_model(
 }
 
 #[tauri::command]
-pub async fn stop_model(state: tauri::State<'_, AppState>) -> Result<(), AppError> {
+pub async fn stop_model(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), AppError> {
     let pid = {
         let pid_lock = state.running_process.lock().map_err(|e| e.to_string())?;
         pid_lock.ok_or("没有正在运行的模型")?
@@ -1283,6 +2012,24 @@ pub async fn stop_model(state: tauri::State<'_, AppState>) -> Result<(), AppErro
     // SGLang Docker 模式：先优雅停止容器，再兜底杀进程
     let container = state.running_container.lock().map_err(|e| e.to_string())?.clone();
     if let Some(container_name) = container {
+        // 多机模式（容器名 adm-sglang-<model>-rank-0）：先 SSH 停止所有远端节点容器
+        if container_name.ends_with("-rank-0") {
+            let model_id = state
+                .running_model_id
+                .lock()
+                .map_err(|e| e.to_string())?
+                .clone()
+                .unwrap_or_default();
+            if !model_id.is_empty() {
+                let (mn, _) = load_multi_node_config(&app);
+                let key: Option<String> = if mn.ssh_key_path.trim().is_empty() {
+                    None
+                } else {
+                    Some(mn.ssh_key_path.trim().to_string())
+                };
+                stop_remote_containers(&app, &mn, key.as_deref(), &model_id, 1).await;
+            }
+        }
         // docker stop/rm 放进 spawn_blocking 并整体限时：docker CLI 卡死（守护进程无响应等）
         // 时最多等待 20s 即放弃，避免"关闭模型"永久无响应
         let timeout = tokio::time::timeout(

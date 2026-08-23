@@ -32,6 +32,37 @@ fn cleanup_processes(app: &tauri::AppHandle) {
     // SGLang Docker 模式：停止并删除容器
     let container_opt = state.running_container.lock().ok().and_then(|l| l.clone());
     if let Some(container) = container_opt {
+        // 多机模式（容器名 adm-sglang-<model>-rank-0）：先 SSH 停止远端节点容器（尽力，3s/台）
+        if container.ends_with("-rank-0") {
+            if let Ok(settings_path) = crate::common::config::get_data_dir(Some(app)).map(|d| d.join("config.json")) {
+                if let Ok(json) = std::fs::read_to_string(settings_path) {
+                    if let Ok(parsed) = serde_json::from_str::<crate::common::types::Settings>(&json) {
+                        let mn = parsed.multi_node_args;
+                        let key: Option<String> = if mn.ssh_key_path.trim().is_empty() {
+                            None
+                        } else {
+                            Some(mn.ssh_key_path.trim().to_string())
+                        };
+                        let model_id = state.running_model_id.lock().ok().and_then(|l| l.clone()).unwrap_or_default();
+                        for (i, node) in mn.nodes.iter().enumerate().skip(1) {
+                            if node.is_self {
+                                continue;
+                            }
+                            let c = format!("adm-sglang-{}-rank-{}", model_id, i);
+                            let script = crate::common::ssh::stop_container_script(&c);
+                            let _ = crate::common::ssh::ssh_run_blocking(
+                                &node.ip,
+                                &node.ssh_user,
+                                node.ssh_port,
+                                key.as_deref(),
+                                &script,
+                                std::time::Duration::from_secs(3),
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let _ = crate::common::utils::platform::docker_cmd()
             .args(["stop", "-t", "3", &container])
             .output();
@@ -157,6 +188,13 @@ pub fn run() {
             settings::delete_engine_image,
             settings::get_docker_mirror_config,
             settings::save_docker_mirror_config,
+            settings::multi_node_probe,
+            settings::list_network_interfaces,
+            settings::get_local_network_info,
+            settings::ensure_ssh_key,
+            settings::push_image_to_remote,
+            settings::sync_model_to_remote,
+            settings::get_app_data_dir,
             // benchmark.rs
             benchmark::start_benchmark,
             benchmark::get_benchmark_status,

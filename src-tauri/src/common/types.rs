@@ -77,12 +77,64 @@ pub struct Settings {
     /// SGLang 详细参数配置（Docker 部署用）
     #[serde(default)]
     pub sglang_args: SglangArgs,
+    /// 多机互联配置（DGX Spark 集群，2+ 节点）；enabled=false 时走单机路径
+    #[serde(default)]
+    pub multi_node_args: MultiNodeArgs,
     /// 调试模式：开启后在软件根目录记录 API/SSE 交互日志（每次重启自动清空）
     #[serde(default)]
     pub debug_logging: bool,
     /// 界面语言（"zh" 中文 / "en" English，空或未知回退中文）
     #[serde(default)]
     pub language: String,
+}
+
+/// 多机互联配置（DGX Spark 集群）
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MultiNodeArgs {
+    /// 总开关：false = 走现有单机代码路径
+    #[serde(default)]
+    pub enabled: bool,
+    /// 节点清单（按下标即 rank；[0] 必须是本机 is_self=true）
+    #[serde(default)]
+    pub nodes: Vec<NodeInfo>,
+    /// 分布式引导端口（--dist-init-addr 端口，默认 20000，不得与服务端口冲突）
+    #[serde(default = "default_dist_init_port")]
+    pub dist_init_port: u16,
+    /// NCCL 通信端口（0 = 自动）
+    #[serde(default)]
+    pub nccl_port: u16,
+    /// 互连网卡（NCCL_SOCKET_IFNAME / GLOO_SOCKET_IFNAME，空 = 自动）
+    #[serde(default)]
+    pub iface: String,
+    /// 启用 RoCE（追加 --device /dev/infiniband、--ulimit memlock=-1:-1、--cap-add IPC_LOCK）
+    #[serde(default)]
+    pub use_roce: bool,
+    /// SSH 私钥路径（-i 指定；空 = 使用 ssh-agent / 默认 key）
+    #[serde(default)]
+    pub ssh_key_path: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct NodeInfo {
+    pub ip: String,
+    pub ssh_user: String,
+    /// SSH 端口（默认 22）
+    #[serde(default = "default_ssh_port")]
+    pub ssh_port: u16,
+    /// 本机标记（仅 nodes[0] 可为 true）
+    #[serde(default)]
+    pub is_self: bool,
+    /// 该节点本地的模型目录（须已下载好模型）
+    #[serde(default)]
+    pub model_dir: String,
+}
+
+fn default_dist_init_port() -> u16 {
+    20000
+}
+
+fn default_ssh_port() -> u16 {
+    22
 }
 
 /// SGLang launch_server 详细参数（设置页可手动修改，启动时拼成 `--key value`）

@@ -139,7 +139,7 @@ docker run \
 - 端口沿用设置页 `port`（默认 5678）
 - 仅非空/非默认值的参数才拼入命令（避免污染 SGLang 默认行为）
 - 额外参数（`extra_args`，每行 `key=value`）原样追加为 `--key value`，`#` 行忽略
-- **MTP 自动启用**：模型目录含 MTP 权重（文件名含 `mtp` 且以 `.safetensors`/`.bin` 结尾，如 `model_mtp.safetensors`）时，自动追加 `--speculative-algorithm NEXTN --speculative-num-steps 3`（Qwen3-Next MTP 官方用法，草稿权重与主模型同目录自动加载）；用户已在 `extra_args` 自定义 `speculative-algorithm` 时跳过，可用 `speculative-algorithm=NONE` 显式关闭
+- **MTP 自动启用**：模型目录含 MTP 权重（文件名含 `mtp` 且以 `.safetensors`/`.bin` 结尾，如 `model_mtp.safetensors`）时，自动追加 `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`（SGLang 中 NEXTN 是 EAGLE 别名，MTP 权重与主模型同目录自动加载，无需 `--speculative-draft-model-path`）；已在 `extra_args` 或模型清单 `sglang_flags` 自定义 `speculative-algorithm` 时跳过，可用 `speculative-algorithm=NONE` 显式关闭
 
 ### 6.2 就绪与状态
 
@@ -179,7 +179,7 @@ docker run \
 | 工具解析器 | `tool_call_parser` | 空 | qwen/qwen25/qwen3_coder/deepseekv3/deepseekv31/glm/llama3/mistral |
 | 额外参数 | `extra_args` | 空 | 每行 `key=value` → `--key value` |
 
-MTP（Multi-Token Prediction）：模型目录有 `model_mtp.safetensors` 时自动启用 NEXTN 投机解码（见 §6.1），无需手动配置；如 MTP 启动异常，在 `extra_args` 写 `speculative-algorithm=NONE` 关闭，或按官方文档调整 `speculative-num-steps`。
+MTP（Multi-Token Prediction）：模型目录有 `model_mtp.safetensors` 时自动启用 EAGLE（NEXTN）投机解码（见 §6.1），无需手动配置；如 MTP 启动异常，在 `extra_args` 写 `speculative-algorithm=NONE` 关闭，或按官方文档调整 `speculative-num-steps`。
 
 改动保存后对**后续启动**生效（无需重启应用；正在运行的容器需手动重启）。
 
@@ -211,3 +211,59 @@ MTP（Multi-Token Prediction）：模型目录有 `model_mtp.safetensors` 时自
 | 模型没下载完就点启动 | `is_dir_model` 要求 `.done` 或 config.json+model.safetensors 齐全 |
 | 前端一直不出现「查看模型」 | 就绪信号匹配 `Uvicorn running on`；先看 model-log 是否有该行 |
 | 想改参数不生效 | 参数持久化在 config.json；已运行容器需 stop 后重新 start |
+
+## 10. 多机互联（2+ 台 DGX Spark 集群，v1 已实现）
+
+> 配置入口：设置页「多机互联」Tab；设计文档：`doc/dgx-spark-multinode-plan.md`。
+> 单机模式（开关关闭）完全不受影响。**v1 目标形态：双机直连（2× DGX Spark）**。
+
+### 10.1 硬件与环境（前置）
+
+- **无 NVLink 跨机**：机间走 ConnectX-7 以太网（2× QSFP 200GbE + 1× RJ45 10GbE 管理口）。拓扑：2 机直连（一根 QSFP DAC）/ 3 机环 / 4 机需 200GbE 交换机
+- 每台节点：已装 Docker + NVIDIA Container Toolkit，**各自下载一份相同模型**（含 `.done`）
+- 节点 0（运行 ADM 的机器）→ 各远端节点 **SSH 免密**（公钥加入 `authorized_keys`，或设置页指定私钥路径）
+- 各节点 IP 互通；**容器必须 `--network host`**（NCCL 分布式握手要求），无需/不能再用 `-p 端口映射`
+
+### 10.2 设置页配置
+
+**直连节点（节点清单）**：
+- **IP 填写「光口 IP」**（ConnectX-7 QSFP 口上配置好的互连地址，如 `192.168.100.1/24` ↔ `192.168.100.2/24`），**不是 RJ45 网卡的局域网 IP**（管理口仅用于 SSH/运维）
+- 第 1 条必须是本机（rank 0）；rank 0 的 IP 即 `--dist-init-addr` 使用的互联地址
+- **模型目录**：本机行自动填写软件数据目录（`<data_dir>/models`，命令 `get_app_data_dir`）；直连节点留空时自动默认 `/home/<SSH用户>/models/<模型ID>`（绝对路径；启动/同步/探活统一生效，`effective_remote_model_dir` 兜底）
+
+| 配置 | 说明 |
+|---|---|
+| 总开关 | 关闭 = 单机模式不变 |
+| 节点清单 | 按下标即 rank，**第 1 条必须是本机**；每行填光口 IP / SSH 用户 / SSH 端口 / 模型目录 |
+| 引导端口 | `--dist-init-addr <节点0IP>:<端口>`（默认 20000），不得与模型服务端口冲突 |
+| NCCL 端口 | 0 = 随机；固定端口便于防火墙放行 |
+| 互连网卡 | 下拉自动扫描**本机物理网卡**，并合并**探活到的远端网卡**（datalist 可手输）；留空 = NCCL 自动发现（推荐）。注意所有节点需统一同名网卡（DGX Spark 同款硬件通常一致，如 CX-7 口 `enp1s0f0np0`/`enp1s0f1np1`） |
+| RoCE | QSFP 直连建议开启（挂载 `/dev/infiniband` + 放宽 memlock）；异常可关闭回退 TCP |
+| 测试连通 | 节点行「测试连通」按钮：SSH 检查远端 Docker / GPU / **镜像（是否已下载本机当前使用的 sglang 镜像，设置页镜像为准）** / 模型目录。远端网卡不再探测——SSH 可达即互联已通 |
+| 同步镜像 | 「同步镜像到直连节点」独立一行：**流式管道** `docker save <img> \| [pv -s <size>] \| gzip -1 \| ssh 直连IP 'gunzip \| docker load'`，不落地临时 tar、直接复用光口 200G 带宽；镜像 = 模型启动参数当前选择；进度事件 `image-push-progress`（stderr 解析 pv 百分比），完成自动重新测试连通 |
+| 同步模型 | 「同步模型到直连节点」独立一行：点击后**先监测远端是否已同步**（`<model_dir>/.done` 存在则跳过），未同步则全量同步本机模型（主模型 = 正在运行的模型，无则第一个已下载模型；**rsync 增量** `--info=progress2`，无 rsync 时 scp -r 回退），完成后校验远端 `.done`；进度事件 `model-sync-progress`（rsync progress2 百分比） |
+
+> SSH 互信：节点 0 需能免密 SSH 到远端（`~/.ssh/id_ed25519` 公钥加入远端 `authorized_keys`；如无密钥可用 `ssh-keygen -t ed25519` 生成，后端 `ensure_ssh_key` 命令幂等保证）
+
+### 10.3 启动（start_model → start_multi_node）
+
+- 触发条件：总开关开启且节点数 ≥ 2（否则走单机 `start_sglang_docker`）
+- 流程：本机 Docker 预检 → 校验节点清单/端口 → 逐台远端探活 → **先启远端**（SSH `nohup docker run ...`，日志落盘 `/tmp/adm_sglang_<model>_rank_<R>.log`，30s 内确认容器 `Up`）→ 再启本机（rank 0）
+- 参数：`--tp N --nnodes N --node-rank R --dist-init-addr <节点0IP>:<引导端口>` 置于命令**最后**（跨节点 TP 拓扑优先）；其余设置页参数 / MTP 自动启用 / 模型清单 `sglang_flags` 规则与单机一致；容器名 `adm-sglang-<model>-rank-<R>`
+- 就绪信号不变：本机 stdout `Uvicorn running on`；WebUI/API 仍指向节点 0（本机）端口
+- **任一失败回滚**：远端预检/启动/就绪失败 → 停止已启动远端节点并报错（错误含远端日志尾部）
+
+### 10.4 停止与监控
+
+- `stop_model` / 应用退出（`cleanup_processes`）：容器名含 `-rank-0` 时先 SSH 逐台 `docker stop/rm` 远端，再停本机
+- 运行期监控：每 10s 检查远端容器，异常退出 → model-log 告警（含日志尾部），不自动级联停止
+- SSH 不可达的残留容器（手动清理）：`ssh <user>@<ip> 'docker rm -f adm-sglang-<model>-rank-<R>'`
+
+### 10.5 常见问题
+
+| 现象 | 排查 |
+|---|---|
+| 启动报"远端节点探活失败" | 检查 SSH 免密/私钥、远端 docker 可用、模型目录含 `.done` |
+| 远端容器启动失败 | 看 `/tmp/adm_sglang_<model>_rank_<R>.log`（启动报错会带回尾部） |
+| NCCL 卡死/不收敛 | 依次尝试：`--disable-cuda-graph` → `NCCL_IB_GID_INDEX=3` → 指定互连网卡 → 关 RoCE（TCP 回退） |
+| 模型目录不存在（远端） | 各节点需各自下载一份模型（迭代二规划 rsync 自动分发） |
