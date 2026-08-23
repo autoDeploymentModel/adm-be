@@ -69,6 +69,18 @@ echo "==== 5) 卡点现场：日志最后 25 行 ===="
 tail -25 /tmp/sg_trace.log
 
 echo
+echo "==== 5.1) SGLang worker 进程环境（与裸 nccl_test 对比，抓 SGLang 注入的差异项）===="
+WPID=$(docker top "$CID" 2>/dev/null | awk 'NR>1 && $NF ~ /python/ {print $2}' | head -1)
+if [ -n "$WPID" ]; then
+  echo "worker pid=$WPID（容器内）；差异候选变量如下："
+  docker exec -i "$CID" sh -c "tr '\\0' '\\n' < /proc/$WPID/environ" 2>/dev/null \
+    | grep -E "^(NCCL|CUDA_VISIBLE|CUMEM|NVLS|GDR|SGLANG|MASTER|RANK|WORLD|LOCAL_|OMPI|PMI)" \
+    | sort || echo "(读取失败——容器内无权限或进程已退出，尝试 sudo docker top)"
+else
+  echo "(未找到 python worker 进程)"
+fi
+
+echo
 echo "==== 6) 本机直连网卡流量（对比两次输出字节数）===="
 ip -s link show "$IFACE" | grep -A1 -E "RX:|TX:"
 sleep 5
@@ -99,4 +111,5 @@ echo "  2) 通道数 8/60 均已验证无关（NCCL_MAX_NCHANNELS 限容无效�
 echo "  3) 2.2 若未挂 /dev/infiniband => 开 use_roce 走官方 2×Spark 配方（+NCCL_IB_GID_INDEX=3）"
 echo "  4) 2.2 gdrdrv 版本主机/容器不一致 => 对齐后重试（GDRCopy 静默失败会卡）"
 echo "  5) 决定性实验：stop 容器后双机 scripts/nccl_test.py（TRACE）隔离 => 卡=NCCL/驱动层，通过=SGLang 层"
-echo "  贴 1/2/2.2/3.1/5 输出"
+echo "  6) nccl_test 通过但仍卡 => 5.1 对比 worker 环境变量；镜像版本是否与通过的测试容器一致（2.29.7 通过 vs 2.28.3/2.30.7 失败）"
+echo "  贴 1/2/2.2/3.1/5/5.1 输出"
