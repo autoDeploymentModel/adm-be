@@ -889,6 +889,9 @@ fn validate_multi_node(mn: &MultiNodeArgs, port: u16) -> Result<(), AppError> {
             bail!("节点 {}（rank {}）IP 为空", i + 1, i);
         }
         crate::common::ssh::validate_host(&n.ip).map_err(|e| e.to_string())?;
+        if !n.is_self {
+            crate::common::ssh::validate_ssh_user(&n.ssh_user).map_err(|e| e.to_string())?;
+        }
         if !n.is_self && n.ssh_user.trim().is_empty() {
             bail!("节点 {}（rank {}）SSH 用户为空", i + 1, i);
         }

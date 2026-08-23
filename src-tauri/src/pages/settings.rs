@@ -434,6 +434,7 @@ pub async fn multi_node_probe(
     model_dir: Option<String>,
 ) -> Result<ProbeResult, AppError> {
     crate::common::ssh::validate_host(&ip)?;
+    crate::common::ssh::validate_ssh_user(&user)?;
     // 本机当前使用的镜像：设置页配置优先，缺省默认
     let mut image = "lmsysorg/sglang:v0.5.17".to_string();
     if let Ok(settings_path) = config::get_data_dir(Some(&app)).map(|d| d.join("config.json")) {
@@ -825,6 +826,7 @@ pub async fn push_image_to_remote(
     image: String,
 ) -> Result<String, AppError> {
     crate::common::ssh::validate_host(&ip)?;
+    crate::common::ssh::validate_ssh_user(&user)?;
     let image = image.trim();
     if image.is_empty() {
         return Err(AppError::msg("镜像名为空".to_string()));
@@ -908,6 +910,7 @@ pub async fn sync_model_to_remote(
     remote_model_dir: String,
 ) -> Result<String, AppError> {
     crate::common::ssh::validate_host(&ip)?;
+    crate::common::ssh::validate_ssh_user(&user)?;
     let data_dir = config::get_data_dir(Some(&app))?;
     let models_root = data_dir.join("models");
 
@@ -971,13 +974,15 @@ pub async fn sync_model_to_remote(
     // 先远端建目录（rsync 不会自动创建不存在的多级父目录），再增量 rsync；无 rsync 回退 scp -r
     let remote_dir_q = crate::common::ssh::quote_remote_path(&remote_dir);
     let script = format!(
-        "ssh {} 'mkdir -p {}' 2>&1 && \
+        "ssh {} '{}@{}' 'mkdir -p {}' 2>&1 && \
          if command -v rsync >/dev/null 2>&1; then \
            rsync -a --info=progress2 --no-inc-recursive -e 'ssh {}' '{}' '{}@{}:{}' 2>&1; \
          else \
            scp -r -o BatchMode=yes -o ConnectTimeout=5 '{}' '{}@{}:{}' 2>&1; \
          fi",
         opts,
+        user.trim(),
+        ip.trim(),
         remote_dir_q,
         opts,
         src_str,

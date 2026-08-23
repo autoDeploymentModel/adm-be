@@ -36,17 +36,37 @@ fn is_ipv4(s: &str) -> bool {
     })
 }
 
-/// IPv6（宽松）：含 `:` 的十六进制/冒号/点组合，至多一个 `::`，可带 `%` 接口名
+/// IPv6（宽松）：含 `:` 的十六进制/冒号/点组合，至多一个 `::`，可带 `%` 接口名；
+/// 无 `::` 时必须不含 `.`（杜绝 `192.168.100.2:22` 这类 IP:端口混填被放行）
 fn is_ipv6(s: &str) -> bool {
     let body = s.split('%').next().unwrap_or(s);
     if !body.contains(':') {
         return false;
     }
-    body.split("::").count() <= 2
+    (body.contains("::") || !body.contains('.'))
+        && body.split("::").count() <= 2
         && body.matches(':').count() <= 7
         && body
             .chars()
             .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
+}
+
+/// 校验 SSH 用户名。OpenSSH 按 `user@host` 解析，用户名若含 `@`（如误粘贴
+/// `user@192.168.100.2` 完整目标）会导致 host 段带 `@`，报 "hostname contains
+/// invalid characters"。
+pub fn validate_ssh_user(user: &str) -> Result<(), AppError> {
+    let u = user.trim();
+    if u.is_empty() {
+        return Err(AppError::msg("SSH 用户为空".to_string()));
+    }
+    let ok = u.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.');
+    if !ok {
+        return Err(AppError::msg(format!(
+            "SSH 用户「{}」包含非法字符（只能含字母/数字/下划线/短横线/句点；不要粘贴 user@ip 完整形式）",
+            u
+        )));
+    }
+    Ok(())
 }
 
 /// 在远端执行命令，返回 (status_success, stdout, stderr)。
