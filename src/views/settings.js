@@ -761,20 +761,46 @@ function getMultiNodeArgsFromForm() {
   };
 }
 
+// 同步任务进行中标志（切页回来 mount 时据此恢复按钮禁用态，防止重复触发同步）
+let mnImgSyncBusy = false;
+let mnModelSyncBusy = false;
+// 最近一次同步状态文本（切页回来 mount 时恢复显示，含最终结果）
+let mnImgSyncStatus = "";
+let mnModelSyncStatus = "";
+// 正在同步的镜像名（save/transfer 阶段状态文字显示用）
+let mnImgSyncName = "";
+
+// 按钮忙态：禁用 + 文案切换，结束恢复原文案
+function setMnBtnBusy(btn, busy, busyText) {
+  if (!btn) return;
+  if (busy) {
+    btn.dataset.idleText = btn.textContent || "";
+    btn.disabled = true;
+    btn.textContent = busyText;
+  } else {
+    btn.disabled = false;
+    btn.textContent = btn.dataset.idleText || "";
+  }
+}
+
 // 流式同步本机镜像到直连节点（docker save | gzip | ssh | docker load，不落盘）
 async function pushImageToRemote() {
   const btn = document.getElementById("mn-push-img-btn");
   const statusEl = document.getElementById("mn-push-img-status");
   const n = mnNodes[1];
   if (!n) return;
+  if (mnImgSyncBusy || (btn && btn.disabled)) return;
   const imageEl = document.getElementById("sglang_image");
   const image = imageEl ? imageEl.value.trim() : "";
   if (!image) {
     showToast(_t("请先在模型启动参数中选择镜像"), true);
     return;
   }
-  if (btn) btn.disabled = true;
-  if (statusEl) statusEl.textContent = _t("导出中...");
+  mnImgSyncBusy = true;
+  setMnBtnBusy(btn, true, _t("镜像同步中..."));
+  mnImgSyncName = image;
+  mnImgSyncStatus = _t("正在同步") + " " + image;
+  if (statusEl) statusEl.textContent = mnImgSyncStatus;
   const keyEl = document.getElementById("multi_ssh_key");
   try {
     const res = await invoke()("push_image_to_remote", {
@@ -785,24 +811,30 @@ async function pushImageToRemote() {
       image: image,
     });
     if (statusEl) statusEl.textContent = String(res);
+    mnImgSyncStatus = String(res);
     showToast(String(res));
     probeNode(1);
   } catch (e) {
     if (statusEl) statusEl.textContent = "";
+    mnImgSyncStatus = "";
     showToast(_t("同步失败: ") + e, true);
   } finally {
-    if (btn) btn.disabled = false;
+    mnImgSyncBusy = false;
+    setMnBtnBusy(btn, false);
   }
 }
 
-// 同步本机模型到直连节点：先监测远端是否已同步，未同步则全量同步（模型目录留空自动 ~/models/<模型ID>）
+// 同步本机模型到直连节点：全量同步所有已下载模型（远端已同步自动跳过）
 async function syncModelToRemote() {
   const btn = document.getElementById("mn-sync-model-btn");
   const statusEl = document.getElementById("mn-sync-model-status");
   const n = mnNodes[1];
   if (!n) return;
-  if (btn) btn.disabled = true;
-  if (statusEl) statusEl.textContent = _t("检测中...");
+  if (mnModelSyncBusy || (btn && btn.disabled)) return;
+  mnModelSyncBusy = true;
+  setMnBtnBusy(btn, true, _t("模型同步中..."));
+  mnModelSyncStatus = _t("检测中...");
+  if (statusEl) statusEl.textContent = mnModelSyncStatus;
   const keyEl = document.getElementById("multi_ssh_key");
   try {
     const res = await invoke()("sync_model_to_remote", {
@@ -813,13 +845,16 @@ async function syncModelToRemote() {
       remoteModelDir: n.modelDir.trim(),
     });
     if (statusEl) statusEl.textContent = String(res);
+    mnModelSyncStatus = String(res);
     showToast(String(res));
     probeNode(1);
   } catch (e) {
     if (statusEl) statusEl.textContent = "";
+    mnModelSyncStatus = "";
     showToast(_t("同步失败: ") + e, true);
   } finally {
-    if (btn) btn.disabled = false;
+    mnModelSyncBusy = false;
+    setMnBtnBusy(btn, false);
   }
 }
 
@@ -843,10 +878,35 @@ function handleTauriEvent(type, payload) {
     ? document.getElementById("mn-push-img-status")
     : document.getElementById("mn-sync-model-status");
   if (!statusEl) return;
-  const txt = syncPhaseText(payload.phase) + (payload.detail ? " · " + payload.detail : "");
+  let txt;
+  if (type === "image-push-progress") {
+    // 镜像同步：save/transfer 阶段显示正在同步的镜像名，完成阶段显示完成
+    if (payload.phase === "done") {
+      txt = syncPhaseText("done");
+    } else {
+      txt = mnImgSyncName
+        ? _t("正在同步") + " " + mnImgSyncName
+        : syncPhaseText(payload.phase) + (payload.detail ? " · " + payload.detail : "");
+    }
+  } else if (payload.phase === "save") {
+    // 模型同步：显示正在同步的模型名（detail 形如「同步模型 xxx ...」）
+    const name = String(payload.detail || "")
+      .replace(/^同步模型\s*/, "")
+      .replace(/\s*\.\.\.?$/, "")
+      .trim();
+    txt = name ? _t("正在同步") + " " + name : syncPhaseText(payload.phase);
+  } else {
+    txt = syncPhaseText(payload.phase) + (payload.detail ? " · " + payload.detail : "");
+  }
   statusEl.textContent = payload.percent != null && payload.percent > 0 && payload.percent < 100
     ? txt + " " + payload.percent + "%"
     : txt;
+  // 保存最近状态，切页回来 mount 时恢复显示
+  if (type === "image-push-progress") {
+    mnImgSyncStatus = statusEl.textContent;
+  } else {
+    mnModelSyncStatus = statusEl.textContent;
+  }
 }
 
 async function fillMultiNodeArgsForm(m) {
@@ -1404,6 +1464,14 @@ export default {
     if (mnSyncModelBtn) {
       mnSyncModelBtn.addEventListener("click", syncModelToRemote);
     }
+    // 同步进行中切页回来：恢复按钮禁用与忙态文案
+    if (mnImgSyncBusy) setMnBtnBusy(mnPushImgBtn, true, _t("镜像同步中..."));
+    if (mnModelSyncBusy) setMnBtnBusy(mnSyncModelBtn, true, _t("模型同步中..."));
+    // 恢复最近同步状态文本（同步中显示当前进度，已完成显示结果）
+    var mnImgStatusEl = document.getElementById("mn-push-img-status");
+    if (mnImgStatusEl && mnImgSyncStatus) mnImgStatusEl.textContent = mnImgSyncStatus;
+    var mnModelStatusEl = document.getElementById("mn-sync-model-status");
+    if (mnModelStatusEl && mnModelSyncStatus) mnModelStatusEl.textContent = mnModelSyncStatus;
 
     var engineRefresh = document.getElementById("engine-refresh-btn");
     if (engineRefresh) engineRefresh.addEventListener("click", loadEngineImages);
