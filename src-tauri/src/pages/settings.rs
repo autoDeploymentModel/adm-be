@@ -463,10 +463,11 @@ pub async fn multi_node_probe(
     )
     .await?;
 
-    // 解析输出：依次找 GPU:/DOCKER:/IMAGE:/MODEL: 段
+    // 解析输出：依次找 GPU:/DOCKER:/IMAGE:/IMG_ERR:/MODEL: 段
     let mut gpu = String::new();
     let mut docker = String::new();
     let mut image_ok = false;
+    let mut image_err = String::new();
     let mut model_exists = false;
     for line in stdout.lines().chain(stderr.lines()) {
         if let Some(v) = line.strip_prefix("GPU:") {
@@ -475,6 +476,8 @@ pub async fn multi_node_probe(
             docker = v.trim().to_string();
         } else if let Some(v) = line.strip_prefix("IMAGE:") {
             image_ok = v.trim() == "IMAGE_OK";
+        } else if let Some(v) = line.strip_prefix("IMG_ERR:") {
+            image_err = v.trim().to_string();
         } else if let Some(v) = line.strip_prefix("MODEL:") {
             model_exists = v.trim() == "MODEL_OK";
         }
@@ -502,13 +505,18 @@ pub async fn multi_node_probe(
         });
     }
     if !image_ok {
+        let mut err = format!("远端未下载本机使用的镜像 {}（请先在远端 docker pull 或配置镜像加速）", image);
+        if !image_err.is_empty() {
+            // 附带真实失败原因（权限/daemon 等），便于定位
+            err.push_str(&format!("\n{}", image_err));
+        }
         return Ok(ProbeResult {
             ok: false,
             gpu,
             docker,
             image_ok,
             model_exists,
-            error: format!("远端未下载本机使用的镜像 {}（请先在远端 docker pull 或配置镜像加速）", image),
+            error: err,
         });
     }
     Ok(ProbeResult {
