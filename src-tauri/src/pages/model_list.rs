@@ -1070,8 +1070,8 @@ fn build_multi_node_args(
     }
     // NCCL_DEBUG 默认 INFO（extra_env 未显式设置时注入）
     if !extra_keys.contains("NCCL_DEBUG") {
-        args.insert(4, "-e".to_string());
-        args.insert(5, "NCCL_DEBUG=INFO".to_string());
+        args.push("-e".to_string());
+        args.push("NCCL_DEBUG=INFO".to_string());
     }
     args.push("-v".to_string());
     args.push(format!(
