@@ -892,12 +892,12 @@ function handleTauriEvent(type, payload) {
 
 async function fillMultiNodeArgsForm(m) {
   const v = m || {};
-  // 双机直连 v1：固定 2 个节点（rank0 本机 + rank1 远端）
+  // 双机直连 v1：固定 2 个节点（rank0 本机 + rank1 远端），不足自动补默认行
   mnNodes = (v.nodes || []).slice(0, 2).map(function (x) {
     return { ip: x.ip || "", sshUser: x.ssh_user || "", sshPort: x.ssh_port || 22, isSelf: !!x.is_self, modelDir: x.model_dir || "" };
   });
-  if (mnNodes.length < 2) {
-    mnNodes.push(defaultMnNode(false));
+  while (mnNodes.length < 2) {
+    mnNodes.push(defaultMnNode(mnNodes.length === 0));
   }
   // 首行必须是本机
   mnNodes[0].isSelf = true;
