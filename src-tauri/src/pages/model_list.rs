@@ -930,12 +930,26 @@ fn has_mtp_weight(model_dir: &std::path::Path) -> bool {
     false
 }
 
-/// 用户（设置页 extra_args 或模型清单 sglang_flags）是否已自定义 speculative-algorithm
+/// 用户（设置页 extra_args 或模型清单 sglang_flags）是否已自定义投机解码参数
+/// 覆盖所有 speculative-* 变体及 GDN 模型的 --enable-linear-replayssm-spec
 fn spec_user_defined(sglang_args: &SglangArgs, sglang_flags: &[String]) -> bool {
+    let spec_keywords = [
+        "speculative-algorithm",
+        "speculative-num-steps",
+        "speculative-eagle-topk",
+        "speculative-num-draft-tokens",
+        "speculative-dspark-block-size",
+        "enable-linear-replayssm-spec",
+        "linear-replayssm-cache-len",
+        "speculative-ngram-max-bfs-breadth",
+    ];
     sglang_args.extra_args.lines().any(|l| {
-        let t = l.trim();
-        t.starts_with("--speculative-algorithm") || t.starts_with("speculative-algorithm")
-    }) || sglang_flags.iter().any(|f| f.contains("speculative-algorithm"))
+        let t = l.trim().trim_start_matches('-');
+        spec_keywords.iter().any(|kw| t.starts_with(kw))
+    }) || sglang_flags.iter().any(|f| {
+        let t = f.trim_start_matches('-');
+        spec_keywords.iter().any(|kw| t.starts_with(kw))
+    })
 }
 
 /// 本机通过 IP 反查网卡名：`ip -o -4 addr show to <IP>` 取接口名。
@@ -984,6 +998,7 @@ async fn detect_remote_iface(
 /// 设置页 sglang_args / MTP 自动启用 / 模型清单 sglang_flags 拼接规则与单机一致。
 /// `iface`：自动从节点 IP 反查的网卡名，注入 NCCL_SOCKET_IFNAME / GLOO_SOCKET_IFNAME；
 ///          None 时不注入（NCCL 自动发现）。
+/// `has_infiniband`：目标节点是否有 /dev/infiniband（本机直接检测，远端经 SSH 预检）。
 fn build_multi_node_args(
     model_id: &str,
     model_dir: &std::path::Path,
@@ -996,6 +1011,7 @@ fn build_multi_node_args(
     rank: usize,
     node0_ip: &str,
     iface: Option<&str>,
+    has_infiniband: bool,
 ) -> Vec<String> {
     let container_name = format!("adm-sglang-{}-rank-{}", model_id, rank);
     let mount_dst = format!("/models/{}", model_id);
@@ -1003,8 +1019,6 @@ fn build_multi_node_args(
         "run".to_string(),
         "-e".to_string(),
         "PYTHONWARNINGS=ignore::FutureWarning".to_string(),
-        "-e".to_string(),
-        "NCCL_DEBUG=INFO".to_string(),
         "--name".to_string(),
         container_name,
         "--gpus".to_string(),
@@ -1013,20 +1027,21 @@ fn build_multi_node_args(
         shm_size.to_string(),
         "--cap-add".to_string(),
         "SYS_NICE".to_string(),
+        "--ulimit".to_string(),
+        "stack=67108864".to_string(),
+        "--ulimit".to_string(),
+        "memlock=-1:-1".to_string(),
+        "--cap-add".to_string(),
+        "IPC_LOCK".to_string(),
         "--ipc".to_string(),
         "host".to_string(),
         "--network".to_string(),
         "host".to_string(),
     ];
-    if mn.use_roce {
-        args.extend([
-            "--device".to_string(),
-            "/dev/infiniband".to_string(),
-            "--ulimit".to_string(),
-            "memlock=-1:-1".to_string(),
-            "--cap-add".to_string(),
-            "IPC_LOCK".to_string(),
-        ]);
+    // 目标节点有 /dev/infiniband 时挂载（DGX Spark 有 IB 网卡；无 IB 的机型自动跳过）
+    if has_infiniband {
+        args.push("--device".to_string());
+        args.push("/dev/infiniband".to_string());
     }
     if let Some(iface_name) = iface.filter(|s| !s.trim().is_empty()) {
         args.extend([
@@ -1037,6 +1052,7 @@ fn build_multi_node_args(
         ]);
     }
     // 额外容器环境变量（每行 KEY=VALUE → -e KEY=VALUE；用于 NCCL 排查如 NCCL_DEBUG=TRACE / NCCL_SOCKET_NTHREADS=1）
+    let mut extra_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
     for line in mn.extra_env.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -1046,10 +1062,16 @@ fn build_multi_node_args(
             let k = k.trim();
             let v = v.trim();
             if !k.is_empty() && !v.is_empty() {
+                extra_keys.insert(k.to_string());
                 args.push("-e".to_string());
                 args.push(format!("{}={}", k, v));
             }
         }
+    }
+    // NCCL_DEBUG 默认 INFO（extra_env 未显式设置时注入）
+    if !extra_keys.contains("NCCL_DEBUG") {
+        args.insert(4, "-e".to_string());
+        args.insert(5, "NCCL_DEBUG=INFO".to_string());
     }
     args.push("-v".to_string());
     args.push(format!(
@@ -1367,6 +1389,20 @@ async fn start_multi_node(
                 "source": "stdout",
             }));
         }
+        // 检测远端是否有 /dev/infiniband（DGX Spark 有 IB 网卡，EdgeXpert 等无）
+        let (_, ib_out, _) = crate::common::ssh::ssh_run(
+            &node.ip, &node.ssh_user, node.ssh_port, key_ref,
+            "test -d /dev/infiniband && echo IB_YES || echo IB_NO",
+            std::time::Duration::from_secs(10),
+        ).await.unwrap_or((false, String::new(), String::new()));
+        let remote_has_ib = ib_out.contains("IB_YES");
+        if remote_has_ib {
+            let _ = app.emit("model-log", serde_json::json!({
+                "model_id": model_id,
+                "line": format!("[多机] 节点 {}（rank {}）检测到 InfiniBand 设备", node.ip, i),
+                "source": "stdout",
+            }));
+        }
         let args = build_multi_node_args(
             model_id,
             &std::path::Path::new(&node_model_dir),
@@ -1379,6 +1415,7 @@ async fn start_multi_node(
             i,
             &node0_ip,
             remote_iface.as_deref(),
+            remote_has_ib,
         );
         let container = multi_container_name(model_id, i);
         let log_path = format!("/tmp/adm_sglang_{}_rank_{}.log", model_id, i);
@@ -1492,8 +1529,9 @@ async fn start_multi_node(
             "source": "stdout",
         }));
     }
+    let local_has_ib = std::path::Path::new("/dev/infiniband").exists();
     let args0 = build_multi_node_args(
-        model_id, model_dir, &image, &shm_size, port, &sglang_args, &sglang_flags, &mn, 0, &node0_ip, local_iface.as_deref(),
+        model_id, model_dir, &image, &shm_size, port, &sglang_args, &sglang_flags, &mn, 0, &node0_ip, local_iface.as_deref(), local_has_ib,
     );
 
     dbg_log!("[DEBUG] sglang multi-node docker args (rank0): {:?}", args0);
@@ -1787,6 +1825,8 @@ async fn start_sglang_docker(
         shm_size,
         "--cap-add".to_string(),
         "SYS_NICE".to_string(),
+        "--ulimit".to_string(),
+        "stack=67108864".to_string(),
         "--ipc".to_string(),
         "host".to_string(),
         "-p".to_string(),
@@ -1906,10 +1946,7 @@ async fn start_sglang_docker(
         }
         found
     };
-    let user_specified_spec = sglang_args.extra_args.lines().any(|l| {
-        let t = l.trim();
-        t.starts_with("--speculative-algorithm") || t.starts_with("speculative-algorithm")
-    }) || sglang_flags.as_deref().unwrap_or(&[]).iter().any(|f| f.contains("speculative-algorithm"));
+    let user_specified_spec = spec_user_defined(&sglang_args, sglang_flags.as_deref().unwrap_or(&[]));
     if has_mtp_weight && !user_specified_spec {
         args.extend([
             "--speculative-algorithm".to_string(),

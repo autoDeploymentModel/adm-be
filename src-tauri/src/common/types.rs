@@ -106,9 +106,6 @@ pub struct MultiNodeArgs {
     /// 互连网卡（NCCL_SOCKET_IFNAME / GLOO_SOCKET_IFNAME，空 = 自动）
     #[serde(default)]
     pub iface: String,
-    /// 启用 RoCE（追加 --device /dev/infiniband、--ulimit memlock=-1:-1、--cap-add IPC_LOCK）
-    #[serde(default = "default_true")]
-    pub use_roce: bool,
     /// SSH 私钥路径（-i 指定；空 = 使用 ssh-agent / 默认 key）
     #[serde(default)]
     pub ssh_key_path: String,
@@ -135,11 +132,6 @@ pub struct NodeInfo {
 fn default_dist_init_port() -> u16 {
     6464
 }
-
-fn default_true() -> bool {
-    true
-}
-
 fn default_ssh_port() -> u16 {
     22
 }
