@@ -44,6 +44,8 @@ echo
 echo "==== 3) 日志落盘 /tmp/sg_trace.log ===="
 docker logs "$CID" > /tmp/sg_trace.log 2>&1
 wc -l /tmp/sg_trace.log
+echo "-- 运行时 NCCL 版本（Config.Env 的 NCCL_VERSION 是构建时烘焙值，以日志为准）--"
+grep -m1 "NCCL version" /tmp/sg_trace.log || echo "(日志中未见 NCCL version 行)"
 
 echo
 echo "==== 4) NCCL socket 层关键行（后 40 行；仅 NCCL_DEBUG=TRACE 时可见 net 行）===="
@@ -70,14 +72,16 @@ tail -25 /tmp/sg_trace.log
 
 echo
 echo "==== 5.1) SGLang worker 进程环境（与裸 nccl_test 对比，抓 SGLang 注入的差异项）===="
-WPID=$(docker top "$CID" 2>/dev/null | awk 'NR>1 && $NF ~ /python/ {print $2}' | head -1)
-if [ -n "$WPID" ]; then
-  echo "worker pid=$WPID（容器内）；差异候选变量如下："
-  docker exec -i "$CID" sh -c "tr '\\0' '\\n' < /proc/$WPID/environ" 2>/dev/null \
-    | grep -E "^(NCCL|CUDA_VISIBLE|CUMEM|NVLS|GDR|SGLANG|MASTER|RANK|WORLD|LOCAL_|OMPI|PMI)" \
-    | sort || echo "(读取失败——容器内无权限或进程已退出，尝试 sudo docker top)"
+WPRCS=$(docker top "$CID" 2>/dev/null | awk 'NR>1 && $0 ~ /python/ {print $2}' | head -5)
+if [ -n "$WPRCS" ]; then
+  for WPID in $WPRCS; do
+    echo "-- python pid=$WPID（容器内）--"
+    docker exec -i "$CID" sh -c "tr '\\0' '\\n' < /proc/$WPID/environ" 2>/dev/null \
+      | grep -E "^(NCCL|CUDA_VISIBLE|CUMEM|NVLS|GDR|SGLANG|MASTER|RANK|WORLD|LOCAL_|OMPI|PMI|TORCH|NVIDIA)" \
+      | sort || echo "(读取失败——容器内无权限或进程已退出)"
+  done
 else
-  echo "(未找到 python worker 进程)"
+  echo "(未找到 python 进程)"
 fi
 
 echo
@@ -88,7 +92,8 @@ ip -s link show "$IFACE" | grep -A1 -E "RX:|TX:"
 echo "-- 网卡 link/speed --"
 ethtool "$IFACE" 2>/dev/null | grep -E "Speed|Link detected" || echo "(ethtool 不可用)"
 echo "-- 本机非回环 TCP 状态（SYN-SENT 堆积=对端端口被拦；无 LISTEN=没绑上）--"
-ss -tna | grep -vE "127.0.0.1|::1" | tail -12
+SS_ALL=$(ss -tna | grep -vE "127.0.0.1|::1")
+echo "$SS_ALL" | tail -12
 
 echo
 echo "==== 7) 远端节点状态（日志尾部 + 网卡流量）===="
@@ -101,15 +106,27 @@ ssh -o ConnectTimeout=5 -o BatchMode=yes "$RANK1_USER@$RANK1_IP" \
   || echo "(远端 SSH 失败——检查免密与 IP)"
 
 echo
-echo "==== 8) 结论速查 ===="
-echo "前提：Listening/Connecting 判据仅 NCCL_DEBUG=TRACE 时有效；INFO 级别看不到 net 行，以 ss/流量/Init COMPLETE 为准"
-echo "TRACE 下出现 \"NET/Socket : Listening on\" 且字节数增长 => 数据面正常，等 Uvicorn"
-echo "无 Listening/Connected/Init COMPLETE 且流量近零 => 仍卡，按序排查："
-echo "  0) 3.1 若 Bootstrap timings 正常且两侧 commId 一致 => rendezvous/端口/防火墙已排除，别再查端口"
-echo "  1) ss 是否 SYN-SENT 堆积？有 => nccl 端口被防火墙/NAT 拦；大量 ESTAB 但无 Init COMPLETE => 建连中途卡"
-echo "  2) 通道数 8/60 均已验证无关（NCCL_MAX_NCHANNELS 限容无效），跳过"
-echo "  3) 2.2 若未挂 /dev/infiniband => 开 use_roce 走官方 2×Spark 配方（+NCCL_IB_GID_INDEX=3）"
-echo "  4) 2.2 gdrdrv 版本主机/容器不一致 => 对齐后重试（GDRCopy 静默失败会卡）"
-echo "  5) 决定性实验：stop 容器后双机 scripts/nccl_test.py（TRACE）隔离 => 卡=NCCL/驱动层，通过=SGLang 层"
-echo "  6) nccl_test 通过但仍卡 => 5.1 对比 worker 环境变量；镜像版本是否与通过的测试容器一致（2.29.7 通过 vs 2.28.3/2.30.7 失败）"
-echo "  贴 1/2/2.2/3.1/5/5.1 输出"
+echo "==== 8) 自动判定（基于本次采集数据；Listening/Connecting 判据仅 TRACE 可见，INFO 以 ss/流量/Init COMPLETE 为准）===="
+SYN=$(echo "$SS_ALL" | grep -c "SYN-SENT" || true)
+EST=$(echo "$SS_ALL" | grep -c ESTAB || true)
+if grep -q "Uvicorn running" /tmp/sg_trace.log; then
+  echo ">>> 服务已就绪：Uvicorn running 已出现，数据面正常，无需排查"
+elif grep -q "Init COMPLETE" /tmp/sg_trace.log; then
+  echo ">>> NCCL 初始化已完成（Init COMPLETE 出现），卡点在后续阶段（权重加载/调度器）；看 5) 尾部是否还有进展"
+else
+  echo ">>> 判定：NCCL 未完成初始化（无 Init COMPLETE）"
+  if [ "$SYN" -gt 0 ]; then
+    echo "  - ss 存在 SYN-SENT x$SYN：对端端口被防火墙/NAT 静默丢弃，查 nccl/数据端口放行"
+  else
+    echo "  - ss 无 SYN-SENT（本地跨机 ESTAB x${EST}）=> 端口层无碍，卡在 NCCL 内部协商"
+  fi
+  if grep -q "NET/IB : No device found" /tmp/sg_trace.log && ! docker inspect "$CID" --format '{{.Config.Cmd}}' | grep -q infiniband; then
+    echo "  - 纯 Socket 形态（未挂 /dev/infiniband）：建议开 use_roce 走官方 2×Spark 配方"
+  fi
+  GH=$(docker inspect "$CID" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^GDRCOPY_HOME=' | head -1 | cut -d= -f2)
+  if [ -n "$GH" ] && ! ls -d /usr/src/gdrdrv* 2>/dev/null | grep -q "${GH##*/}"; then
+    echo "  - gdrdrv 版本与容器不一致（容器 $GH，主机无匹配）：GDRCopy 静默失败可能卡，需对齐"
+  fi
+  docker inspect "$CID" --format '{{.Config.Cmd}}' | grep -q -- '--nccl-port' && echo "  - 仍在传 --nccl-port：官方多机示例从不传它，建议设 0 对比"
+  grep -q "CustomAllreduce is disabled" /tmp/sg_trace.log && echo "  - 已进入 SGLang 组初始化：隔离测试通过时用 5.1 对比 worker env（2.29.7 镜像通过 vs 2.28.3/2.30.7 失败）"
+fi
