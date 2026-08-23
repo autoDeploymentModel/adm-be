@@ -823,7 +823,8 @@ fn ssh_opts(port: u16, key: Option<&str>) -> String {
 }
 
 /// 一键流式同步本机 SGLang 镜像到远端：
-/// `docker save <image> | [pv -s <size>] | gzip -1 | ssh <直连IP> 'gunzip | docker load'`
+/// `docker save <image> | [pv -s <size>] | ssh <直连IP> '<docker> load'`
+/// 直连光口带宽充足，不做 gzip 压缩（避免单线程压缩成为瓶颈）；
 /// 全程不落地临时 tar；进度经 `image-push-progress` 事件实时上报。
 #[tauri::command]
 pub async fn push_image_to_remote(
@@ -875,15 +876,17 @@ pub async fn push_image_to_remote(
         .unwrap_or(false);
 
     pipe_emit(&app, &ip, "image-push-progress", "save", 3, "导出并流式传输中...");
+    // 光口直连带宽充足（200GbE），不再 gzip 压缩（单线程 gzip 反而成为瓶颈）；
+    // pv 直接计量原始流，进度实时滚动。
     let remote_cmd = format!(
-        "gunzip | {} load && {} image inspect {} >/dev/null 2>&1 && echo LOAD_OK || echo LOAD_FAIL",
+        "{} load && {} image inspect {} >/dev/null 2>&1 && echo LOAD_OK || echo LOAD_FAIL",
         rdk,
         rdk,
         crate::common::ssh::sh_quote(&image)
     );
     let pipe = if has_pv && !size.is_empty() {
         format!(
-            "{} save {} | pv -f -s {} | gzip -1 | ssh {} {}@{} \"{}\"",
+            "{} save {} | pv -f -s {} | ssh {} {}@{} \"{}\"",
             dk,
             crate::common::ssh::sh_quote(&image),
             size,
@@ -894,7 +897,7 @@ pub async fn push_image_to_remote(
         )
     } else {
         format!(
-            "{} save {} | gzip -1 | ssh {} {}@{} \"{}\"",
+            "{} save {} | ssh {} {}@{} \"{}\"",
             dk,
             crate::common::ssh::sh_quote(&image),
             ssh_opts(ssh_port, key_ref),
@@ -913,10 +916,16 @@ pub async fn push_image_to_remote(
             }
         })?;
     if !ok || !stdout.contains("LOAD_OK") {
-        if !err_tail.trim().is_empty() {
-            return Err(AppError::msg(format!("远端镜像导入失败：\n{}\n{}", stdout.trim(), err_tail.trim())));
+        let mut detail = if err_tail.trim().is_empty() {
+            stdout.trim().to_string()
+        } else {
+            format!("{}\n{}", stdout.trim(), err_tail.trim())
+        };
+        // 权限失败（远端用户无 docker 权限且无免密 sudo）时给出明确引导
+        if detail.contains("permission denied") || detail.contains("LOAD_FAIL") {
+            detail.push_str("\n提示：远端用户无 docker 权限，请在直连节点将 SSH 用户加入 docker 组（sudo usermod -aG docker <user>），或配置免密 sudo（visudo 添加 <user> ALL=(ALL) NOPASSWD: ALL）后重试");
         }
-        return Err(AppError::msg(format!("远端镜像导入失败：\n{}", stdout.trim())));
+        return Err(AppError::msg(format!("远端镜像导入失败：\n{}", detail)));
     }
     pipe_emit(&app, &ip, "image-push-progress", "done", 100, "镜像同步完成");
     Ok(format!("镜像 {} 已流式同步到 {}", image, ip))
