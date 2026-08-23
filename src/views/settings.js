@@ -1017,7 +1017,7 @@ function resetParams() {
 function autoSave() { saveParams(); }
 
 function setupAutoSave() {
-  ["ctx_size", "port", "host", "sglang_image", "sglang_shm", "sg_tp", "sg_mem_frac", "sg_dtype", "sg_quant", "sg_kv_dtype", "sg_sched", "sg_max_run", "sg_max_queue", "sg_chunk", "sg_log_level", "sg_log_requests", "sg_metrics",
+  ["ctx_size", "port", "host", "sglang_image", "sglang_shm", "sg_tp", "sg_mem_frac", "sg_dtype", "sg_quant", "sg_kv_dtype", "sg_sched", "sg_max_run", "sg_max_queue", "sg_chunk", "sg_log_level", "sg_log_requests", "sg_metrics", "sg_extra_args",
    "multi_enabled", "multi_dist_port", "multi_nccl_port", "multi_roce"].forEach(function (id) {
     var el = document.getElementById(id);
     if (el) el.addEventListener("change", autoSave);
