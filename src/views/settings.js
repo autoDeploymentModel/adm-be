@@ -436,6 +436,17 @@ const template = `
           </div>
         </div>
 
+        <div class="param-group">
+          <div class="param-group-title">${_t("更多启动参数")}</div>
+          <div class="param-row" style="align-items:flex-start;">
+            <div class="param-label">${_t("额外参数")}<div class="param-key">extra_args</div></div>
+            <div class="param-input" style="max-width:480px;">
+              <textarea id="sg_extra_args" rows="4" style="width:100%;resize:vertical;background:var(--c-panel-2);border:1px solid var(--c-border);border-radius:6px;color:var(--c-text);font-size:13px;padding:8px 12px;font-family:monospace;outline:none;" placeholder="disable-cuda-graph&#10;reasoning-parser=deepseek&#10;# 注释行以 # 开头会被忽略"></textarea>
+              <div class="param-desc">${_t("每行一个参数：key=value 拼成 --key value；无等号的整行作为纯开关参数（如 disable-cuda-graph）；# 开头为注释。多机 NCCL 卡死排查可加 disable-cuda-graph")}</div>
+            </div>
+          </div>
+        </div>
+
         <button class="btn-reset" id="reset-btn">${_t("恢复默认")}</button>
       </div>
 
@@ -937,7 +948,7 @@ function getSglangArgsFromForm() {
     log_level: str("sg_log_level"),
     log_requests: bool("sg_log_requests"),
     enable_metrics: bool("sg_metrics"),
-    extra_args: "",
+    extra_args: str("sg_extra_args").trim(),
   };
 }
 
@@ -959,6 +970,7 @@ function fillSglangArgsForm(a) {
   set("sg_log_level", v.log_level || "");
   setB("sg_log_requests", v.log_requests);
   setB("sg_metrics", v.enable_metrics);
+  set("sg_extra_args", v.extra_args || "");
 }
 
 function getParamsFromForm() {

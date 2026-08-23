@@ -1102,12 +1102,21 @@ fn build_multi_node_args(
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Some((k, v)) = line.split_once('=') {
-            let k = k.trim().trim_start_matches("--");
-            let v = v.trim();
-            if !k.is_empty() && !v.is_empty() {
-                args.push(format!("--{}", k));
-                args.push(v.to_string());
+        match line.split_once('=') {
+            Some((k, v)) => {
+                let k = k.trim().trim_start_matches("--");
+                let v = v.trim();
+                if !k.is_empty() && !v.is_empty() {
+                    args.push(format!("--{}", k));
+                    args.push(v.to_string());
+                }
+            }
+            None => {
+                // 无等号：flag 型参数（如 --disable-cuda-graph 或 disable-cuda-graph）
+                let k = line.trim_start_matches("--");
+                if !k.is_empty() {
+                    args.push(format!("--{}", k));
+                }
             }
         }
     }
@@ -1820,16 +1829,24 @@ async fn start_sglang_docker(
     if !sglang_args.tool_call_parser.is_empty() {
         args.extend(["--tool-call-parser".to_string(), sglang_args.tool_call_parser.clone()]);
     }
-    // 额外参数：每行一个 key=value，拼成 --key value
+    // 额外参数：每行一个 key=value 拼成 --key value；无等号行作为纯 flag（--key）追加
     for line in sglang_args.extra_args.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') { continue; }
-        if let Some((k, v)) = line.split_once('=') {
-            let k = k.trim().trim_start_matches("--");
-            let v = v.trim();
-            if !k.is_empty() && !v.is_empty() {
-                args.push(format!("--{}", k));
-                args.push(v.to_string());
+        match line.split_once('=') {
+            Some((k, v)) => {
+                let k = k.trim().trim_start_matches("--");
+                let v = v.trim();
+                if !k.is_empty() && !v.is_empty() {
+                    args.push(format!("--{}", k));
+                    args.push(v.to_string());
+                }
+            }
+            None => {
+                let k = line.trim_start_matches("--");
+                if !k.is_empty() {
+                    args.push(format!("--{}", k));
+                }
             }
         }
     }
