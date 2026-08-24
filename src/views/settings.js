@@ -727,21 +727,9 @@ async function pushImageToRemote() {
   const n = mnNodes[1];
   if (!n) return;
   if (mnImgSyncBusy || (btn && btn.disabled)) return;
-  const image = (() => {
-    const model = (window.__ADM_STATE && window.__ADM_STATE.modelList || []).find(m => {
-      const rid = window.__ADM_STATE && window.__ADM_STATE.runningModelId;
-      return rid && m.model_id === rid;
-    });
-    return (model && model.vllm_image) || "";
-  })();
-  if (!image) {
-    showToast(_t("未找到当前模型的镜像配置"), true);
-    return;
-  }
   mnImgSyncBusy = true;
   setMnBtnBusy(btn, true, _t("镜像同步中..."));
-  mnImgSyncName = image;
-  mnImgSyncStatus = _t("正在同步") + " " + image;
+  mnImgSyncStatus = _t("正在枚举本机镜像...");
   if (statusEl) statusEl.textContent = mnImgSyncStatus;
   try {
     const res = await invoke()("push_image_to_remote", {
@@ -749,7 +737,6 @@ async function pushImageToRemote() {
       user: n.sshUser,
       port: n.sshPort || 22,
       key: null,
-      image: image,
     });
     if (statusEl) statusEl.textContent = String(res);
     mnImgSyncStatus = String(res);

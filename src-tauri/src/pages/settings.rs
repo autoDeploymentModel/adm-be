@@ -76,21 +76,11 @@ pub async fn write_app_log(level: String, tag: String, message: String) -> Resul
     Ok(())
 }
 
-// ===== 推理引擎镜像管理 =====
+// ===== 镜像同步到直连节点 =====
 
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EngineImageInfo {
-    pub repo_tag: String,
-    pub size: String,
-    pub id: String,
-    pub in_use: bool,
-}
-
-/// 收集本地已拉取的推理引擎镜像：docker images 过滤仓库名含 vllm 或 spark-vllm 的条目，
-/// 并标记当前运行中容器正在使用的镜像（阻止删除）。
-fn collect_engine_images(state: &AppState) -> Result<Vec<EngineImageInfo>, AppError> {
-    // 用 JSON 格式输出解析（tab 列解析在部分 docker 版本上字段会错位/缺失）
+/// 列出本机所有 docker 镜像（不过滤仓库名），仅跳过 <none>:<none> 与空 ID 条目；
+/// 专供镜像同步 / 批量推送流程使用。返回的是 `repo:tag` 字符串列表。
+fn collect_all_local_images() -> Result<Vec<String>, AppError> {
     let out = crate::common::utils::platform::docker_cmd()
         .args(["images", "--no-trunc", "--format", "{{json .}}"])
         .output()
@@ -101,19 +91,7 @@ fn collect_engine_images(state: &AppState) -> Result<Vec<EngineImageInfo>, AppEr
             String::from_utf8_lossy(&out.stderr)
         )));
     }
-
-    // 当前运行中容器使用的镜像 ID（去掉 sha256: 前缀；--no-trunc 下与 images 输出同为完整 ID）
-    let mut use_id: Option<String> = None;
-    let container = state.running_container.lock().map_err(|e| e.to_string())?.clone();
-    if let Some(c) = container {
-        if let Ok(insp) = crate::common::utils::platform::docker_cmd()
-            .args(["inspect", "-f", "{{.Image}}", &c])
-            .output()
-        {
-            use_id = String::from_utf8_lossy(&insp.stdout).trim().strip_prefix("sha256:").map(|s| s.trim().to_string());
-        }
-    }
-
+    let mut seen = std::collections::HashSet::new();
     let mut images = Vec::new();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         let line = line.trim();
@@ -126,22 +104,15 @@ fn collect_engine_images(state: &AppState) -> Result<Vec<EngineImageInfo>, AppEr
         };
         let repo = v["Repository"].as_str().unwrap_or("").trim();
         let tag = v["Tag"].as_str().unwrap_or("").trim();
-        if repo.is_empty() || tag.is_empty() || tag == "<none>" {
+        if repo.is_empty() || repo == "<none>" || tag.is_empty() || tag == "<none>" {
             continue;
         }
-        // 仓库名或 tag 含 vllm 或 spark-vllm 才收（兼容 eugr/spark-vllm-b12x 等镜像名）
-        if !repo.contains("vllm") && !repo.contains("spark-vllm") && !tag.contains("vllm") && !tag.contains("spark-vllm") {
-            continue;
+        let repo_tag = format!("{}:{}", repo, tag);
+        if seen.insert(repo_tag.clone()) {
+            images.push(repo_tag);
         }
-        let id = v["ID"].as_str().unwrap_or("").trim().to_string();
-        images.push(EngineImageInfo {
-            repo_tag: format!("{}:{}", repo, tag),
-            size: v["Size"].as_str().unwrap_or("-").trim().to_string(),
-            in_use: use_id.as_deref() == Some(id.as_str()),
-            id,
-        });
     }
-    images.sort_by(|a, b| b.repo_tag.cmp(&a.repo_tag));
+    images.sort();
     Ok(images)
 }
 
@@ -798,7 +769,7 @@ fn ssh_opts(port: u16, key: Option<&str>) -> String {
     s
 }
 
-/// 一键流式同步本机 vLLM 镜像到远端：
+/// 一键流式同步本机全部 docker 镜像到远端：
 /// `docker save <image> | [pv -s <size>] | ssh <直连IP> '<docker> load'`
 /// 直连光口带宽充足，不做 gzip 压缩（避免单线程压缩成为瓶颈）；
 /// 全程不落地临时 tar；进度经 `image-push-progress` 事件实时上报。
@@ -809,35 +780,14 @@ pub async fn push_image_to_remote(
     user: String,
     port: u16,
     key: Option<String>,
-    image: String,
 ) -> Result<String, AppError> {
     crate::common::ssh::validate_host(&ip)?;
     crate::common::ssh::validate_ssh_user(&user)?;
 
-    // 全量同步本机所有推理引擎镜像（仓库名含 vllm 或 spark-vllm）；
-    // 传入的 image（来自当前运行中模型的 vllm_image）排到最前优先同步
-    let mut images: Vec<String> = Vec::new();
-    match collect_engine_images(&app.state::<AppState>()) {
-        Ok(list) => {
-            for it in list {
-                if !images.contains(&it.repo_tag) {
-                    images.push(it.repo_tag);
-                }
-            }
-        }
-        Err(e) => return Err(e),
-    }
-    let sel = image.trim();
-    if !sel.is_empty() {
-        if let Some(pos) = images.iter().position(|i| i == sel) {
-            let m = images.remove(pos);
-            images.insert(0, m);
-        } else {
-            images.insert(0, sel.to_string());
-        }
-    }
+    // 全量枚举本机所有 docker 镜像，逐个推送；远端已存在则跳过
+    let images = collect_all_local_images()?;
     if images.is_empty() {
-        return Err(AppError::msg("本机没有已下载的推理引擎镜像，请先下载镜像".to_string()));
+        return Err(AppError::msg("本机没有可同步的 docker 镜像".to_string()));
     }
 
     let ssh_port = if port == 0 { 22 } else { port };
@@ -932,9 +882,9 @@ pub async fn push_image_to_remote(
     }
 }
 
-/// 一键同步本机所有已下载模型到直连节点（rsync 增量优先，无 rsync 回退 scp -r；
+/// 一键同步本机全部已下载模型到直连节点（rsync 增量优先，无 rsync 回退 scp -r；
 /// 进度经 `model-sync-progress` 事件上报；完成校验远端 .done）。
-/// 全量同步：遍历本机全部完整模型，正在运行的模型排最前；
+/// 全量扫描 `models_root` 下所有完整模型目录（带 .done 或 config.json + model.safetensors），
 /// 远端目标 = 设置页模型目录（留空自动 /home/<SSH用户>/models/<模型ID>），
 /// 已同步（远端 .done 存在）的模型自动跳过。
 #[tauri::command]
@@ -951,7 +901,7 @@ pub async fn sync_model_to_remote(
     let data_dir = config::get_data_dir(Some(&app))?;
     let models_root = data_dir.join("models");
 
-    // 本机完整模型列表（.done 或 config.json + model.safetensors）
+    // 全量扫描本机完整模型目录（按目录名顺序），不做优先级排序
     let mut local_models: Vec<(String, std::path::PathBuf)> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&models_root) {
         for entry in entries.flatten() {
@@ -968,17 +918,9 @@ pub async fn sync_model_to_remote(
             }
         }
     }
+    local_models.sort_by(|a, b| a.0.cmp(&b.0));
     if local_models.is_empty() {
         return Err(AppError::msg("本机没有已下载完成的模型，请先下载模型".to_string()));
-    }
-    // 正在运行的模型排最前（优先同步），其余保持顺序
-    if let Ok(guard) = app.state::<AppState>().running_model_id.lock() {
-        if let Some(rid) = guard.as_ref() {
-            if let Some(pos) = local_models.iter().position(|(id, _)| id == rid) {
-                let m = local_models.remove(pos);
-                local_models.insert(0, m);
-            }
-        }
     }
 
     let ssh_port = if port == 0 { 22 } else { port };
