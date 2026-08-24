@@ -852,6 +852,15 @@ async function handleStart(btn) {
 
     const device = S().currentDeviceFilter && S().currentDeviceFilter !== "all" ? S().currentDeviceFilter : null;
 
+    // 每次启动前重新拉取远程 model.json，保证 vllm_flags / vllm_image 用的是最新线上配置
+    // （用户改远程清单后无需重启应用 / 重新进入列表页；拉取失败则沿用内存列表，不阻塞启动）
+    try {
+      const fresh = await invoke()("fetch_model_list");
+      if (Array.isArray(fresh) && fresh.length) S().modelList = fresh;
+    } catch (e) {
+      console.warn("[model_list] 启动前刷新模型清单失败，沿用内存列表:", e);
+    }
+
     // 模型配置的 vllm_image（完整镜像名）→ 指定该模型使用的镜像
     const model = (S().modelList || []).find(m => m.model_id === modelId);
     const vllmImage = (model && model.vllm_image) || null;

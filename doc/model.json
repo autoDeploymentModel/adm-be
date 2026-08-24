@@ -14,7 +14,6 @@
         "vllm_flags": [
             "--trust-remote-code",
             "--tensor-parallel-size 2",
-            "--distributed-executor-backend ray",
             "--host 0.0.0.0",
             "--port 8000",
             "--kv-cache-dtype fp8_ds_mla",
@@ -31,8 +30,7 @@
             "--enable-prefix-caching",
             "--enable-expert-parallel",
             "--moe-backend auto",
-            "--attention-config {\"use_fp4_indexer_cache\":true}",
-            "--speculative-config {\"method\":\"dspark\",\"num_speculative_tokens\":3,\"draft_sample_method\":\"greedy\"}",
+            "--speculative-config {\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_sample_method\":\"greedy\"}",
             "--hf-overrides {\"dspark_noise_token_id\":128799}",
             "--default-chat-template-kwargs.thinking true",
             "--default-chat-template-kwargs.reasoning_effort high",
