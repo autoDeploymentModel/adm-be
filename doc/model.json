@@ -24,7 +24,7 @@
             "--enable-auto-tool-choice",
             "--reasoning-parser deepseek_v4",
             "--load-format fastsafetensors",
-            "--max-model-len 250000",
+            "--max-model-len 650000",
             "--max-num-seqs 8",
             "--max-num-batched-tokens 4096",
             "--gpu-memory-utilization 0.83",

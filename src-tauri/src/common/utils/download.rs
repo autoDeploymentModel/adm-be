@@ -9,6 +9,10 @@ use crate::common::error::AppError;
 /// - 如果 `part_path` 存在，从当前大小处续传（使用 HTTP Range 头）。
 /// - 下载完成后，`part_path` 会重命名为 `final_path`。
 ///
+/// 镜像策略：传入 `huggingface.co` 原 URL 后，内部先尝试 `hf-mirror.com`（国内加速），
+/// 连接失败（DNS/连接/TLS）时回退到原始 `huggingface.co`。回退时若有未完成的 `.part`
+/// 会先删除（不同源字节布局不同，避免续传错位）。
+///
 /// `on_progress` 回调在下载过程中被调用，参数为 `(progress, downloaded, total_size)`：
 /// - `progress`: 0-99 的百分比
 /// - `downloaded`: 已下载字节数（含续传已有部分）
@@ -19,6 +23,47 @@ pub async fn download_with_resume(
     final_path: &Path,
     part_path: &Path,
     on_progress: impl Fn(u8, u64, u64),
+) -> Result<(), AppError> {
+    // 镜像优先（国内加速），回退到原 URL；不同时持有 .part 续传文件，避免源切换导致字节错位
+    let candidates: Vec<String> = if let Some(rest) = url.strip_prefix("https://huggingface.co/") {
+        vec![
+            format!("https://hf-mirror.com/{}", rest),
+            url.to_string(),
+        ]
+    } else {
+        vec![url.to_string()]
+    };
+
+    let mut last_err: Option<AppError> = None;
+    for (idx, candidate) in candidates.iter().enumerate() {
+        // 切换源时丢弃已有 .part（不同源的同 offset 字节不同，续传会错位）
+        if idx > 0 && part_path.exists() {
+            let _ = std::fs::remove_file(part_path);
+        }
+        match try_download_one(client, candidate, final_path, part_path, &on_progress).await {
+            Ok(()) => return Ok(()),
+            Err(e) if is_network_error(&e) && idx + 1 < candidates.len() => {
+                crate::common::utils::logger::write_log(
+                    "WARN",
+                    "DOWNLOAD",
+                    &format!("[{}] 失败，自动切换下一源: {}", candidate, e),
+                );
+                last_err = Some(e);
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| AppError::msg("所有镜像源均失败".to_string())))
+}
+
+/// 单一 URL 的下载尝试（含断点续传）
+async fn try_download_one(
+    client: &reqwest::Client,
+    url: &str,
+    final_path: &Path,
+    part_path: &Path,
+    on_progress: &impl Fn(u8, u64, u64),
 ) -> Result<(), AppError> {
     // 文件已存在，跳过下载
     if final_path.exists() {
@@ -118,4 +163,17 @@ pub async fn download_with_resume(
         .map_err(|e| AppError::msg(format!("重命名文件失败: {}", e)))?;
 
     Ok(())
+}
+
+/// 判断错误是否属于"网络层失败"（DNS/连接/TLS 等），用于决定是否切换镜像源。
+/// HTTP 4xx/5xx 不算网络错误（重试只会拿到同样的状态码）。
+fn is_network_error(err: &AppError) -> bool {
+    let msg = err.to_string();
+    // reqwest 的 connection error / timeout 等都通过 Display 转 string 后含这些关键字
+    msg.contains("error sending request")
+        || msg.contains("dns error")
+        || msg.contains("connection")
+        || msg.contains("timeout")
+        || msg.contains("tls")
+        || msg.contains("SSL")
 }

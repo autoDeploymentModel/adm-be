@@ -256,7 +256,7 @@ pub async fn download_model(
                 .map_err(|e| format!("创建下载客户端失败: {}", e))?;
 
             for (idx, url) in files.iter().enumerate() {
-                let url = url.replace("https://huggingface.co/", "https://hf-mirror.com/");
+                // 镜像策略由 download_with_resume 内部处理（先 mirror，失败回退原 URL）
                 let filename = url
                     .rsplit('/')
                     .next()
@@ -342,8 +342,7 @@ pub async fn download_model(
         }
     }
 
-    let model_url = model_url.replace("https://huggingface.co/", "https://hf-mirror.com/");
-
+    // 镜像策略由 download_with_resume 内部处理（先 mirror，失败回退原 URL）
     let model_filename = model_url
         .rsplit('/')
         .next()
@@ -480,8 +479,7 @@ async fn download_extra_file(
     download_client: &reqwest::Client,
     file_type: &str,
 ) -> Result<(), AppError> {
-    let file_url = file_url.replace("https://huggingface.co/", "https://hf-mirror.com/");
-
+    // 镜像策略由 download_with_resume 内部处理（先 mirror，失败回退原 URL）
     let filename = file_url
         .rsplit('/')
         .next()
