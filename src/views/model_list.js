@@ -624,6 +624,9 @@ function renderModelTable() {
     const modelFilesAttr = model.model_download_files && model.model_download_files.length > 0
       ? ' data-model-files="' + escapeHtml(JSON.stringify(model.model_download_files)) + '"'
       : '';
+    const modelImageAttr = model.vllm_image
+      ? ' data-model-image="' + escapeHtml(model.vllm_image) + '"'
+      : '';
     let downloadBtnHtml = "";
     if (downloaded) {
       downloadBtnHtml = '';
@@ -636,9 +639,9 @@ function renderModelTable() {
     } else if (downloadingProgress !== undefined) {
       downloadBtnHtml = '<button class="btn btn-download" data-model-id="' + safeModelId + '" disabled>' + downloadingProgress + '%</button>';
     } else if (partSize && partSize > 0) {
-      downloadBtnHtml = '<button class="btn btn-download" data-model-id="' + safeModelId + '" data-model-url="' + escapeHtml(model.model_url) + '" data-model-mmproj="' + escapeHtml(model.model_mmproj || '') + '" data-model-diffusion="' + escapeHtml(model.model_diffusion || '') + '" data-model-vae="' + escapeHtml(model.model_vae || '') + '" data-model-type="' + escapeHtml(model.model_type || '') + '"' + modelFilesAttr + ' id="dl-' + safeModelId + '">' + _t("继续下载") + '</button>';
+      downloadBtnHtml = '<button class="btn btn-download" data-model-id="' + safeModelId + '" data-model-url="' + escapeHtml(model.model_url) + '" data-model-mmproj="' + escapeHtml(model.model_mmproj || '') + '" data-model-diffusion="' + escapeHtml(model.model_diffusion || '') + '" data-model-vae="' + escapeHtml(model.model_vae || '') + '" data-model-type="' + escapeHtml(model.model_type || '') + '"' + modelFilesAttr + modelImageAttr + ' id="dl-' + safeModelId + '">' + _t("继续下载") + '</button>';
     } else if (available) {
-      downloadBtnHtml = '<button class="btn btn-download" data-model-id="' + safeModelId + '" data-model-url="' + escapeHtml(model.model_url) + '" data-model-mmproj="' + escapeHtml(model.model_mmproj || '') + '" data-model-diffusion="' + escapeHtml(model.model_diffusion || '') + '" data-model-vae="' + escapeHtml(model.model_vae || '') + '" data-model-type="' + escapeHtml(model.model_type || '') + '"' + modelFilesAttr + ' id="dl-' + safeModelId + '">' + _t("下载") + '</button>';
+      downloadBtnHtml = '<button class="btn btn-download" data-model-id="' + safeModelId + '" data-model-url="' + escapeHtml(model.model_url) + '" data-model-mmproj="' + escapeHtml(model.model_mmproj || '') + '" data-model-diffusion="' + escapeHtml(model.model_diffusion || '') + '" data-model-vae="' + escapeHtml(model.model_vae || '') + '" data-model-type="' + escapeHtml(model.model_type || '') + '"' + modelFilesAttr + modelImageAttr + ' id="dl-' + safeModelId + '">' + _t("下载") + '</button>';
     } else {
       downloadBtnHtml = '<button class="btn btn-download" disabled>' + _t("下载") + '</button>';
     }
@@ -737,6 +740,7 @@ async function handleDownload(btn) {
   const modelDiffusion = btn.dataset.modelDiffusion || null;
   const modelVae = btn.dataset.modelVae || null;
   const modelType = btn.dataset.modelType || '';
+  const vllmImage = btn.dataset.modelImage || null;
   let modelFiles = null;
   if (btn.dataset.modelFiles) {
     try { modelFiles = JSON.parse(btn.dataset.modelFiles); } catch (_) { modelFiles = null; }
@@ -748,7 +752,7 @@ async function handleDownload(btn) {
   }
 
   try {
-    await invoke()("download_model", { modelId: modelId, modelUrl: modelUrl, modelMmproj: modelMmproj, modelDiffusion: modelDiffusion, modelVae: modelVae, modelType: modelType, modelFiles: modelFiles });
+    await invoke()("download_model", { modelId: modelId, modelUrl: modelUrl, modelMmproj: modelMmproj, modelDiffusion: modelDiffusion, modelVae: modelVae, modelType: modelType, modelFiles: modelFiles, vllmImage: vllmImage });
     console.log("[model_list] 下载模型 invoke 完成:", modelId);
   } catch (e) {
     console.error("[model_list] 下载失败:", e);
@@ -848,16 +852,16 @@ async function handleStart(btn) {
 
     const device = S().currentDeviceFilter && S().currentDeviceFilter !== "all" ? S().currentDeviceFilter : null;
 
-    // 模型配置的 sglang_version（完整镜像名，如 lmsysorg/sglang:dev-cu13-qwen38-27b-dflash2）→ 指定该模型使用的镜像
+    // 模型配置的 vllm_image（完整镜像名）→ 指定该模型使用的镜像
     const model = (S().modelList || []).find(m => m.model_id === modelId);
-    const sglangVersion = (model && model.sglang_version) || null;
-    // 模型配置的官方推荐启动参数（如 --mem-fraction-static 0.80）→ 优先级最高的启动参数
-    const sglangFlags = (model && model.sglang_flags) || null;
+    const vllmImage = (model && model.vllm_image) || null;
+    // 模型配置的 vllm_flags（官方推荐启动参数）→ 优先级最高
+    const vllmFlags = (model && model.vllm_flags) || null;
 
     S().startingModelId = modelId;
     renderModelTable();
 
-    await invoke()("start_model", { modelId: modelId, params: params, device: device, sglangVersion: sglangVersion, sglangFlags: sglangFlags });
+    await invoke()("start_model", { modelId: modelId, params: params, device: device, vllmImage: vllmImage, vllmFlags: vllmFlags });
     console.log("[model_list] 启动模型 invoke 完成:", modelId);
   } catch (e) {
     console.error("[model_list] 启动失败:", e);
@@ -949,6 +953,9 @@ function handleTauriEvent(type, payload) {
       break;
     }
     case "download-complete": {
+      if (payload && payload.type === "image-pull-failed") {
+        showToast(_t("镜像拉取失败：") + (payload.image || "") + _t("；请检查网络或手动 docker pull，启动前需先补拉镜像"), true);
+      }
       renderModelTable();
       break;
     }

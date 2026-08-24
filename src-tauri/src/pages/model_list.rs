@@ -213,6 +213,7 @@ pub async fn download_model(
     model_vae: Option<String>,
     model_type: String,
     model_files: Option<Vec<String>>,
+    vllm_image: Option<String>,
 ) -> Result<(), AppError> {
     {
         let state = app.state::<AppState>();
@@ -328,10 +329,15 @@ pub async fn download_model(
 
             // 全部文件下载完成：写 .done 标记（scan_local_models 排除）
             std::fs::write(model_dir.join(".done"), "").ok();
+            // 模型文件下完 → 立刻发完成事件（前端立即显示「已下载」+ 启动按钮可点）。
+            // 镜像拉取后做（见下），启动时若镜像缺失由后端 `check_docker_env` 明确报错。
+            // 顺序倒过来会让用户在镜像拉取期间（5-30 min）一直看到 100% 卡住的下载按钮。
             app.emit(
                 "download-complete",
                 serde_json::json!({ "model_id": &model_id, "type": "model", "all": true }),
             ).ok();
+            // 后台拉取对应 vLLM 镜像：失败保留 .done，前端 toast 提示但不阻止后续手动 docker pull。
+            pull_image_if_configured(&app, &model_id, vllm_image.as_deref()).await;
             return Ok(());
         }
     }
@@ -429,6 +435,43 @@ pub async fn download_model(
     Ok(())
 }
 
+/// 模型下载完成后拉取 vLLM 镜像（如果模型清单指定了 vllm_image）：
+/// - 配置缺字段（None / 空串）→ 直接跳过（启动时会被拒绝）
+/// - 镜像已存在 → 跳过拉取，秒级返回
+/// - 拉取成功 → 后续 start_vllm_docker 可直接 docker run
+/// - 拉取失败 → 写日志 + 发 model-log + toast，**不报错返回**（模型文件已落盘，
+///   用户可手动 docker pull 或重新点击下载触发重拉）
+async fn pull_image_if_configured(app: &tauri::AppHandle, model_id: &str, image: Option<&str>) {
+    let image = match image.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(v) => v.to_string(),
+        None => return,
+    };
+    match pull_docker_image(app, model_id, &image).await {
+        Ok(_) => {}
+        Err(e) => {
+            let msg = format!("镜像 {} 拉取失败（启动前需补拉）：{}", image, e);
+            crate::common::utils::logger::write_log("ERROR", "DOCKER", &format!("[{}] {}", model_id, msg));
+            let _ = app.emit(
+                "model-log",
+                serde_json::json!({
+                    "model_id": model_id,
+                    "line": format!("[ERROR] {}", msg),
+                    "source": "stderr",
+                }),
+            );
+            let _ = app.emit(
+                "download-complete",
+                serde_json::json!({
+                    "model_id": model_id,
+                    "type": "image-pull-failed",
+                    "image": &image,
+                    "error": e.to_string(),
+                }),
+            );
+        }
+    }
+}
+
 async fn download_extra_file(
     app: &tauri::AppHandle,
     model_id: &str,
@@ -491,16 +534,68 @@ async fn download_extra_file(
     Ok(())
 }
 
-/// Docker 环境预检：CLI 存在 → daemon 运行 → NVIDIA runtime 可用 → 镜像存在（缺失自动拉取，
-/// 拉取失败自动回退国内镜像源前缀）。成功返回**实际可用的镜像名**（可能是镜像源前缀版本，
-/// 后续 docker run 必须用它）；任一环节失败返回错误原因，前端以 toast / model-log 展示。
+/// Docker 环境预检：CLI 存在 → daemon 运行 → NVIDIA runtime 可用 → **镜像已存在**。
+/// **不拉取镜像**——镜像由下载流程（`download_model` → `pull_docker_image`）负责；启动时若镜像缺失直接报错，
+/// 引导用户重新触发下载。任一环节失败返回错误原因，前端以 toast / model-log 展示。
 async fn check_docker_env(
     app: &tauri::AppHandle,
     model_id: &str,
     image: &str,
 ) -> Result<String, AppError> {
+    docker_preflight(app, model_id).await?;
+
+    // 镜像必须已存在（由下载流程提前拉取）；缺失时启动直接失败
+    if !docker_image_exists(app, model_id, image).await? {
+        return Err(AppError::msg(format!(
+            "镜像 {} 尚未下载（缺失或被清理），请回到模型列表重新点击「下载」触发拉取",
+            image
+        )));
+    }
+    Ok(image.to_string())
+}
+
+/// 拉取镜像（仅由 `download_model` 在模型文件下完后调用）：
+/// CLI/daemon/GPU 预检 → 镜像存在则跳过 → 否则 `docker pull`（多源回退/超时见 pull_image）。
+/// 成功返回实际可用镜像名（可能是镜像源前缀版本），拉取失败返回错误。
+async fn pull_docker_image(
+    app: &tauri::AppHandle,
+    model_id: &str,
+    image: &str,
+) -> Result<String, AppError> {
+    docker_preflight(app, model_id).await?;
+
+    if docker_image_exists(app, model_id, image).await? {
+        crate::common::utils::logger::write_log("INFO", "DOCKER", &format!("[{}] 镜像 {} 已存在，跳过拉取", model_id, image));
+        app.emit(
+            "model-log",
+            serde_json::json!({
+                "model_id": model_id,
+                "line": format!("[Docker] 镜像 {} 已存在本地，跳过拉取", image),
+                "source": "stdout",
+            }),
+        )
+        .ok();
+        return Ok(image.to_string());
+    }
+
+    match pull_image(app, model_id, image, PULL_TIMEOUT).await {
+        Ok(true) => Ok(image.to_string()),
+        Ok(false) => Err(AppError::msg(format!(
+            "镜像 {} 拉取失败（无进度输出超时 {} 分钟）；请检查网络或镜像地址后手动执行 docker pull {}；国内网络可改用镜像加速：设置页「Docker 镜像配置」写入加速器地址（如 https://docker.1ms.run）并重启 Docker",
+            image,
+            PULL_TIMEOUT.as_secs() / 60,
+            image
+        ))),
+        Err(e) => Err(AppError::msg(format!(
+            "镜像 {} 拉取中止: {}；请检查网络或手动执行 docker pull {}",
+            image, e, image
+        ))),
+    }
+}
+
+/// CLI/daemon/GPU runtime 预检；输出镜像存在性检查外的环境信息
+async fn docker_preflight(app: &tauri::AppHandle, model_id: &str) -> Result<(), AppError> {
     let log = |line: String| {
-        // 同时写入日志文件（设置 → 运行日志可查），与事件转发并存
         crate::common::utils::logger::write_log("INFO", "DOCKER", &line);
         app.emit(
             "model-log",
@@ -537,18 +632,14 @@ async fn check_docker_env(
         .map_err(|e| AppError::msg(format!("docker info 执行失败: {}", e)))?;
     if !info.status.success() {
         let stderr = String::from_utf8_lossy(&info.stderr).to_string();
-        // 权限不足：stderr 含 "permission denied" 或 "Cannot connect to the Docker daemon"
         if stderr.contains("permission denied") || stderr.contains("access denied") {
-            return Err(AppError::msg(
-                "DOCKER_PERMISSION_DENIED".to_string(),
-            ));
+            return Err(AppError::msg("DOCKER_PERMISSION_DENIED".to_string()));
         }
         return Err(AppError::msg(
             "Docker daemon 未运行或不可访问，请先启动 Docker 服务（systemd: sudo systemctl start docker；桌面版: 打开 Docker Desktop）".to_string(),
         ));
     }
     let info_text = String::from_utf8_lossy(&info.stdout).to_string();
-    // GPU 直通检测：传统 nvidia runtime（daemon.json 配置）或 CDI 模式（/etc/cdi 挂载）任一存在即视为可用
     let has_nvidia_runtime = info_text.contains("nvidia");
     let has_cdi = info_text.contains("CDI");
     log(format!(
@@ -556,8 +647,27 @@ async fn check_docker_env(
         if has_nvidia_runtime { "可用" } else { "未配置" },
         if has_cdi { "可用" } else { "未配置" }
     ));
+    Ok(())
+}
 
-    // 3. 镜像检查；已存在则直接可用
+/// 检查本地是否存在指定镜像（含国内镜像源前缀探测）；存在返回 true
+async fn docker_image_exists(
+    app: &tauri::AppHandle,
+    model_id: &str,
+    image: &str,
+) -> Result<bool, AppError> {
+    let log = |line: String| {
+        crate::common::utils::logger::write_log("INFO", "DOCKER", &line);
+        app.emit(
+            "model-log",
+            serde_json::json!({
+                "model_id": model_id,
+                "line": line,
+                "source": "stdout",
+            }),
+        )
+        .ok();
+    };
     let inspect = crate::common::utils::platform::docker_cmd_tokio()
         .args(["image", "inspect", image])
         .output()
@@ -565,30 +675,9 @@ async fn check_docker_env(
         .map_err(|e| AppError::msg(format!("docker image inspect 执行失败: {}", e)))?;
     if inspect.status.success() {
         log(format!("[Docker] 镜像 {} 已存在", image));
-        return Ok(image.to_string());
+        return Ok(true);
     }
-
-    // 4. 镜像不存在 → 直接 docker pull（镜像加速由 daemon.json registry-mirrors
-    //    配置全局生效，见设置页「Docker 镜像配置」，不再做应用内镜像源回退）
-    match pull_image(app, model_id, image, PULL_TIMEOUT).await {
-        Ok(true) => {
-            log(format!("[Docker] 镜像 {} 拉取完成", image));
-            return Ok(image.to_string());
-        }
-        Ok(false) => {
-            log(format!("[Docker] 拉取 {} 失败，中止启动", image));
-        }
-        Err(e) => {
-            log(format!("[Docker] 拉取 {} 中止: {}", image, e));
-        }
-    }
-
-    Err(AppError::msg(format!(
-        "镜像拉取失败（单源连续 {} 分钟无输出即放弃）：{}\n请检查网络或镜像地址后手动执行: docker pull {}；\n国内网络可改用镜像加速：设置页「Docker 镜像配置」写入加速器地址（如 https://docker.1ms.run）并重启 Docker",
-        PULL_TIMEOUT.as_secs() / 60,
-        image,
-        image
-    )))
+    Ok(false)
 }
 
 /// 单源镜像拉取「闲置」超时（3 分钟）：仅当 stdout/stderr 连续 3 分钟无任何输出
@@ -747,8 +836,8 @@ async fn pull_image(
         });
     }
 
-    // 闲置超时熔断：仅当连续 timeout 无任何输出（进度停滞/卡死）才终止，
-    // 由调用方（check_docker_env 多源回退循环）切换到下一个来源；进度在动则永远等待
+    // 闲置超时熔断：仅当连续 timeout 无任何输出（进度停滞/卡死）才终止；
+    // 进度在动则永远等待
     tokio::select! {
         status = child.wait() => {
             let status = status.map_err(|e| AppError::msg(format!("docker pull 等待失败: {}", e)))?;
@@ -829,7 +918,7 @@ fn parse_pull_percent(raw: &str) -> Option<u8> {
 
 // ===== 多机互联（2+ 台 DGX Spark 集群）=====
 // 设计文档：doc/dgx-spark-multinode-plan.md。
-// 原则：单机路径（start_sglang_docker）零改动；仅当设置页 multi_node_args.enabled 且节点数 >= 2 时走本分支。
+// 原则：单机路径（start_vllm_docker）零改动；仅当设置页 multi_node_args.enabled 且节点数 >= 2 时走本分支。
 
 /// 前台运行 docker run（多机 rank 0 用）：Windows 直接 spawn，Unix 新建进程组便于整树清理
 #[cfg(target_os = "windows")]
@@ -852,18 +941,18 @@ fn spawn_docker_run(args: &[String]) -> std::io::Result<std::process::Child> {
 }
 
 /// 从 config.json 读取多机配置（不存在/解析失败回默认值）
-fn load_multi_node_config(app: &tauri::AppHandle) -> (MultiNodeArgs, SglangArgs) {
+fn load_multi_node_config(app: &tauri::AppHandle) -> (MultiNodeArgs, VllmArgs) {
     let mut mn = MultiNodeArgs::default();
-    let mut sa = SglangArgs::default();
+    let mut va = VllmArgs::default();
     if let Ok(settings_path) = config::get_data_dir(Some(app)).map(|d| d.join("config.json")) {
         if let Ok(json) = std::fs::read_to_string(settings_path) {
             if let Ok(parsed) = serde_json::from_str::<Settings>(&json) {
                 mn = parsed.multi_node_args;
-                sa = parsed.sglang_args;
+                va = parsed.vllm_args;
             }
         }
     }
-    (mn, sa)
+    (mn, va)
 }
 
 /// 多机配置校验（启动前，失败列出具体原因）
@@ -879,10 +968,10 @@ fn validate_multi_node(mn: &MultiNodeArgs, port: u16) -> Result<(), AppError> {
         bail!("本机（rank 0）IP 不能为空（其他节点需通过该地址互联）");
     }
     if mn.dist_init_port == 0 {
-        bail!("引导端口（--dist-init-addr 端口）不能为 0");
+        bail!("Ray 端口（--ray-init-address）不能为 0");
     }
     if mn.dist_init_port == port {
-        bail!("引导端口 {} 与模型服务端口冲突，请在设置页修改引导端口", port);
+        bail!("Ray 端口 {} 与模型服务端口冲突，请在设置页修改 Ray 端口", port);
     }
     for (i, n) in mn.nodes.iter().enumerate() {
         if n.ip.trim().is_empty() {
@@ -915,41 +1004,6 @@ fn effective_remote_model_dir(model_dir: &str, user: &str, model_id: &str) -> St
     } else {
         format!("{}/{}", t, model_id)
     }
-}
-
-/// 模型目录是否含 MTP 权重（文件名含 mtp 且 .safetensors / .bin）
-fn has_mtp_weight(model_dir: &std::path::Path) -> bool {
-    if let Ok(entries) = std::fs::read_dir(model_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_lowercase();
-            if name.contains("mtp") && (name.ends_with(".safetensors") || name.ends_with(".bin")) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// 用户（设置页 extra_args 或模型清单 sglang_flags）是否已自定义投机解码参数
-/// 覆盖所有 speculative-* 变体及 GDN 模型的 --enable-linear-replayssm-spec
-fn spec_user_defined(sglang_args: &SglangArgs, sglang_flags: &[String]) -> bool {
-    let spec_keywords = [
-        "speculative-algorithm",
-        "speculative-num-steps",
-        "speculative-eagle-topk",
-        "speculative-num-draft-tokens",
-        "speculative-dspark-block-size",
-        "enable-linear-replayssm-spec",
-        "linear-replayssm-cache-len",
-        "speculative-ngram-max-bfs-breadth",
-    ];
-    sglang_args.extra_args.lines().any(|l| {
-        let t = l.trim().trim_start_matches('-');
-        spec_keywords.iter().any(|kw| t.starts_with(kw))
-    }) || sglang_flags.iter().any(|f| {
-        let t = f.trim_start_matches('-');
-        spec_keywords.iter().any(|kw| t.starts_with(kw))
-    })
 }
 
 /// 本机通过 IP 反查网卡名：`ip -o -4 addr show to <IP>` 取接口名。
@@ -990,37 +1044,23 @@ async fn detect_remote_iface(
     if name.is_empty() { None } else { Some(name) }
 }
 
-/// 构建某 rank 的完整 docker run 参数（多机模式）。
-///
-/// 与单机的差异：`--network host`（替代 -p 端口映射，NCCL 跨机必需）；
-/// 多机参数（--tp N --nnodes N --node-rank R --dist-init-addr）置于命令**最后**，
-/// 保证跨节点 TP 拓扑不被设置页/模型清单的同名参数覆盖。
-/// 设置页 sglang_args / MTP 自动启用 / 模型清单 sglang_flags 拼接规则与单机一致。
-/// `iface`：自动从节点 IP 反查的网卡名，注入 NCCL_SOCKET_IFNAME / GLOO_SOCKET_IFNAME；
-///          None 时不注入（NCCL 自动发现）。
-/// `has_infiniband`：目标节点是否有 /dev/infiniband（本机直接检测，远端经 SSH 预检）。
-fn build_multi_node_args(
-    model_id: &str,
-    model_dir: &std::path::Path,
-    image: &str,
+/// 共享 docker run 前缀（多机 head/worker 都用）：
+/// `--name --gpus --shm-size --cap-add --ulimit --ipc host --network host` +
+/// 可选 `--device /dev/infiniband` + 可选 `-e NCCL_SOCKET_IFNAME/GLOO_SOCKET_IFNAME` +
+/// `multi_node_args.extra_env` 每行 `-e KEY=VALUE` + `NCCL_DEBUG=INFO` 默认值。
+fn build_common_docker_prefix(
+    container_name: &str,
     shm_size: &str,
-    port: u16,
-    sglang_args: &SglangArgs,
-    sglang_flags: &Option<Vec<String>>,
-    mn: &MultiNodeArgs,
-    rank: usize,
-    node0_ip: &str,
     iface: Option<&str>,
     has_infiniband: bool,
+    mn_extra_env: &str,
 ) -> Vec<String> {
-    let container_name = format!("adm-sglang-{}-rank-{}", model_id, rank);
-    let mount_dst = format!("/models/{}", model_id);
     let mut args: Vec<String> = vec![
         "run".to_string(),
         "-e".to_string(),
         "PYTHONWARNINGS=ignore::FutureWarning".to_string(),
         "--name".to_string(),
-        container_name,
+        container_name.to_string(),
         "--gpus".to_string(),
         "all".to_string(),
         "--shm-size".to_string(),
@@ -1038,11 +1078,12 @@ fn build_multi_node_args(
         "--network".to_string(),
         "host".to_string(),
     ];
-    // 目标节点有 /dev/infiniband 时挂载（DGX Spark 有 IB 网卡；无 IB 的机型自动跳过）
+    // DGX Spark 有 IB 网卡；其他机型无 IB 自动跳过
     if has_infiniband {
         args.push("--device".to_string());
         args.push("/dev/infiniband".to_string());
     }
+    // 网卡名注入 NCCL/GLOO（多机 collective 必需）；None 时让 NCCL 自动发现
     if let Some(iface_name) = iface.filter(|s| !s.trim().is_empty()) {
         args.extend([
             "-e".to_string(),
@@ -1051,9 +1092,9 @@ fn build_multi_node_args(
             format!("GLOO_SOCKET_IFNAME={}", iface_name.trim()),
         ]);
     }
-    // 额外容器环境变量（每行 KEY=VALUE → -e KEY=VALUE；用于 NCCL 排查如 NCCL_DEBUG=TRACE / NCCL_SOCKET_NTHREADS=1）
+    // 设置页「额外环境变量」每行 KEY=VALUE → -e KEY=VALUE（NCCL 排查如 NCCL_DEBUG=TRACE / NCCL_SOCKET_NTHREADS=1）
     let mut extra_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for line in mn.extra_env.lines() {
+    for line in mn_extra_env.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -1068,73 +1109,66 @@ fn build_multi_node_args(
             }
         }
     }
-    // NCCL_DEBUG 默认 INFO（extra_env 未显式设置时注入）
+    // NCCL_DEBUG 默认 INFO（extra_env 未显式设置时注入；与 doc §4.4 的 WARN 略有差异，便于双机排障）
     if !extra_keys.contains("NCCL_DEBUG") {
         args.push("-e".to_string());
         args.push("NCCL_DEBUG=INFO".to_string());
     }
-    args.push("-v".to_string());
-    args.push(format!(
-        "{}:{}{}",
-        model_dir.to_string_lossy(),
-        mount_dst,
-        ":ro"
-    ));
-    args.push(image.to_string());
-    args.push("python3".to_string());
-    args.push("-m".to_string());
-    args.push("sglang.launch_server".to_string());
-    args.push("--model-path".to_string());
-    args.push(mount_dst);
-    args.push("--host".to_string());
-    args.push("0.0.0.0".to_string());
-    args.push("--port".to_string());
-    args.push(port.to_string());
+    args
+}
 
-    // ===== 设置页 SGLang 详细参数（仅非空/非默认值，规则同单机）=====
-    if sglang_args.context_length > 0 {
-        args.extend(["--context-length".to_string(), sglang_args.context_length.to_string()]);
+/// 把 vllm_args 拼接为 `--key value` 追加到 args；规则同 start_vllm_docker（仅非空/非默认值）。
+/// `ctx_size`：设置页 launch_params.ctx_size（>0 时追加 `--max-model-len`，0/None = 模型自带默认）。
+/// 全大写 KEY=VALUE 行视为环境变量误填，跳过并提示（避免误写成 --NCCL_DEBUG 之类 CLI 参数）。
+fn push_vllm_args(args: &mut Vec<String>, vllm_args: &VllmArgs, ctx_size: Option<i32>) {
+    if let Some(ctx) = ctx_size {
+        if ctx > 0 {
+            args.extend(["--max-model-len".to_string(), ctx.to_string()]);
+        }
     }
-    if sglang_args.mem_fraction_static > 0.0 {
-        args.extend(["--mem-fraction-static".to_string(), format!("{}", sglang_args.mem_fraction_static)]);
+    if vllm_args.tensor_parallel_size > 1 {
+        args.extend(["--tensor-parallel-size".to_string(), vllm_args.tensor_parallel_size.to_string()]);
     }
-    if !sglang_args.dtype.is_empty() {
-        args.extend(["--dtype".to_string(), sglang_args.dtype.clone()]);
+    if vllm_args.gpu_memory_utilization > 0.0 {
+        args.extend(["--gpu-memory-utilization".to_string(), format!("{}", vllm_args.gpu_memory_utilization)]);
     }
-    if !sglang_args.quantization.is_empty() {
-        args.extend(["--quantization".to_string(), sglang_args.quantization.clone()]);
+    if !vllm_args.quantization.is_empty() {
+        args.extend(["--quantization".to_string(), vllm_args.quantization.clone()]);
     }
-    if !sglang_args.kv_cache_dtype.is_empty() {
-        args.extend(["--kv-cache-dtype".to_string(), sglang_args.kv_cache_dtype.clone()]);
+    if !vllm_args.kv_cache_dtype.is_empty() {
+        args.extend(["--kv-cache-dtype".to_string(), vllm_args.kv_cache_dtype.clone()]);
     }
-    if !sglang_args.schedule_policy.is_empty() {
-        args.extend(["--schedule-policy".to_string(), sglang_args.schedule_policy.clone()]);
+    if !vllm_args.reasoning_parser.is_empty() {
+        args.extend(["--reasoning-parser".to_string(), vllm_args.reasoning_parser.clone()]);
     }
-    if sglang_args.max_running_requests > 0 {
-        args.extend(["--max-running-requests".to_string(), sglang_args.max_running_requests.to_string()]);
+    if !vllm_args.tool_call_parser.is_empty() {
+        args.extend(["--tool-call-parser".to_string(), vllm_args.tool_call_parser.clone()]);
     }
-    if sglang_args.max_queued_requests > 0 {
-        args.extend(["--max-queued-requests".to_string(), sglang_args.max_queued_requests.to_string()]);
+    if vllm_args.trust_remote_code {
+        args.push("--trust-remote-code".to_string());
     }
-    if sglang_args.chunked_prefill_size != 0 {
-        args.extend(["--chunked-prefill-size".to_string(), sglang_args.chunked_prefill_size.to_string()]);
+    if vllm_args.enable_auto_tool_choice {
+        args.push("--enable-auto-tool-choice".to_string());
     }
-    if !sglang_args.log_level.is_empty() && sglang_args.log_level != "info" {
-        args.extend(["--log-level".to_string(), sglang_args.log_level.clone()]);
+    if !vllm_args.distributed_executor_backend.is_empty() {
+        args.extend(["--distributed-executor-backend".to_string(), vllm_args.distributed_executor_backend.clone()]);
     }
-    if sglang_args.log_requests {
-        args.push("--log-requests".to_string());
+    if !vllm_args.load_format.is_empty() {
+        args.extend(["--load-format".to_string(), vllm_args.load_format.clone()]);
     }
-    if sglang_args.enable_metrics {
-        args.push("--enable-metrics".to_string());
+    if vllm_args.block_size > 0 {
+        args.extend(["--block-size".to_string(), vllm_args.block_size.to_string()]);
     }
-    if !sglang_args.reasoning_parser.is_empty() {
-        args.extend(["--reasoning-parser".to_string(), sglang_args.reasoning_parser.clone()]);
+    if !vllm_args.tokenizer_mode.is_empty() {
+        args.extend(["--tokenizer-mode".to_string(), vllm_args.tokenizer_mode.clone()]);
     }
-    if !sglang_args.tool_call_parser.is_empty() {
-        args.extend(["--tool-call-parser".to_string(), sglang_args.tool_call_parser.clone()]);
+    if vllm_args.max_num_seqs > 0 {
+        args.extend(["--max-num-seqs".to_string(), vllm_args.max_num_seqs.to_string()]);
     }
-    for line in sglang_args.extra_args.lines() {
+    if vllm_args.max_num_batched_tokens != 0 {
+        args.extend(["--max-num-batched-tokens".to_string(), vllm_args.max_num_batched_tokens.to_string()]);
+    }
+    for line in vllm_args.extra_args.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -1144,8 +1178,6 @@ fn build_multi_node_args(
                 let k = k.trim().trim_start_matches("--");
                 let v = v.trim();
                 if !k.is_empty() && !v.is_empty() {
-                    // 全大写 + 数字/下划线 = 疑似环境变量误填（如 NCCL_DEBUG=TRACE）：
-                    // 不是 SGLang 参数，跳过并提示，避免 --NCCL_DEBUG 启动失败
                     if k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') && k.len() > 1 {
                         crate::common::utils::logger::write_log(
                             "WARN",
@@ -1159,7 +1191,7 @@ fn build_multi_node_args(
                 }
             }
             None => {
-                // 无等号：flag 型参数（如 --disable-cuda-graph 或 disable-cuda-graph）
+                // 无等号：flag 型参数（如 disable-cuda-graph 或 --disable-cuda-graph）
                 let k = line.trim_start_matches("--");
                 if !k.is_empty() {
                     args.push(format!("--{}", k));
@@ -1167,71 +1199,117 @@ fn build_multi_node_args(
             }
         }
     }
+}
 
-    // ===== MTP 自动启用（规则同单机）=====
-    let flags = sglang_flags.as_deref().unwrap_or(&[]);
-    if has_mtp_weight(model_dir) && !spec_user_defined(sglang_args, flags) {
-        args.extend([
-            "--speculative-algorithm".to_string(),
-            "EAGLE".to_string(),
-            "--speculative-num-steps".to_string(),
-            "3".to_string(),
-            "--speculative-eagle-topk".to_string(),
-            "1".to_string(),
-            "--speculative-num-draft-tokens".to_string(),
-            "4".to_string(),
-        ]);
+/// 把模型清单 vllm_flags 拼接为 `--key value` 追加到 args（每条 `--key value` 或 `--flag`，start_vllm_docker 同规则）。
+fn push_vllm_flags(args: &mut Vec<String>, vllm_flags: &Option<Vec<String>>) {
+    let flags = vllm_flags.as_deref().unwrap_or(&[]);
+    if flags.is_empty() {
+        return;
     }
-
-    // ===== 模型清单 sglang_flags（规则同单机，追加即生效）=====
-    if !flags.is_empty() {
-        for raw in flags {
-            let raw = raw.trim();
-            if raw.is_empty() {
-                continue;
-            }
-            let (k, v) = match raw.split_once(char::is_whitespace) {
-                Some((k, v)) => (k, v.trim()),
-                None => (raw, ""),
-            };
-            let k = k.trim_start_matches("--");
-            if k.is_empty() {
-                continue;
-            }
-            args.push(format!("--{}", k));
-            if !v.is_empty() {
-                args.push(v.to_string());
-            }
+    for raw in flags {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let (k, v) = match raw.split_once(char::is_whitespace) {
+            Some((k, v)) => (k, v.trim()),
+            None => (raw, ""),
+        };
+        let k = k.trim_start_matches("--");
+        if k.is_empty() {
+            continue;
+        }
+        args.push(format!("--{}", k));
+        if !v.is_empty() {
+            args.push(v.to_string());
         }
     }
+}
 
-    // ===== 多机参数（最后追加，跨节点并行拓扑不可被覆盖）=====
+/// 多机 head（本机 rank 0）docker run 参数：跑 `vllm serve` + Ray 后端，
+/// 末尾固定追加 `--distributed-executor-backend ray --nnodes N --node-rank 0
+/// --tensor-parallel-size N --ray-init-address 127.0.0.1:<dist_init_port>`，
+/// 保证跨节点 TP 拓扑不被设置页/模型清单同名参数覆盖。
+fn build_multi_node_head_args(
+    model_id: &str,
+    model_dir: &std::path::Path,
+    image: &str,
+    shm_size: &str,
+    port: u16,
+    vllm_args: &VllmArgs,
+    vllm_flags: &Option<Vec<String>>,
+    mn: &MultiNodeArgs,
+    iface: Option<&str>,
+    has_infiniband: bool,
+    ctx_size: Option<i32>,
+) -> Vec<String> {
+    let container_name = format!("adm-vllm-{}-rank-0", model_id);
+    let mount_dst = format!("/models/{}", model_id);
+    let mut args = build_common_docker_prefix(&container_name, shm_size, iface, has_infiniband, &mn.extra_env);
+    args.push("-v".to_string());
+    args.push(format!("{}:{}:ro", model_dir.to_string_lossy(), mount_dst));
+    args.push(image.to_string());
+    args.push("vllm".to_string());
+    args.push("serve".to_string());
+    args.push(mount_dst.clone());
+    args.push("--host".to_string());
+    args.push("0.0.0.0".to_string());
+    args.push("--port".to_string());
+    args.push(port.to_string());
+
+    push_vllm_args(&mut args, vllm_args, ctx_size);
+    push_vllm_flags(&mut args, vllm_flags);
+
     let n_nodes = mn.nodes.len();
-    let is_pp = mn.parallel_mode.trim().eq_ignore_ascii_case("pp");
-    let parallel_flag = if is_pp {
-        "--pipeline-parallel-size"
-    } else {
-        "--tensor-parallel-size"
-    };
     args.extend([
-        parallel_flag.to_string(),
-        n_nodes.to_string(),
+        "--distributed-executor-backend".to_string(),
+        "ray".to_string(),
         "--nnodes".to_string(),
         n_nodes.to_string(),
         "--node-rank".to_string(),
-        rank.to_string(),
-        "--dist-init-addr".to_string(),
-        format!("{}:{}", node0_ip, mn.dist_init_port),
+        "0".to_string(),
+        "--tensor-parallel-size".to_string(),
+        n_nodes.to_string(),
+        "--ray-init-address".to_string(),
+        format!("127.0.0.1:{}", mn.dist_init_port),
     ]);
-    if mn.nccl_port > 0 {
-        args.extend(["--nccl-port".to_string(), mn.nccl_port.to_string()]);
-    }
+    args
+}
+
+/// 多机 worker（远端 rank i）docker run 参数：跑 `python -m vllm.distributed.ray_utils`
+/// 加入 head 的 Ray 集群（`--ray-address <head_ip>:<dist_init_port>`）；不跑 vllm serve。
+/// 与单机差异：仅共享 docker 前缀 + 模型挂载，entrypoint 是 Ray worker。
+/// 启动顺序：先起 worker（加入 Ray head），再起 head 的 vllm serve。
+fn build_multi_node_worker_args(
+    model_id: &str,
+    model_dir: &std::path::Path,
+    image: &str,
+    shm_size: &str,
+    rank: usize,
+    node0_ip: &str,
+    mn: &MultiNodeArgs,
+    iface: Option<&str>,
+    has_infiniband: bool,
+) -> Vec<String> {
+    let container_name = format!("adm-vllm-{}-rank-{}", model_id, rank);
+    let mount_dst = format!("/models/{}", model_id);
+    let mut args = build_common_docker_prefix(&container_name, shm_size, iface, has_infiniband, &mn.extra_env);
+    args.push("-v".to_string());
+    args.push(format!("{}:{}:ro", model_dir.to_string_lossy(), mount_dst));
+    args.push(image.to_string());
+    // Ray worker entrypoint（eugr/spark-vllm fork 自定义模块；upstream vLLM 无此 CLI）
+    args.push("python".to_string());
+    args.push("-m".to_string());
+    args.push("vllm.distributed.ray_utils".to_string());
+    args.push("--ray-address".to_string());
+    args.push(format!("{}:{}", node0_ip, mn.dist_init_port));
     args
 }
 
 /// 本机（rank 0）docker run 容器名（多机停止时据此识别多机模式）
 fn multi_container_name(model_id: &str, rank: usize) -> String {
-    format!("adm-sglang-{}-rank-{}", model_id, rank)
+    format!("adm-vllm-{}-rank-{}", model_id, rank)
 }
 
 /// 停止已启动的远端节点容器（启动失败回滚 / 停止模型共用）
@@ -1281,11 +1359,11 @@ async fn start_multi_node(
     model_id: &str,
     model_dir: &std::path::Path,
     params: LaunchParams,
-    sglang_version: Option<String>,
-    sglang_flags: Option<Vec<String>>,
+    vllm_image: Option<String>,
+    vllm_flags: Option<Vec<String>>,
 ) -> Result<(), AppError> {
-    let (mn, sglang_args) = load_multi_node_config(app);
-    let port: u16 = params.port.unwrap_or(5678);
+    let (mn, vllm_args) = load_multi_node_config(app);
+    let port: u16 = params.port.unwrap_or(8000);
     validate_multi_node(&mn, port)?;
     let n_nodes = mn.nodes.len();
     let key: Option<String> = if mn.ssh_key_path.trim().is_empty() {
@@ -1295,20 +1373,15 @@ async fn start_multi_node(
     };
     let key_ref = key.as_deref();
 
-    // 镜像 / 共享内存：设置页优先，缺省用机型默认（规则同单机）
-    let default_image = "lmsysorg/sglang:v0.5.17";
+    // 镜像由远程 model.json 的 vllm_image 字段唯一指定（每模型独立配置），缺字段视为清单错误。
+    let image = vllm_image
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::msg(format!("模型 {} 缺少 vllm_image 配置（远程 model.json 必填）", model_id)))?
+        .to_string();
     let default_shm = "64g";
-    let mut image = if sglang_args.image.is_empty() { default_image.to_string() } else { sglang_args.image.clone() };
-    if let Some(ver) = sglang_version.as_deref().map(str::trim) {
-        if !ver.is_empty() {
-            image = if ver.contains('/') || ver.starts_with("lmsysorg/") {
-                ver.to_string()
-            } else {
-                format!("lmsysorg/sglang:{}", ver)
-            };
-        }
-    }
-    let shm_size = if sglang_args.shm_size.is_empty() { default_shm.to_string() } else { sglang_args.shm_size.clone() };
+    let shm_size = if vllm_args.shm_size.is_empty() { default_shm.to_string() } else { vllm_args.shm_size.clone() };
 
     // 本机 Docker 预检（CLI / daemon / GPU runtime / 镜像，含自动 pull）
     let image = check_docker_env(app, model_id, &image).await?;
@@ -1319,24 +1392,22 @@ async fn start_multi_node(
             bail!("端口 {} 已被占用，请先关闭占用该端口的进程，或在设置页更换监听端口", port);
         }
     }
-    // 引导端口占用检查
+    // Ray 端口占用检查（worker 通过该端口 join head 的 Ray 集群）
     {
         let probe = std::net::TcpListener::bind(("0.0.0.0", mn.dist_init_port));
         if probe.is_err() {
-            bail!("引导端口 {} 已被占用，请在设置页更换引导端口", mn.dist_init_port);
+            bail!("Ray 端口 {} 已被占用，请在设置页更换 Ray 端口", mn.dist_init_port);
         }
     }
 
-    let is_pp = mn.parallel_mode.trim().eq_ignore_ascii_case("pp");
-    let mode_label = if is_pp { "PP" } else { "TP" };
     crate::common::utils::logger::write_log(
         "INFO",
         "MODEL",
-        &format!("[{}] 多机模式启动：{} 个节点（{}={}），镜像 {}，节点0={}", model_id, n_nodes, mode_label, n_nodes, image, mn.nodes[0].ip),
+        &format!("[{}] 多机模式启动：{} 个节点（TP={}），镜像 {}，节点0={}", model_id, n_nodes, n_nodes, image, mn.nodes[0].ip),
     );
     let _ = app.emit("model-log", serde_json::json!({
         "model_id": model_id,
-        "line": format!("[多机] 启动 {} 节点集群（{}={}，rank0={}），镜像 {}", n_nodes, mode_label, n_nodes, mn.nodes[0].ip, image),
+        "line": format!("[多机] 启动 {} 节点集群（TP={}，rank0={}），镜像 {}", n_nodes, n_nodes, mn.nodes[0].ip, image),
         "source": "stdout",
     }));
 
@@ -1345,7 +1416,7 @@ async fn start_multi_node(
     for (i, node) in mn.nodes.iter().enumerate().skip(1) {
         let node_model_dir = effective_remote_model_dir(&node.model_dir, &node.ssh_user, model_id);
         // 预检：docker daemon / GPU / 本机所用镜像 / 模型目录（含 .done）
-        let probe = crate::common::ssh::probe_script(&node_model_dir, &image, false);
+        let probe = crate::common::ssh::probe_script(&node_model_dir, &image, false, true);
         let (ok, out, err) = crate::common::ssh::ssh_run(
             &node.ip, &node.ssh_user, node.ssh_port, key_ref, &probe,
             std::time::Duration::from_secs(20),
@@ -1385,7 +1456,7 @@ async fn start_multi_node(
             "source": "stdout",
         }));
 
-        // 启动：nohup docker run 后台运行，日志落盘 /tmp/adm_sglang_<model>_rank_<i>.log
+        // 启动：nohup docker run 后台运行，日志落盘 /tmp/adm_vllm_<model>_rank_<i>.log
         // 自动从节点 IP 反查互连网卡名
         let remote_iface = detect_remote_iface(
             &node.ip, &node.ssh_user, node.ssh_port, key_ref, &node.ip,
@@ -1411,22 +1482,19 @@ async fn start_multi_node(
                 "source": "stdout",
             }));
         }
-        let args = build_multi_node_args(
+        let args = build_multi_node_worker_args(
             model_id,
             &std::path::Path::new(&node_model_dir),
             &image,
             &shm_size,
-            port,
-            &sglang_args,
-            &sglang_flags,
-            &mn,
             i,
             &node0_ip,
+            &mn,
             remote_iface.as_deref(),
             remote_has_ib,
         );
         let container = multi_container_name(model_id, i);
-        let log_path = format!("/tmp/adm_sglang_{}_rank_{}.log", model_id, i);
+        let log_path = format!("/tmp/adm_vllm_{}_rank_{}.log", model_id, i);
         // 清理远端同名残留容器（上次启动失败/手动残留，与 rank 0 的 docker rm -f 对齐），
         // 否则 docker run --name 立即失败且不会出现在 docker ps 中
         let clean_script = crate::common::ssh::stop_container_script(&container);
@@ -1507,10 +1575,10 @@ async fn start_multi_node(
             let detail = if !tail.trim().is_empty() {
                 tail
             } else if let Some(st) = ps_a {
-                format!("容器状态：{}（日志为空，docker run 阶段即失败，可在远端查看 /tmp/adm_sglang_{}_rank_{}.log）", st, model_id, i)
+                format!("容器状态：{}（日志为空，docker run 阶段即失败，可在远端查看 /tmp/adm_vllm_{}_rank_{}.log）", st, model_id, i)
             } else {
                 let hint = if poll_fail > 0 { format!("远端 SSH 轮询失败 {} 次；", poll_fail) } else { String::new() };
-                format!("{}30s 内未进入运行状态（未看到容器，docker run 可能立即失败，可在远端查看 /tmp/adm_sglang_{}_rank_{}.log）", hint, model_id, i)
+                format!("{}30s 内未进入运行状态（未看到容器，docker run 可能立即失败，可在远端查看 /tmp/adm_vllm_{}_rank_{}.log）", hint, model_id, i)
             };
             crate::common::utils::logger::write_log("ERROR", "MODEL", &format!("[{}] 远端节点 {} 容器启动失败:\n{}", model_id, node.ip, detail));
             bail!("远端节点 {}（rank {}）容器启动失败，已回滚停止已启动节点：\n{}", node.ip, i, detail);
@@ -1538,11 +1606,11 @@ async fn start_multi_node(
         }));
     }
     let local_has_ib = std::path::Path::new("/dev/infiniband").exists();
-    let args0 = build_multi_node_args(
-        model_id, model_dir, &image, &shm_size, port, &sglang_args, &sglang_flags, &mn, 0, &node0_ip, local_iface.as_deref(), local_has_ib,
+    let args0 = build_multi_node_head_args(
+        model_id, model_dir, &image, &shm_size, port, &vllm_args, &vllm_flags, &mn, local_iface.as_deref(), local_has_ib, params.ctx_size,
     );
 
-    dbg_log!("[DEBUG] sglang multi-node docker args (rank0): {:?}", args0);
+    dbg_log!("[DEBUG] vllm multi-node docker args (rank0): {:?}", args0);
     let _ = app.emit("model-log", serde_json::json!({
         "model_id": model_id,
         "line": format!("[多机] 本机（rank 0）启动容器 {}", container0),
@@ -1602,12 +1670,13 @@ async fn start_multi_node(
             Some(std::thread::spawn(move || {
                 let reader = BufReader::new(stdout);
                 for line in reader.lines().map_while(Result::ok) {
-                    crate::common::utils::logger::write_log("INFO", "SGLang", &line);
+                    crate::common::utils::logger::write_log("INFO", "vLLM", &line);
                     app_c.emit("model-log", serde_json::json!({
                         "model_id": &mid, "line": line.clone(), "source": "stdout",
                     })).ok();
                     if line.contains("Uvicorn running on")
-                        || line.contains("The server is fired up and ready to rock!")
+                        || line.contains("Application startup complete")
+                        || line.contains("Starting vLLM API server")
                     {
                         app_c.emit("model-started", serde_json::json!({
                             "model_id": &mid, "port": port,
@@ -1625,7 +1694,7 @@ async fn start_multi_node(
             Some(std::thread::spawn(move || {
                 let reader = BufReader::new(stderr);
                 for line in reader.lines().map_while(Result::ok) {
-                    crate::common::utils::logger::write_log("WARN", "SGLang", &line);
+                    crate::common::utils::logger::write_log("WARN", "vLLM", &line);
                     app_c.emit("model-log", serde_json::json!({
                         "model_id": &mid, "line": line, "source": "stderr",
                     })).ok();
@@ -1711,7 +1780,7 @@ async fn start_multi_node(
                         }
                         Ok((_, out, _)) if out.contains("Exited") || out.contains("Dead") => {
                             checked = true;
-                            let log_path = format!("/tmp/adm_sglang_{}_rank_{}.log", mid, i);
+                            let log_path = format!("/tmp/adm_vllm_{}_rank_{}.log", mid, i);
                             let tail = crate::common::ssh::ssh_run_blocking(
                                 &node.ip, &node.ssh_user, node.ssh_port, key_ref,
                                 &format!("tail -n 30 {}", crate::common::ssh::sh_quote(&log_path)),
@@ -1744,61 +1813,56 @@ async fn start_multi_node(
     Ok(())
 }
 
-/// SGLang Docker 启动（Ubuntu / DGX Spark 等机型）。
+/// vLLM Docker 启动（Ubuntu / DGX Spark 等机型）。
 /// 模型目录以只读方式挂载进容器，容器前台运行（生命周期 = docker run 进程），
-/// 就绪信号：stdout 出现 "Uvicorn running on"（SGLang 启动完成）。
-async fn start_sglang_docker(
+/// 就绪信号：stdout 出现 "Application startup complete" / "Starting vLLM API server" / "Uvicorn running on"。
+async fn start_vllm_docker(
     app: &tauri::AppHandle,
     state: &tauri::State<'_, AppState>,
     model_id: &str,
     model_dir: &std::path::Path,
     params: LaunchParams,
     device: Option<String>,
-    sglang_version: Option<String>,
-    sglang_flags: Option<Vec<String>>,
+    vllm_image: Option<String>,
+    vllm_flags: Option<Vec<String>>,
 ) -> Result<(), AppError> {
-    const CONTAINER_PREFIX: &str = "adm-sglang-";
+    const CONTAINER_PREFIX: &str = "adm-vllm-";
     let container_name = format!("{}{}", CONTAINER_PREFIX, model_id);
 
-    // 加载设置中的 SGLang 详细参数配置
+    // 加载设置中的 vLLM 详细参数配置
     let settings_path = config::get_data_dir(Some(app))?.join("config.json");
-    let mut sglang_args = SglangArgs::default();
+    let mut vllm_args = VllmArgs::default();
     if let Ok(json) = std::fs::read_to_string(&settings_path) {
         if let Ok(parsed) = serde_json::from_str::<Settings>(&json) {
-            sglang_args = parsed.sglang_args;
+            vllm_args = parsed.vllm_args;
         }
     }
 
-    // 机型 → 启动配置（后续按机型扩展）；镜像/内存以设置页配置为准（缺省按机型兜底）
-    let default_image = match device.as_deref() {
-        Some("dgx-spark-128G") => "lmsysorg/sglang:v0.5.17",
-        _ => "lmsysorg/sglang:v0.5.17",
-    };
+    // 镜像由远程 model.json 的 vllm_image 字段唯一指定（每模型独立配置），本地不再保留硬编码兜底；
+    // 缺字段视为模型清单配置错误，直接拒绝启动。
+    let image = vllm_image
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::msg(format!("模型 {} 缺少 vllm_image 配置（远程 model.json 必填）", model_id)))?
+        .to_string();
+    crate::common::utils::logger::write_log("INFO", "DOCKER", &format!("[{}] 使用镜像 {}", model_id, image));
+    app.emit("model-log", serde_json::json!({
+        "model_id": model_id,
+        "line": format!("使用镜像 {}（模型 vllm_image）", image),
+        "source": "stdout",
+    })).ok();
     let default_shm = match device.as_deref() {
         Some("dgx-spark-128G") => "64g",
         _ => "32g",
     };
-    // 镜像优先级：模型配置 sglang_version（完整镜像名）> 设置页镜像 > 机型默认。
-    // sglang_version 直接就是完整镜像名（如 lmsysorg/sglang:dev-cu13-qwen38-27b-dflash2），原样使用不再拼接
-    let mut image = if sglang_args.image.is_empty() { default_image.to_string() } else { sglang_args.image.clone() };
-    if let Some(ver) = sglang_version.as_deref().map(str::trim) {
-        if !ver.is_empty() {
-            image = ver.to_string();
-        }
-    }
-    crate::common::utils::logger::write_log("INFO", "DOCKER", &format!("[{}] 使用镜像 {}（优先级：模型 sglang_version > 设置页 > 默认）", model_id, image));
-    app.emit("model-log", serde_json::json!({
-        "model_id": model_id,
-        "line": format!("使用镜像 {}（模型 sglang_version / 设置页 / 默认）", image),
-        "source": "stdout",
-    })).ok();
-    let shm_size = if sglang_args.shm_size.is_empty() { default_shm.to_string() } else { sglang_args.shm_size.clone() };
+    let shm_size = if vllm_args.shm_size.is_empty() { default_shm.to_string() } else { vllm_args.shm_size.clone() };
 
     // ===== 启动前 Docker 环境预检（CLI / daemon / GPU runtime / 镜像）=====
     // 返回实际可用镜像名（可能是国内镜像源前缀版本），后续 docker run 必须用它
     let image = check_docker_env(app, model_id, &image).await?;
 
-    let port: u16 = params.port.unwrap_or(5678);
+    let port: u16 = params.port.unwrap_or(8000);
     // Docker 容器内必须监听 0.0.0.0 才能经 -p 端口映射对外服务；设置页 host 不适用容器内
     let host = "0.0.0.0".to_string();
 
@@ -1821,6 +1885,31 @@ async fn start_sglang_docker(
     let mount_src = model_dir.to_string_lossy().to_string();
     let mount_dst = format!("/models/{}", model_id);
 
+    // ===== 设置页「额外环境变量」注入（与多机 build_common_docker_prefix 行为对齐）=====
+    // 每行 KEY=VALUE → -e KEY=VALUE；extra_env 已显式设置 NCCL_DEBUG 时不覆盖，未设置时默认 INFO。
+    // KEY 全大写+数字+下划线 + 长度 > 1 才视为合法（避免误把空行/残行注入）。
+    let mut extra_env_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut extra_env_args: Vec<String> = Vec::new();
+    for line in vllm_args.extra_env.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            let k = k.trim();
+            let v = v.trim();
+            if !k.is_empty() && !v.is_empty() && k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') && k.len() > 1 {
+                extra_env_keys.insert(k.to_string());
+                extra_env_args.push("-e".to_string());
+                extra_env_args.push(format!("{}={}", k, v));
+            }
+        }
+    }
+    if !extra_env_keys.contains("NCCL_DEBUG") {
+        extra_env_args.push("-e".to_string());
+        extra_env_args.push("NCCL_DEBUG=INFO".to_string());
+    }
+
     let mut args: Vec<String> = vec![
         "run".to_string(),
         "-e".to_string(),
@@ -1841,147 +1930,26 @@ async fn start_sglang_docker(
         format!("{}:{}", port, port),
         "-v".to_string(),
         format!("{}:{}:ro", mount_src, mount_dst),
-        image,
-        "python3".to_string(),
-        "-m".to_string(),
-        "sglang.launch_server".to_string(),
-        "--model-path".to_string(),
-        mount_dst,
-        "--host".to_string(),
-        host,
-        "--port".to_string(),
-        port.to_string(),
     ];
+    // 注入额外环境变量（必须在 image 之前）
+    args.extend(extra_env_args);
+    args.push(image);
+    args.push("vllm".to_string());
+    args.push("serve".to_string());
+    args.push(mount_dst);
+    args.push("--host".to_string());
+    args.push(host);
+    args.push("--port".to_string());
+    args.push(port.to_string());
 
-    // ===== 设置页 SGLang 详细参数（仅非空/非默认值才追加） =====
-    // 上下文大小：设置页 ctx_size 优先，其次 sglang_args.context_length
-    let mut ctx: i64 = params.ctx_size.unwrap_or(0) as i64;
-    if ctx <= 0 { ctx = sglang_args.context_length; }
-    if ctx > 0 {
-        args.extend(["--context-length".to_string(), ctx.to_string()]);
-    }
-    if sglang_args.tensor_parallel_size > 1 {
-        args.extend(["--tensor-parallel-size".to_string(), sglang_args.tensor_parallel_size.to_string()]);
-    }
-    if sglang_args.mem_fraction_static > 0.0 {
-        args.extend(["--mem-fraction-static".to_string(), format!("{}", sglang_args.mem_fraction_static)]);
-    }
-    if !sglang_args.dtype.is_empty() {
-        args.extend(["--dtype".to_string(), sglang_args.dtype.clone()]);
-    }
-    if !sglang_args.quantization.is_empty() {
-        args.extend(["--quantization".to_string(), sglang_args.quantization.clone()]);
-    }
-    if !sglang_args.kv_cache_dtype.is_empty() {
-        args.extend(["--kv-cache-dtype".to_string(), sglang_args.kv_cache_dtype.clone()]);
-    }
-    if !sglang_args.schedule_policy.is_empty() {
-        args.extend(["--schedule-policy".to_string(), sglang_args.schedule_policy.clone()]);
-    }
-    if sglang_args.max_running_requests > 0 {
-        args.extend(["--max-running-requests".to_string(), sglang_args.max_running_requests.to_string()]);
-    }
-    if sglang_args.max_queued_requests > 0 {
-        args.extend(["--max-queued-requests".to_string(), sglang_args.max_queued_requests.to_string()]);
-    }
-    if sglang_args.chunked_prefill_size != 0 {
-        args.extend(["--chunked-prefill-size".to_string(), sglang_args.chunked_prefill_size.to_string()]);
-    }
-    if !sglang_args.log_level.is_empty() && sglang_args.log_level != "info" {
-        args.extend(["--log-level".to_string(), sglang_args.log_level.clone()]);
-    }
-    if sglang_args.log_requests {
-        args.push("--log-requests".to_string());
-    }
-    if sglang_args.enable_metrics {
-        args.push("--enable-metrics".to_string());
-    }
-    if !sglang_args.reasoning_parser.is_empty() {
-        args.extend(["--reasoning-parser".to_string(), sglang_args.reasoning_parser.clone()]);
-    }
-    if !sglang_args.tool_call_parser.is_empty() {
-        args.extend(["--tool-call-parser".to_string(), sglang_args.tool_call_parser.clone()]);
-    }
-    // 额外参数：每行一个 key=value 拼成 --key value；无等号行作为纯 flag（--key）追加
-    for line in sglang_args.extra_args.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') { continue; }
-        match line.split_once('=') {
-            Some((k, v)) => {
-                let k = k.trim().trim_start_matches("--");
-                let v = v.trim();
-                if !k.is_empty() && !v.is_empty() {
-                    // 全大写 + 数字/下划线 = 疑似环境变量误填（如 NCCL_DEBUG=TRACE），跳过并提示
-                    if k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') && k.len() > 1 {
-                        crate::common::utils::logger::write_log(
-                            "WARN",
-                            "MODEL",
-                            &format!("extra_args 疑似环境变量误填（已忽略，请填到多机「额外环境变量」）：{}={}", k, v),
-                        );
-                        continue;
-                    }
-                    args.push(format!("--{}", k));
-                    args.push(v.to_string());
-                }
-            }
-            None => {
-                let k = line.trim_start_matches("--");
-                if !k.is_empty() {
-                    args.push(format!("--{}", k));
-                }
-            }
-        }
-    }
+    // ===== 设置页 vLLM 详细参数（仅非空/非默认值才追加） =====
+    // 统一调用 push_vllm_args（与多机 head 同源，避免遗漏新参数）
+    push_vllm_args(&mut args, &vllm_args, params.ctx_size);
 
-    // ===== MTP（Multi-Token Prediction）自动启用 =====
-    // 模型目录含 MTP 权重（如 model_mtp.safetensors）时自动启用 NEXTN 投机解码
-    // （SGLang 中 NEXTN 是 EAGLE 的别名；MTP 权重与主模型同目录，SGLang 自动加载，
-    // 无需 --speculative-draft-model-path。参考 DeepSeek-V3.2 官方用法：
-    // --speculative-algorithm EAGLE --speculative-num-steps 3
-    // --speculative-eagle-topk 1 --speculative-num-draft-tokens 4）
-    // 用户已在额外参数里自定义 speculative 相关参数时跳过（尊重覆盖，
-    // 也可用 --speculative-algorithm NONE 显式关闭）。
-    let has_mtp_weight = {
-        let mut found = false;
-        if let Ok(entries) = std::fs::read_dir(model_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_lowercase();
-                if name.contains("mtp") && (name.ends_with(".safetensors") || name.ends_with(".bin")) {
-                    found = true;
-                    break;
-                }
-            }
-        }
-        found
-    };
-    let user_specified_spec = spec_user_defined(&sglang_args, sglang_flags.as_deref().unwrap_or(&[]));
-    if has_mtp_weight && !user_specified_spec {
-        args.extend([
-            "--speculative-algorithm".to_string(),
-            "EAGLE".to_string(),
-            "--speculative-num-steps".to_string(),
-            "3".to_string(),
-            "--speculative-eagle-topk".to_string(),
-            "1".to_string(),
-            "--speculative-num-draft-tokens".to_string(),
-            "4".to_string(),
-        ]);
-        app.emit(
-            "model-log",
-            serde_json::json!({
-                "model_id": model_id,
-                "line": "[MTP] 检测到 MTP 权重，已自动启用 EAGLE 投机解码（num-steps=3, eagle-topk=1, num-draft-tokens=4）",
-                "source": "stdout",
-            }),
-        )
-        .ok();
-        crate::common::utils::logger::write_log("INFO", "MODEL", &format!("[{}] MTP 权重检测到，已启用 EAGLE 投机解码", model_id));
-    }
-
-    // ===== 模型配置 SGLang 参数（sglang_flags）=====
-    // 官方 cookbook 推荐值，最后追加，优先级最高：同名参数可覆盖设置页配置与默认值
-    //（SGLang 各参数为 argparse 后值生效）。每条格式 "--key value" 或 "--flag"。
-    if let Some(flags) = sglang_flags.as_deref().filter(|f| !f.is_empty()) {
+    // ===== 模型配置 vLLM 参数（vllm_flags）=====
+    // 最后追加，优先级最高：同名参数可覆盖设置页配置与默认值。
+    // 每条格式 "--key value" 或 "--flag"。
+    if let Some(flags) = vllm_flags.as_deref().filter(|f| !f.is_empty()) {
         let mut applied = Vec::new();
         for raw in flags {
             let raw = raw.trim();
@@ -2004,16 +1972,16 @@ async fn start_sglang_docker(
                 "model-log",
                 serde_json::json!({
                     "model_id": model_id,
-                    "line": format!("[模型配置] 已应用模型清单 sglang_flags（优先级最高）：{}", applied.join(" ")),
+                    "line": format!("[模型配置] 已应用模型清单 vllm_flags（优先级最高）：{}", applied.join(" ")),
                     "source": "stdout",
                 }),
             )
             .ok();
-            crate::common::utils::logger::write_log("INFO", "MODEL", &format!("[{}] 应用模型清单 sglang_flags: {}", model_id, applied.join(" ")));
+            crate::common::utils::logger::write_log("INFO", "MODEL", &format!("[{}] 应用模型清单 vllm_flags: {}", model_id, applied.join(" ")));
         }
     }
 
-    dbg_log!("[DEBUG] sglang docker args: {:?}", args);
+    dbg_log!("[DEBUG] vllm docker args: {:?}", args);
 
     app.emit(
         "model-log",
@@ -2092,15 +2060,16 @@ async fn start_sglang_docker(
             Some(std::thread::spawn(move || {
                 let reader = BufReader::new(stdout);
                 for line in reader.lines().map_while(Result::ok) {
-                    crate::common::utils::logger::write_log("INFO", "SGLang", &line);
+                    crate::common::utils::logger::write_log("INFO", "vLLM", &line);
                     app_c
                         .emit("model-log", serde_json::json!({
                             "model_id": &mid, "line": line.clone(), "source": "stdout",
                         }))
                         .ok();
                     // 推理引擎就绪信号
-                    if line.contains("Uvicorn running on")
-                        || line.contains("The server is fired up and ready to rock!")
+                    if line.contains("Application startup complete")
+                        || line.contains("Starting vLLM API server")
+                        || line.contains("Uvicorn running on")
                     {
                         app_c
                             .emit("model-started", serde_json::json!({
@@ -2120,7 +2089,7 @@ async fn start_sglang_docker(
             Some(std::thread::spawn(move || {
                 let reader = BufReader::new(stderr);
                 for line in reader.lines().map_while(Result::ok) {
-                    crate::common::utils::logger::write_log("WARN", "SGLang", &line);
+                    crate::common::utils::logger::write_log("WARN", "vLLM", &line);
                     app_c
                         .emit("model-log", serde_json::json!({
                             "model_id": &mid, "line": line, "source": "stderr",
@@ -2182,11 +2151,11 @@ pub async fn start_model(
     model_id: String,
     params: LaunchParams,
     device: Option<String>,
-    sglang_version: Option<String>,
-    sglang_flags: Option<Vec<String>>,
+    vllm_image: Option<String>,
+    vllm_flags: Option<Vec<String>>,
 ) -> Result<(), AppError> {
     // 统一捕获启动失败并写入本地日志
-    let result = start_model_inner(&app, &state, &model_id, params, device, sglang_version, sglang_flags).await;
+    let result = start_model_inner(&app, &state, &model_id, params, device, vllm_image, vllm_flags).await;
     if let Err(ref e) = result {
         crate::common::utils::logger::write_log("ERROR", "MODEL", &format!("[{}] 启动失败: {}", model_id, e));
     }
@@ -2199,8 +2168,8 @@ async fn start_model_inner(
     model_id: &str,
     params: LaunchParams,
     device: Option<String>,
-    sglang_version: Option<String>,
-    sglang_flags: Option<Vec<String>>,
+    vllm_image: Option<String>,
+    vllm_flags: Option<Vec<String>>,
 ) -> Result<(), AppError> {
     {
         let pid_lock = state.running_process.lock().map_err(|e| e.to_string())?;
@@ -2213,19 +2182,19 @@ async fn start_model_inner(
     let models_dir = data_dir.join("models");
     let model_dir = models_dir.join(model_id);
 
-    // ===== 新格式（safetensors 目录模型）：SGLang Docker 启动 =====
+    // ===== 新格式（safetensors 目录模型）：vLLM Docker 启动 =====
     let is_dir_model = model_dir.join(".done").exists()
         || (model_dir.join("config.json").exists() && model_dir.join("model.safetensors").exists());
     if is_dir_model {
         // 多机互联：设置页启用且节点数 >= 2 时走集群启动（单机路径不变）
         let (mn, _) = load_multi_node_config(app);
         if mn.enabled && mn.nodes.len() >= 2 {
-            return start_multi_node(app, state, model_id, &model_dir, params, sglang_version, sglang_flags).await;
+            return start_multi_node(app, state, model_id, &model_dir, params, vllm_image, vllm_flags).await;
         }
-        return start_sglang_docker(app, state, model_id, &model_dir, params, device, sglang_version, sglang_flags).await;
+        return start_vllm_docker(app, state, model_id, &model_dir, params, device, vllm_image, vllm_flags).await;
     }
 
-    // 仅支持 SGLang Docker 部署（safetensors 目录模型）
+    // 仅支持 vLLM Docker 部署（safetensors 目录模型）
     Err(AppError::msg("当前仅支持推理引擎（safetensors 目录）模型，请下载新版模型后重试"))
 }
 
@@ -2235,10 +2204,10 @@ pub async fn stop_model(app: tauri::AppHandle, state: tauri::State<'_, AppState>
         let pid_lock = state.running_process.lock().map_err(|e| e.to_string())?;
         pid_lock.ok_or("没有正在运行的模型")?
     };
-    // SGLang Docker 模式：先优雅停止容器，再兜底杀进程
+    // vLLM Docker 模式：先优雅停止容器，再兜底杀进程
     let container = state.running_container.lock().map_err(|e| e.to_string())?.clone();
     if let Some(container_name) = container {
-        // 多机模式（容器名 adm-sglang-<model>-rank-0）：先 SSH 停止所有远端节点容器
+        // 多机模式（容器名 adm-vllm-<model>-rank-0）：先 SSH 停止所有远端节点容器
         if container_name.ends_with("-rank-0") {
             let model_id = state
                 .running_model_id

@@ -42,13 +42,12 @@ pub struct RemoteModel {
     /// 适配机型列表（如 "dgx-spark-128G"）；空数组 = 所有机型可用
     #[serde(default)]
     pub model_support_devices: Vec<String>,
-    /// 模型指定的 SGLang 镜像（完整 Docker 镜像名，如 "lmsysorg/sglang:dev-cu13-qwen38-27b-dflash2"）；非空时启动直接使用
+    /// vLLM Docker 镜像（完整名，如 "eugr/spark-vllm-b12x:latest"）；由远程 model.json 唯一指定
     #[serde(default)]
-    pub sglang_version: String,
-    /// 模型指定的 SGLang 启动参数（官方 cookbook 推荐值，如 ["--mem-fraction-static 0.80"]）；
-    /// 每条为完整 `--key value` 或 `--flag`，最后追加，优先级最高（可覆盖设置页同名参数与默认值）
+    pub vllm_image: String,
+    /// vLLM 启动参数（如 ["--max-model-len 262144"]）；每条为完整 `--key value` 或 `--flag`，远程覆盖本地同名参数
     #[serde(default)]
-    pub sglang_flags: Vec<String>,
+    pub vllm_flags: Vec<String>,
     #[serde(default)]
     pub model_size: String,
     #[serde(default)]
@@ -74,9 +73,9 @@ pub struct RemoteModel {
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Settings {
     pub launch_params: LaunchParams,
-    /// SGLang 详细参数配置（Docker 部署用）
+    /// vLLM 详细参数配置（Docker 部署用）
     #[serde(default)]
-    pub sglang_args: SglangArgs,
+    pub vllm_args: VllmArgs,
     /// 多机互联配置（DGX Spark 集群，2+ 节点）；enabled=false 时走单机路径
     #[serde(default)]
     pub multi_node_args: MultiNodeArgs,
@@ -97,12 +96,9 @@ pub struct MultiNodeArgs {
     /// 节点清单（按下标即 rank；[0] 必须是本机 is_self=true）
     #[serde(default)]
     pub nodes: Vec<NodeInfo>,
-    /// 分布式引导端口（--dist-init-addr 端口，默认 6464 与 SGLang 官方一致，不得与服务端口冲突）
+    /// Ray 分布式引导端口（默认 6379，与 Ray 官方一致，不得与服务端口冲突）
     #[serde(default = "default_dist_init_port")]
     pub dist_init_port: u16,
-    /// NCCL 通信端口（0 = 自动）
-    #[serde(default)]
-    pub nccl_port: u16,
     /// 互连网卡（NCCL_SOCKET_IFNAME / GLOO_SOCKET_IFNAME，空 = 自动）
     #[serde(default)]
     pub iface: String,
@@ -112,14 +108,6 @@ pub struct MultiNodeArgs {
     /// 额外容器环境变量（每行 KEY=VALUE，注入 docker run -e KEY=VALUE；如 NCCL_DEBUG=TRACE / NCCL_SOCKET_NTHREADS=1）
     #[serde(default)]
     pub extra_env: String,
-    /// 并行模式："tp"（张量并行，默认）或 "pp"（流水线并行）
-    /// DGX Spark (GB10) 双机 TP=2 存在 NCCL all-reduce 死锁（平台级 bug），PP=2 可绕过
-    #[serde(default = "default_parallel_mode")]
-    pub parallel_mode: String,
-}
-
-fn default_parallel_mode() -> String {
-    "tp".to_string()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -138,77 +126,78 @@ pub struct NodeInfo {
 }
 
 fn default_dist_init_port() -> u16 {
-    6464
+    6379
 }
 fn default_ssh_port() -> u16 {
     22
 }
 
-/// SGLang launch_server 详细参数（设置页可手动修改，启动时拼成 `--key value`）
+/// vLLM serve 详细参数（设置页可调，启动时拼成 `--key value`）
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
-pub struct SglangArgs {
-    /// Docker 镜像（固定 tag，如 lmsysorg/sglang:v0.5.17）
-    #[serde(default = "default_sglang_image")]
-    pub image: String,
+pub struct VllmArgs {
     /// docker --shm-size
-    #[serde(default = "default_sglang_shm")]
+    #[serde(default = "default_vllm_shm")]
     pub shm_size: String,
-    /// 模型最大上下文长度（0/空 = 使用模型默认）
-    #[serde(default)]
-    pub context_length: i64,
     /// 张量并行大小
     #[serde(default)]
     pub tensor_parallel_size: i64,
-    /// 静态内存占比（0.0 = 自动）
+    /// GPU 显存利用率（0.0-1.0，0 = 自动）
     #[serde(default)]
-    pub mem_fraction_static: f32,
-    /// 模型权重/激活数据类型（auto/half/float16/bfloat16/float/float32）
-    #[serde(default)]
-    pub dtype: String,
-    /// 量化方法（空 = 不指定，NVFP4 模型自动从 config 解析）
+    pub gpu_memory_utilization: f32,
+    /// 量化方法（空 = 不指定，自动从 config 解析）
     #[serde(default)]
     pub quantization: String,
-    /// KV cache 数据类型（auto/fp8_e5m2/fp8_e4m3/bf16/nvfp4/fp4_mx_block16）
+    /// KV cache 数据类型（auto/fp8/fp8_e4m3/bf16）
     #[serde(default)]
     pub kv_cache_dtype: String,
-    /// 调度策略（fcfs/lpm/random/dfs-weight/lof/priority）
+    /// 分布式执行后端（ray/mp，空 = 单机）
     #[serde(default)]
-    pub schedule_policy: String,
-    /// 最大运行中请求数（0 = 自动）
+    pub distributed_executor_backend: String,
+    /// 加载格式（safetensors/instanttensor/auto；空 = 不指定，使用 vLLM 默认）
     #[serde(default)]
-    pub max_running_requests: i64,
-    /// 最大排队请求数（0 = 自动）
+    pub load_format: String,
+    /// Block size（DeepSeek V4 推荐 256）
+    #[serde(default = "default_vllm_block_size")]
+    pub block_size: i64,
+    /// Tokenizer 模式（deepseek_v4 等）
     #[serde(default)]
-    pub max_queued_requests: i64,
-    /// chunked prefill 大小（0 = 自动，-1 = 禁用）
-    #[serde(default)]
-    pub chunked_prefill_size: i64,
-    /// 日志级别（info/debug/warning/error/critical）
-    #[serde(default)]
-    pub log_level: String,
-    /// 记录所有请求日志
-    #[serde(default)]
-    pub log_requests: bool,
-    /// 启动 Prometheus metrics
-    #[serde(default)]
-    pub enable_metrics: bool,
-    /// 推理模型 parser（deepseek-r1/qwen3 等，推理模型专用）
-    #[serde(default)]
-    pub reasoning_parser: String,
-    /// 工具调用 parser（qwen/qwen25/deepseekv3 等）
+    pub tokenizer_mode: String,
+    /// 工具调用 parser
     #[serde(default)]
     pub tool_call_parser: String,
+    /// 推理 parser
+    #[serde(default)]
+    pub reasoning_parser: String,
+    /// 自动工具选择
+    #[serde(default = "default_true")]
+    pub enable_auto_tool_choice: bool,
+    /// 信任远程代码
+    #[serde(default = "default_true")]
+    pub trust_remote_code: bool,
+    /// 最大并发序列数（0 = 自动）
+    #[serde(default)]
+    pub max_num_seqs: i64,
+    /// 单批最大 Token 数（0 = 自动，-1 = 禁用）
+    #[serde(default)]
+    pub max_num_batched_tokens: i64,
     /// 额外参数（每行一个 `key=value`，原样拼成 --key value 追加到命令尾部）
     #[serde(default)]
     pub extra_args: String,
+    /// 额外环境变量（每行一个 `KEY=VALUE`，注入 docker run -e KEY=VALUE）
+    #[serde(default)]
+    pub extra_env: String,
 }
 
-fn default_sglang_image() -> String {
-    "lmsysorg/sglang:v0.5.17".to_string()
-}
-
-fn default_sglang_shm() -> String {
+fn default_vllm_shm() -> String {
     "64g".to_string()
+}
+
+fn default_vllm_block_size() -> i64 {
+    256
+}
+
+fn default_true() -> bool {
+    true
 }
 
 // ===== 自动更新相关结构 =====

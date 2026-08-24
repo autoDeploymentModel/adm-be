@@ -130,19 +130,23 @@ pub async fn ssh_run(
     }
 }
 
-/// 远端探活脚本：nvidia-smi 简版 + docker 版本 + 本机所用镜像存在性 + 模型目录存在性。
-/// 输出解析约定（每行 `LABEL:VALUE` 格式，label 和 value 在同一行）：
-/// `GPU:` 行 GPU 名（无 GPU 时为空）；`DOCKER:` 行 docker ServerVersion（异常时 "DOCKER_ERR"）；
-/// `IMAGE:` 行 "IMAGE_OK" / "IMAGE_MISSING"（远端是否已下载 `image`）；
+/// 远端节点探活脚本：检查 GPU / Docker daemon / 镜像 / 模型目录。
+///
+/// 输出（每行 `LABEL:VALUE` 形式，便于 strip_prefix 解析）：
+/// `GPU:` 行 GPU 名（`nvidia-smi` 探不到为空）；
+/// `DOCKER:` 行 Docker ServerVersion（异常为 `DOCKER_ERR`）；
+/// `IMAGE:` 行 `IMAGE_OK` / `IMAGE_MISSING` / `IMAGE:SKIPPED`（`check_image=false` 时输出 SKIPPED，
+///           用于未指定模型的纯环境探测场景）；
 /// `IMG_ERR:` 行镜像检查失败原因（仅 IMAGE_MISSING 时输出）；
-/// `MODEL:` 行 "MODEL_OK" / "MODEL_MISSING"。
-/// `root_mode=true`：model_dir 为模型根目录（探活时留空自动 `~/models` 或 `/home/<user>/models`），
-/// 目录存在且其中含已同步模型（任一子目录有 `.done`）即 MODEL_OK；
-/// `root_mode=false`：model_dir 为精确模型目录，目录存在且自身有 `.done` 才 MODEL_OK。
+/// `MODEL:` 行 `MODEL_OK` / `MODEL_MISSING`。
+///
+/// `model_dir_root_mode=true`：model_dir 为模型根目录，目录存在且其中任一子目录有 `.done` 即 MODEL_OK；
+/// `model_dir_root_mode=false`：model_dir 为精确模型目录，自身有 `.done` 才 MODEL_OK。
+///
 /// 注：远端无需探测网卡——SSH 可达即说明互联已通。
-pub fn probe_script(model_dir: &str, image: &str, root_mode: bool) -> String {
+pub fn probe_script(model_dir: &str, image: &str, model_dir_root_mode: bool, check_image: bool) -> String {
     let dir_q = quote_remote_path(model_dir);
-    let model_chk = if root_mode {
+    let model_chk = if model_dir_root_mode {
         format!(
             "if [ -d {d} ] && ( [ -e {d}/.done ] 2>/dev/null || ls {d}/*/.done >/dev/null 2>&1 ); then echo MODEL_OK; else echo MODEL_MISSING; fi",
             d = dir_q
@@ -154,15 +158,23 @@ pub fn probe_script(model_dir: &str, image: &str, root_mode: bool) -> String {
         )
     };
     let img = sh_quote(image);
-    // 使用 echo "LABEL:$(...)" 确保 label 和 value 在同一行，
-    // 解析端用 strip_prefix("LABEL:") 即可提取 value。
+    let image_block = if !check_image || image.is_empty() {
+        "echo \"IMAGE:SKIPPED\"".to_string()
+    } else {
+        // 使用 echo "LABEL:$(...)" 确保 label 和 value 在同一行，
+        // 解析端用 strip_prefix("LABEL:") 即可提取 value。
+        format!(
+            "echo \"IMAGE:$(sudo -n docker image inspect {img} >/dev/null 2>&1 || docker image inspect {img} >/dev/null 2>&1 && echo IMAGE_OK || echo IMAGE_MISSING)\"; \
+             if ! (sudo -n docker image inspect {img} >/dev/null 2>&1 || docker image inspect {img} >/dev/null 2>&1); then echo \"IMG_ERR:$( (sudo -n docker image inspect {img} 2>&1 || docker image inspect {img} 2>&1) | tail -1 )\"; fi",
+            img = img
+        )
+    };
     format!(
         "echo \"GPU:$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)\"; \
          echo \"DOCKER:$(sudo -n docker info --format '{{{{.ServerVersion}}}}' 2>/dev/null || docker info --format '{{{{.ServerVersion}}}}' 2>/dev/null || echo DOCKER_ERR)\"; \
-         echo \"IMAGE:$(sudo -n docker image inspect {img} >/dev/null 2>&1 || docker image inspect {img} >/dev/null 2>&1 && echo IMAGE_OK || echo IMAGE_MISSING)\"; \
-         if ! (sudo -n docker image inspect {img} >/dev/null 2>&1 || docker image inspect {img} >/dev/null 2>&1); then echo \"IMG_ERR:$( (sudo -n docker image inspect {img} 2>&1 || docker image inspect {img} 2>&1) | tail -1 )\"; fi; \
+         {img_block}; \
          echo \"MODEL:$({chk})\"",
-        img = img,
+        img_block = image_block,
         chk = model_chk
     )
 }

@@ -29,10 +29,10 @@ fn cleanup_processes(app: &tauri::AppHandle) {
     if let Some(pid) = pid_opt {
         crate::common::utils::platform::kill_process_tree(pid);
     }
-    // SGLang Docker 模式：停止并删除容器
+    // vLLM Docker 模式：停止并删除容器
     let container_opt = state.running_container.lock().ok().and_then(|l| l.clone());
     if let Some(container) = container_opt {
-        // 多机模式（容器名 adm-sglang-<model>-rank-0）：先 SSH 停止远端节点容器（尽力，3s/台）
+        // 多机模式（容器名 adm-vllm-<model>-rank-0）：先 SSH 停止远端节点容器（尽力，3s/台）
         if container.ends_with("-rank-0") {
             if let Ok(settings_path) = crate::common::config::get_data_dir(Some(app)).map(|d| d.join("config.json")) {
                 if let Ok(json) = std::fs::read_to_string(settings_path) {
@@ -48,7 +48,7 @@ fn cleanup_processes(app: &tauri::AppHandle) {
                             if node.is_self {
                                 continue;
                             }
-                            let c = format!("adm-sglang-{}-rank-{}", model_id, i);
+                            let c = format!("adm-vllm-{}-rank-{}", model_id, i);
                             let script = crate::common::ssh::stop_container_script(&c);
                             let _ = crate::common::ssh::ssh_run_blocking(
                                 &node.ip,
@@ -184,8 +184,6 @@ pub fn run() {
             settings::fix_docker_permission,
             settings::write_app_log,
             settings::clear_all_logs,
-            settings::list_engine_images,
-            settings::delete_engine_image,
             settings::get_docker_mirror_config,
             settings::save_docker_mirror_config,
             settings::multi_node_probe,

@@ -87,7 +87,7 @@ pub struct EngineImageInfo {
     pub in_use: bool,
 }
 
-/// 收集本地已拉取的推理引擎镜像：docker images 过滤仓库名含 sglang 的条目，
+/// 收集本地已拉取的推理引擎镜像：docker images 过滤仓库名含 vllm 或 spark-vllm 的条目，
 /// 并标记当前运行中容器正在使用的镜像（阻止删除）。
 fn collect_engine_images(state: &AppState) -> Result<Vec<EngineImageInfo>, AppError> {
     // 用 JSON 格式输出解析（tab 列解析在部分 docker 版本上字段会错位/缺失）
@@ -129,8 +129,8 @@ fn collect_engine_images(state: &AppState) -> Result<Vec<EngineImageInfo>, AppEr
         if repo.is_empty() || tag.is_empty() || tag == "<none>" {
             continue;
         }
-        // 仓库名或 tag 含 sglang 才收（兼容国内镜像源前缀仓库名）
-        if !repo.contains("sglang") && !tag.contains("sglang") {
+        // 仓库名或 tag 含 vllm 或 spark-vllm 才收（兼容 eugr/spark-vllm-b12x 等镜像名）
+        if !repo.contains("vllm") && !repo.contains("spark-vllm") && !tag.contains("vllm") && !tag.contains("spark-vllm") {
             continue;
         }
         let id = v["ID"].as_str().unwrap_or("").trim().to_string();
@@ -145,33 +145,7 @@ fn collect_engine_images(state: &AppState) -> Result<Vec<EngineImageInfo>, AppEr
     Ok(images)
 }
 
-/// 列出本地已拉取的推理引擎镜像（版本管理面板用）
-#[tauri::command]
-pub async fn list_engine_images(state: tauri::State<'_, AppState>) -> Result<Vec<EngineImageInfo>, AppError> {
-    collect_engine_images(&state)
-}
 
-/// 删除指定 tag 的推理引擎镜像；正在被运行中的模型使用时会拒绝删除
-#[tauri::command]
-pub async fn delete_engine_image(
-    state: tauri::State<'_, AppState>,
-    repo_tag: String,
-) -> Result<(), AppError> {
-    for img in collect_engine_images(&state)? {
-        if img.repo_tag == repo_tag && img.in_use {
-            return Err(AppError::msg("该镜像正在被运行中的模型使用，请先停止模型".to_string()));
-        }
-    }
-    let out = crate::common::utils::platform::docker_cmd()
-        .args(["rmi", &repo_tag])
-        .output()
-        .map_err(|e| AppError::msg(format!("执行 docker rmi 失败: {}", e)))?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        return Err(AppError::msg(if stderr.is_empty() { "docker rmi 失败".to_string() } else { stderr }));
-    }
-    Ok(())
-}
 
 // ===== Docker 镜像加速配置（daemon.json registry-mirrors）=====
 
@@ -413,7 +387,7 @@ pub struct ProbeResult {
     pub gpu: String,
     /// 远端 Docker ServerVersion，异常为 "DOCKER_ERR"
     pub docker: String,
-    /// 远端是否已下载本机当前使用的 SGLang 镜像
+    /// 远端是否已下载本机当前使用的 vLLM 镜像
     pub image_ok: bool,
     /// 远端模型目录（含 .done）是否存在
     pub model_exists: bool,
@@ -421,31 +395,22 @@ pub struct ProbeResult {
     pub error: String,
 }
 
-/// 探活单个远端节点：SSH 执行 nvidia-smi / docker info / 本机所用镜像 / 模型目录检查。
-/// 镜像以本机 config.json 的 sglang_args.image 为准（缺省默认 lmsysorg/sglang:v0.5.17）。
+/// 探活单个远端节点：SSH 执行 nvidia-smi / docker info / 可选镜像 / 模型目录检查。
+/// 镜像（可选）由前端从远程 model.json 的 vllm_image 字段透传；未传时跳过镜像检查（仅校验 GPU/Docker/模型目录）。
 /// 远端无需探测网卡——SSH 可达即说明互联已通。
 #[tauri::command]
 pub async fn multi_node_probe(
-    app: tauri::AppHandle,
+    _app: tauri::AppHandle,
     ip: String,
     user: String,
     port: u16,
     key: Option<String>,
     model_dir: Option<String>,
+    image: Option<String>,
 ) -> Result<ProbeResult, AppError> {
     crate::common::ssh::validate_host(&ip)?;
     crate::common::ssh::validate_ssh_user(&user)?;
-    // 本机当前使用的镜像：设置页配置优先，缺省默认
-    let mut image = "lmsysorg/sglang:v0.5.17".to_string();
-    if let Ok(settings_path) = config::get_data_dir(Some(&app)).map(|d| d.join("config.json")) {
-        if let Ok(json) = std::fs::read_to_string(settings_path) {
-            if let Ok(parsed) = serde_json::from_str::<crate::common::types::Settings>(&json) {
-                if !parsed.sglang_args.image.trim().is_empty() {
-                    image = parsed.sglang_args.image.trim().to_string();
-                }
-            }
-        }
-    }
+    let image = image.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
     // 模型目录：留空时按默认根目录探测（/home/<user>/models 或 ~/models）。
     // 无论用户是否填写模型目录，都按根目录模式（root_mode=true）检查：
@@ -458,7 +423,8 @@ pub async fn multi_node_probe(
     } else {
         raw_model_dir.to_string()
     };
-    let cmd = crate::common::ssh::probe_script(&probe_model_dir, &image, true);
+    // image 为 None 时显式跳过镜像检查（纯环境探测场景）；model_dir 默认按根目录模式探活
+    let cmd = crate::common::ssh::probe_script(&probe_model_dir, image.unwrap_or(""), true, image.is_some());
     let (ok, stdout, stderr) = crate::common::ssh::ssh_run(
         &ip, &user, if port == 0 { 22 } else { port },
         key.as_deref(), &cmd, std::time::Duration::from_secs(20),
@@ -507,8 +473,8 @@ pub async fn multi_node_probe(
         });
     }
     // 检查顺序：SSH → Docker daemon → 镜像 → 模型，任一失败即返回 ok=false
-    if !image_ok {
-        let mut err = format!("远端未下载本机使用的镜像 {}（请先在远端 docker pull 或配置镜像加速）", image);
+    if image.is_some() && !image_ok {
+        let mut err = format!("远端未下载本机使用的镜像 {}（请先在远端 docker pull 或配置镜像加速）", image.unwrap_or(""));
         if !image_err.is_empty() {
             err.push_str(&format!("\n{}", image_err));
         }
@@ -832,7 +798,7 @@ fn ssh_opts(port: u16, key: Option<&str>) -> String {
     s
 }
 
-/// 一键流式同步本机 SGLang 镜像到远端：
+/// 一键流式同步本机 vLLM 镜像到远端：
 /// `docker save <image> | [pv -s <size>] | ssh <直连IP> '<docker> load'`
 /// 直连光口带宽充足，不做 gzip 压缩（避免单线程压缩成为瓶颈）；
 /// 全程不落地临时 tar；进度经 `image-push-progress` 事件实时上报。
@@ -848,8 +814,8 @@ pub async fn push_image_to_remote(
     crate::common::ssh::validate_host(&ip)?;
     crate::common::ssh::validate_ssh_user(&user)?;
 
-    // 全量同步本机所有推理引擎镜像（仓库名含 sglang，兼容国内镜像源前缀）；
-    // 传入的 image（设置页当前选择）排到最前优先同步
+    // 全量同步本机所有推理引擎镜像（仓库名含 vllm 或 spark-vllm）；
+    // 传入的 image（来自当前运行中模型的 vllm_image）排到最前优先同步
     let mut images: Vec<String> = Vec::new();
     match collect_engine_images(&app.state::<AppState>()) {
         Ok(list) => {

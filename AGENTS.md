@@ -12,7 +12,7 @@
 ## 架构
 - **Tauri 2.11.2** + Rust 后端 + **原生 HTML/CSS/JS**（无框架、无打包工具）。
   所有前端源码在 `src/` 目录下，作为 `frontendDist` 原样提供。
-- **推理引擎 = SGLang（Docker 部署）**：llama.cpp 方案已完全移除。模型以 **HF safetensors 目录**（`models/<model_id>/`，含 `.done` 完成标记）下载，`start_model` 检测目录模型后走 `start_sglang_docker`：`docker run --gpus all --shm-size <配置> -p <port>:<port> -v <模型目录>:/models/<model_id>:ro lmsysorg/sglang:v0.5.17 python3 -m sglang.launch_server ...`，就绪信号为 stdout `Uvicorn running on`。容器内 host 固定 `0.0.0.0`（端口映射必需），端口沿用设置页。停止/退出走 `docker stop/rm` + 杀进程兜底。完整流程见 `doc/sglang-deployment.md`。
+- **推理引擎 = vLLM（Docker 部署，`eugr/spark-vllm` fork）**：llama.cpp 与 SGLang 方案均已移除。模型以 **HF safetensors 目录**（`models/<model_id>/`，含 `.done` 完成标记）下载，`start_model` 检测目录模型后走 `start_vllm_docker`：`docker run --gpus all --shm-size <配置> -p <port>:<port> -v <模型目录>:/models/<model_id>:ro <镜像> vllm serve ...`。**镜像由远程 model.json 的 `vllm_image` 字段唯一指定**（每模型独立配置，本地不再保留硬编码兜底；缺字段直接拒绝启动）。容器内 host 固定 `0.0.0.0`（端口映射必需），端口沿用设置页（默认 8000）。就绪信号为 stdout `Application startup complete` / `Starting vLLM API server` / `Uvicorn running on`。停止/退出走 `docker stop/rm` + 杀进程兜底。完整流程见 `doc/vllm-deployment.md`。
 - **单窗口 SPA（单页应用）** + hash 路由：
   - `index.html`（外壳）含 `#view-root` 容器、底部硬件栏与导航。
   - 3 个视图（`model_list` / `model_image` / `settings`）各自为独立 **ES 模块**（`src/views/*.js`），默认导出 `{ template, mount(root, params), unmount() }`。模型运行后「查看模型」直接用系统浏览器打开 WebUI（`window.openUrl`），不再有 chat 视图。
@@ -34,20 +34,24 @@
 | 模块 | 关键命令 |
 |--------|-------------|
 | `index.rs` | `get_system_info`, `check_update`（远程 `d/update.json`，无 llamacpp 逻辑） |
-| `model_list.rs` | `fetch_model_list`, `scan_local_models`, `scan_part_files`, `download_model`（多文件目录下载）, `start_model`（目录模型 → `start_sglang_docker`）, `stop_model`（docker stop/rm）, `delete_local_model` |
-| `settings.rs` | `save_settings`（直接写入 + `sync_all` 刷盘，持久化 `sglang_args`）, `load_settings`, `get_app_version` |
+| `model_list.rs` | `fetch_model_list`, `scan_local_models`, `scan_part_files`, `download_model`（多文件目录下载）, `start_model`（目录模型 → `start_vllm_docker` / 多机 `start_multi_node`）, `stop_model`（docker stop/rm）, `delete_local_model` |
+| `settings.rs` | `save_settings`（直接写入 + `sync_all` 刷盘，持久化 `vllm_args` / `multi_node_args`）, `load_settings`, `get_app_version`, `multi_node_probe`（SSH 探活）, `push_image_to_remote`（流式镜像同步） |
 | `model_image.rs` | `check_sd_exists`, `download_and_extract_sd`, `start_sd_generation`, `stop_sd`, `save_sd_image_as` |
 
 ## 关键注意事项
-- **SGLang 镜像固定 tag**：默认 `lmsysorg/sglang:v0.5.17`（v0.5.14+ 支持 GB10；多架构含 arm64 适配 DGX Spark）。`latest` 可变 tag 不用于生产；旧 `spark` tag 已过时。升级只改 `config.json` 的 `sglang_args.image`。
-- **NVFP4 在 DGX Spark（GB10）有已知 CUDA 崩溃问题**：优先使用 FP8 权重模型；NVFP4 模型在 Spark 上异常时换 FP8。
+- **vLLM 镜像**：由远程 model.json `vllm_image` 字段唯一指定（如 `ghcr.io/spark-arena/dgx-vllm-eugr-nightly-b12x:2026082301`），本机不再保留默认兜底。**镜像拉取统一在模型下载阶段完成**——`download_model` 下完模型文件（写 `.done`）后自动调 `pull_docker_image` 拉镜像（已存在则跳过）；`start_vllm_docker` / `start_multi_node` 启动时只做 `check_docker_env`（CLI/daemon/GPU 预检 + `docker image inspect` 校验），镜像缺失直接报「请回到模型列表重新点击下载触发拉取」，**不在启动时拉镜像**。镜像缺失场景：用户 `docker rmi` 误删、镜像被 Docker 清理、模型清单新增镜像未拉。本应用对接的是 `eugr/spark-vllm-docker` 社区 fork（专门针对 DGX Spark / GB10 sm12x 优化），**不要去查官方 vLLM 文档作为参数权威**——fork 含大量自定义（Ray worker entrypoint `python -m vllm.distributed.ray_utils`、`--backend vllm-scan` 压测后端、`--speculative-config {method:dflash|dspark,...}`、`--attention-config` / `--reasoning-config` / `--compilation-config` JSON 配置、`--load-format instanttensor`、`--dspark-noise-token-id` 等 hf-overrides、`--default-chat-template-kwargs.*` 等），upstream vLLM 不直接兼容这些自定义入口与参数。升级镜像版本只改 model.json；切到 upstream vLLM 时需同步调整 `start_multi_node` worker entrypoint 与 `benchmark.rs` 的 `--backend`。
+- **启动参数权威源**：`https://github.com/eugr/spark-vllm-docker`（README + `recipes/` 配方 + `mods/` 补丁说明 + `examples/` 启动脚本）。新增/变更 vLLM 启动参数、KV-cache 类型、量化方法、投机解码算法、模型 parser 之前先查 fork 的 README 与对应 model recipe 配方，不要凭 upstream 经验添加。fork 默认 `gpu-memory-utilization=0.8`、默认 `--shm-size=64g`、容器强制 `--ulimit nofile=1048576:1048576`、默认注入 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。
+- **NVFP4 在 DGX Spark（GB10）有已知 CUDA 崩溃问题**：优先使用 FP8 权重模型；NVFP4 模型在 Spark 上异常时换 FP8（fork 的 `eugr/spark-vllm:latest` 含 DeepGEMM `nv_dev` 分支支持 sm12x，但 NVRTC 编译器已禁用，需关注 FlashInfer 启动日志）。
 - **模型下载（多文件目录）**：`model_download_files` 清单逐文件 `.part` 续传，下载完成写 `.done`；所有 `huggingface.co` 自动替换为 `hf-mirror.com`。
-- **SGLang 参数**：设置页「模型启动参数」面板配置 `sglang_args`（image/shm_size/tp/mem-fraction-static/dtype/quantization/kv-cache-dtype/schedule-policy/请求数/chunked-prefill/log 等 + `extra_args` 每行 `key=value` 追加 `--key value`），仅非空/非默认值拼入命令。**官方参数文档（权威，改参数前必查）：`https://docs.sglang.io/docs/advanced_features/server_arguments`**；推测解码文档：`https://docs.sglang.io/docs/advanced_features/speculative_decoding`；DeepSeek MTP 用法：`https://docs.sglang.io/basic_usage/deepseek_v3.html`。设置页下拉选项必须与文档支持的枚举值完全一致，新增/变更参数前先查文档再改代码。
-- **MTP 自动启用**：模型目录含 MTP 权重（`model_mtp.safetensors` 等，文件名含 `mtp` 且为 `.safetensors`/`.bin`）时自动追加 `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`（SGLang 中 NEXTN 是 EAGLE 别名，MTP 权重同目录自动加载，无需 `--speculative-draft-model-path`）；`extra_args` 或模型清单 `sglang_flags` 已自定义 `speculative-algorithm` 则跳过。实现位置：`model_list.rs` `start_sglang_docker`。
-- **模型清单 `sglang_flags`**：`RemoteModel` 可带官方推荐启动参数数组（每条 `--key value` 或 `--flag`），启动时最后追加、优先级最高（可覆盖设置页同名参数，SGLang 后值生效），经前端 `start_model` 的 `sglangFlags` 透传；含 `speculative-algorithm` 时跳过 MTP 自动启用。示例见 `doc/model_list.json`（Qwen3.8-27B DGX Spark 配方）。
+- **vLLM 参数**：设置页「模型启动参数」面板配置 `vllm_args`（shm_size / tp / gpu-memory-utilization / quantization / kv-cache-dtype / distributed-executor-backend / load-format / block-size / tokenizer-mode / 推理 & 工具 parser / trust-remote-code / enable-auto-tool-choice / max-num-seqs / max-num-batched-tokens / `extra_args` 每行 `key=value` 追加 `--key value` / `extra_env` 每行 `KEY=VALUE` 注入 `-e`），仅非空/非默认值拼入命令。**参数权威文档：`https://github.com/eugr/spark-vllm-docker`（fork 的 README / recipes / examples）**——不要去查 `docs.vllm.ai`。设置页下拉选项必须与 fork 当前支持的能力完全一致，新增/变更参数前先看 fork 的最新 recipe 与 mod 列表。
+- **多机集群硬规则**（对齐 fork `launch-cluster.sh`）：
+  - **不要** 在 `vllm serve` 命令里手动加 `--distributed-executor-backend`、`--nnodes`、`--node-rank`、`--master-addr`、`--master-port`、`--headless`——本应用 `start_multi_node` 已在命令尾部追加这些参数；用户把它们写进 `vllm_flags` / `extra_args` 反而会被后追加的同名参数覆盖导致行为异常（vLLM 后值生效）。
+  - fork 默认 no-Ray 多机后端；本应用当前固定走 Ray 后端（`--distributed-executor-backend ray` + Ray worker entrypoint），与 fork 的 no-Ray 模式不同，需保留。
+  - `--tensor-parallel-size / -tp` 由 launch-cluster 自动从 active 节点数派生；本应用多机 TP 固定等于 `n_nodes`，不要让用户在 `vllm_flags` 里覆盖。
+- **模型清单 `vllm_flags`**：`RemoteModel` 可带 fork 官方推荐启动参数数组（每条 `--key value` 或 `--flag`，如 `--speculative-config {...}` JSON 配置），启动时最后追加、优先级最高（可覆盖设置页同名参数，vLLM 后值生效），经前端 `start_model` 的 `vllmFlags` 透传。示例见 `doc/model.json`（DeepSeek-V4-Flash DGX Spark 配方）。
 - **硬件优先级**：`hwinfo` 插件数据覆盖 `sysinfo`。
 - **更新流程**：启动后延迟 3 秒 → 应用更新（不再有 llamacpp / VC++ 运行库流程）。
-- **窗口关闭**：`cleanup_processes`（托盘退出 / 窗口关闭 / `ExitRequested` 统一入口，幂等）停止 SGLang 容器（`docker stop/rm`）+ 杀 llama-server/sd-cli 残留兜底。
+- **窗口关闭**：`cleanup_processes`（托盘退出 / 窗口关闭 / `ExitRequested` 统一入口，幂等）停止 vLLM 容器（`docker stop/rm`，单机容器名 `adm-vllm-<model>`、多机容器名 `adm-vllm-<model>-rank-<R>`）+ 杀 sd-cli 残留兜底。
 - **Windows**：`main.rs` 中的 `#![windows_subsystem = "windows"]` + `build.rs` 中的 `/SUBSYSTEM:WINDOWS` 隐藏控制台。
 - **调试日志**：`dbg_log!` 宏（`src-tauri/src/common/utils/log.rs`）仅 debug 构建输出到 stderr，release 构建编译为空。
 
@@ -61,11 +65,6 @@
 - 图标：`python scripts/generate-icons.py` 从 `src-tauri/icons/source.png` 生成。
 
 ## 注意事项
-- SGLang 部署流程完整文档：`doc/sglang-deployment.md`（架构 / 前置条件 / 镜像策略 / 模型清单格式 / 下载 / 启动命令 / 参数表 / 排查）。当新的功能发生变化时候即时更新文档
-- 多机互联（2+ 台 DGX Spark 集群）：v1 已实现（设置页「多机互联」Tab）。关键注意：总开关 + 节点清单（首条必须本机）；多机容器必须 `--network host`（无 `-p`）；容器名 `adm-sglang-<model>-rank-<R>`（据此识别多机停止）；远端经 SSH `nohup docker run` 启动、日志落盘 `/tmp/adm_sglang_<model>_rank_<R>.log`；多机参数（--tp/--nnodes/--node-rank/--dist-init-addr）放命令最后。细节见 `doc/sglang-deployment.md` §10 与 `doc/dgx-spark-multinode-plan.md`
-- 模型列表远端配置 `https://adm.tuduoduo.top/b/model.json`（本地示例 `doc/model_list.json`）：新格式 `model_download_files` + `model_support_devices`。
-- **已移除功能**：llama.cpp 方案（llamacpp 下载/版本/删除命令、llama-server 启动分支、VC++ 运行库与 LLamaCPP 更新弹窗）、Agent 聊天页（含 admAgent server 集成、多 workspace、微信 Bot/iLink、技能管理）。相关代码均已删除，不要再按旧文档引用。
-- **项目结构**：
-  - `src/` + `src-tauri/` — Tauri 桌面端（vanilla JS 前端 + Rust 后端）
-  - `website/` — 营销网站
-  - `scripts/` — 工具脚本（图标生成 / 签名 / 旧版数据迁移 migrate-data.sh（仅 Ubuntu/Linux：~/.local/share/com.adm.admapp -> com.adm.be））
+- vLLM 部署流程完整文档：`doc/vllm-deployment.md`（架构 / 前置条件 / 镜像策略 / 模型清单格式 / 下载 / 启动命令 / 参数表 / 排查）。当新的功能发生变化时候即时更新文档
+- 多机互联（2+ 台 DGX Spark 集群）：v1 已实现（设置页「多机互联」Tab）。关键注意：总开关 + 节点清单（首条必须本机）；多机容器必须 `--network host`（无 `-p`）；容器名 `adm-vllm-<model>-rank-<R>`（据此识别多机停止）；head 跑 `vllm serve` + Ray 后端，worker 经 SSH `nohup docker run` 启动 `python -m vllm.distributed.ray_utils` 加入 head 集群、日志落盘 `/tmp/adm_vllm_<model>_rank_<R>.log`；多机参数（`--distributed-executor-backend ray --nnodes N --node-rank R --tensor-parallel-size N --ray-init-address`）放命令最后。Ray 引导端口默认 6379（与 Ray 官方一致），不得与模型服务端口冲突。细节见 `doc/vllm-deployment.md` 与 `doc/dgx-spark-multinode-plan.md`
+- 模型列表远端配置 `https://adm.tuduoduo.top/b/model.json`（本地示例 `doc/model.json`）：新格式 `model_download_files` + `model_support_devices` + `vllm_image` + `vllm_flags`。

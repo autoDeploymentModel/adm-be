@@ -1,0 +1,49 @@
+[
+    {
+        "model_id": "DeepSeek-V4-Flash-0731",
+        "model_download_files": [
+            "https://huggingface.co/MJPansa/DeepSeek-V4-Flash-0731-NVFP4/resolve/main/config.json",
+            "https://huggingface.co/MJPansa/DeepSeek-V4-Flash-0731-NVFP4/resolve/main/generation_config.json",
+            "https://huggingface.co/MJPansa/DeepSeek-V4-Flash-0731-NVFP4/resolve/main/model.safetensors.index.json",
+            "https://huggingface.co/MJPansa/DeepSeek-V4-Flash-0731-NVFP4/resolve/main/model-00001-of-00048.safetensors",
+            "https://huggingface.co/MJPansa/DeepSeek-V4-Flash-0731-NVFP4/resolve/main/tokenizer.json",
+            "https://huggingface.co/MJPansa/DeepSeek-V4-Flash-0731-NVFP4/resolve/main/tokenizer_config.json"
+        ],
+        "model_support_devices": ["dgx-spark-128G"],
+        "vllm_image": "ghcr.io/spark-arena/dgx-vllm-eugr-nightly-b12x:2026082301",
+        "vllm_flags": [
+            "--trust-remote-code",
+            "--tensor-parallel-size 2",
+            "--distributed-executor-backend ray",
+            "--host 0.0.0.0",
+            "--port 8000",
+            "--kv-cache-dtype fp8_ds_mla",
+            "--block-size 256",
+            "--tokenizer-mode deepseek_v4",
+            "--tool-call-parser deepseek_v4",
+            "--enable-auto-tool-choice",
+            "--reasoning-parser deepseek_v4",
+            "--load-format fastsafetensors",
+            "--max-model-len 250000",
+            "--max-num-seqs 8",
+            "--max-num-batched-tokens 4096",
+            "--gpu-memory-utilization 0.83",
+            "--enable-prefix-caching",
+            "--enable-expert-parallel",
+            "--moe-backend auto",
+            "--attention-config {\"use_fp4_indexer_cache\":true}",
+            "--speculative-config {\"method\":\"dspark\",\"num_speculative_tokens\":3,\"draft_sample_method\":\"greedy\"}",
+            "--hf-overrides {\"dspark_noise_token_id\":128799}",
+            "--default-chat-template-kwargs.thinking true",
+            "--default-chat-template-kwargs.reasoning_effort high",
+            "--reasoning-config {\"reasoning_parser\":\"deepseek_v4\",\"reasoning_start_str\":\"\",\"reasoning_end_str\":\"\"}",
+            "--compilation-config {\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"custom_ops\":[\"all\"]}"
+        ],
+        "model_size": "167 GB",
+        "model_type": "纯文本",
+        "model_description": "DeepSeek-V4-Flash-0731 NVFP4量化 + DSpark投机解码，支持对话/推理/工具调用",
+        "support_tools": true,
+        "support_reasoning": true,
+        "support_images": false
+    }
+]

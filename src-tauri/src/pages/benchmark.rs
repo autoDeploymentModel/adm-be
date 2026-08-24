@@ -14,7 +14,12 @@ pub struct BenchmarkParams {
     pub num_prompts: Option<u64>,
 }
 
-/// 在 SGLang 容器内执行 bench_serving 性能测试
+/// 在 vLLM 容器内执行 `vllm bench serve` 性能测试
+///
+/// 注意：`--backend vllm-scan` 是 `eugr/spark-vllm` fork 自定义后端
+/// （同 fork 的 Ray worker entrypoint 也是 `python -m vllm.distributed.ray_utils`），
+/// upstream vLLM 用 `--backend vllm`。本应用部署的镜像均为 eugr fork，
+/// 切到 upstream vLLM 镜像时需把后端改回 `vllm`。
 #[tauri::command]
 pub async fn start_benchmark(
     app: tauri::AppHandle,
@@ -22,10 +27,9 @@ pub async fn start_benchmark(
     params: BenchmarkParams,
 ) -> Result<(), AppError> {
     let container = state.running_container.lock().map_err(|e| e.to_string())?.clone();
-    let port = state.running_port.lock().map_err(|e| e.to_string())?.unwrap_or(5678);
+    let port = state.running_port.lock().map_err(|e| e.to_string())?.unwrap_or(8000);
 
     let container_name = container.ok_or("没有正在运行的模型容器")?;
-    let model_id = state.running_model_id.lock().map_err(|e| e.to_string())?.clone().unwrap_or_else(|| "default".to_string());
 
     {
         let mut running = state.benchmark_running.lock().map_err(|e| e.to_string())?;
@@ -41,25 +45,15 @@ pub async fn start_benchmark(
 
     let base_url = format!("http://127.0.0.1:{}", port);
 
-    // 容器通常无外网，random 数据集默认会下载 ShareGPT 语料；先写入一份本地 JSON 供 --dataset-path 使用
-    let _ = crate::common::utils::platform::docker_cmd()
-        .args([
-            "exec", &container_name,
-            "sh", "-c",
-            r#"python3 -c 'import json;json.dump([{"conversations":[{"value":"hello world, this is a benchmark prompt from admapp"},{"value":"hi there, this is the assistant reply"}]} for _ in range(20)], open("/tmp/bench_sharegpt.json","w",encoding="utf-8"))'"#,
-        ])
-        .output();
-
+    // vLLM `--dataset-name random` 自带随机 prompt 生成，无需额外 dataset-path 文件。
     let mut cmd = crate::common::utils::platform::docker_cmd();
     cmd.args([
-        "exec", "-e", "HF_HUB_OFFLINE=1", "-e", "PYTHONWARNINGS=ignore::FutureWarning", &container_name,
-        "python3", "-m", "sglang.benchmark.serving",
-        "--backend", "sglang",
+        "exec", "-e", "HF_HUB_OFFLINE=1", &container_name,
+        "vllm", "bench", "serve",
+        "--backend", "vllm-scan",
         "--base-url", &base_url,
         "--model", "default",
-        "--tokenizer", &format!("/models/{}", model_id),
         "--dataset-name", "random",
-        "--dataset-path", "/tmp/bench_sharegpt.json",
         "--random-input-len", &input_len.to_string(),
         "--random-output-len", &output_len.to_string(),
         "--num-prompts", &num_prompts.to_string(),

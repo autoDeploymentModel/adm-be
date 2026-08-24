@@ -6,7 +6,7 @@ pub struct AppState {
     pub running_process: Mutex<Option<u32>>,
     pub running_model_id: Mutex<Option<String>>,
     pub running_port: Mutex<Option<u16>>,
-    /// 当前运行的 SGLang Docker 容器名（仅 docker 部署方式使用）
+    /// 当前运行的 vLLM Docker 容器名（仅 docker 部署方式使用）
     pub running_container: Mutex<Option<String>>,
     pub downloading_progress: Mutex<HashMap<String, u8>>,
     pub downloading_phase: Mutex<HashMap<String, String>>,

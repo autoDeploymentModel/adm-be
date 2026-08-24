@@ -273,8 +273,12 @@ const template = `
         <div class="param-group">
           <div class="param-group-title">${_t("基础参数")}</div>
           <div class="param-row">
-            <div class="param-label">${_t("上下文大小")}<div class="param-key">--context-length</div></div>
-            <div class="param-input"><input type="number" id="ctx_size" value="25600" min="0"><div class="param-desc">${_t("模型最大上下文长度，留 0 表示使用模型自带默认值")}</div></div>
+            <div class="param-label">${_t("最大上下文长度")}<div class="param-key">--max-model-len</div></div>
+            <div class="param-input"><input type="number" id="ctx_size" value="0" min="0"><div class="param-desc">${_t("模型最大上下文长度，留 0 表示使用模型自带默认值")}</div></div>
+          </div>
+          <div class="param-row">
+            <div class="param-label">${_t("共享内存")}<div class="param-key">--shm-size</div></div>
+            <div class="param-input"><input type="text" id="vllm_shm" placeholder="64g" style="max-width:200px;"><div class="param-desc">${_t("DGX Spark 建议 64g，其他机型 32g")}</div></div>
           </div>
         </div>
 
@@ -282,35 +286,57 @@ const template = `
           <div class="param-group-title">${_t("服务参数")}</div>
           <div class="param-row">
             <div class="param-label">${_t("监听端口")}<div class="param-key">--port</div></div>
-            <div class="param-input"><input type="number" id="port" value="5678" min="1" max="65535"><div class="param-desc">${_t("Docker 端口映射（容器内始终监听 0.0.0.0）")}</div></div>
+            <div class="param-input"><input type="number" id="port" value="8000" min="1" max="65535"><div class="param-desc">${_t("Docker 端口映射（容器内始终监听 0.0.0.0）")}</div></div>
           </div>
         </div>
 
         <div class="param-group">
-          <div class="param-group-title">${_t("Docker 部署")}</div>
+          <div class="param-group-title">${_t("vLLM 基础参数")}</div>
           <div class="param-row">
-            <div class="param-label">${_t("镜像")}<div class="param-key">sglang_image</div></div>
+            <div class="param-label">${_t("分布式后端")}<div class="param-key">--distributed-executor-backend</div></div>
             <div class="param-input">
-              <select id="sglang_image" style="max-width:480px;"></select>
-              <div class="param-desc">${_t("下拉列出本地已拉取的推理引擎版本，选中即保存生效（重启模型后应用）；列表外的版本可在模型清单 sglang_version 指定")}</div>
+              <select id="sg_dist_backend">
+                <option value="">${_t("auto（单机）")}</option>
+                <option value="ray">${_t("ray（多机）")}</option>
+                <option value="mp">mp</option>
+              </select>
             </div>
           </div>
           <div class="param-row">
-            <div class="param-label">${_t("共享内存")}<div class="param-key">--shm-size</div></div>
-            <div class="param-input"><input type="text" id="sglang_shm" placeholder="64g" style="max-width:200px;"><div class="param-desc">${_t("DGX Spark 建议 64g，其他机型 32g")}</div></div>
+            <div class="param-label">${_t("加载格式")}<div class="param-key">--load-format</div></div>
+            <div class="param-input">
+              <select id="sg_load_format">
+                <option value="">${_t("不指定（vLLM 默认）")}</option>
+                <option value="safetensors">safetensors</option>
+                <option value="instanttensor">instanttensor</option>
+                <option value="auto">auto</option>
+              </select>
+            </div>
           </div>
-        </div>
-
-        <div class="param-group">
-          <div class="param-group-title">${_t("推理引擎管理")}</div>
-          <div class="param-desc" style="margin-bottom:10px;">${_t("本地已拉取的镜像列表；正在被运行中的模型使用的镜像不可删除")}</div>
-          <div style="overflow-x:auto;">
-          <table class="version-table engine-table" style="width:100%;">
-            <thead><tr><th style="text-align:left;">${_t("版本")}</th><th>${_t("大小")}</th><th>${_t("状态")}</th><th>${_t("操作")}</th></tr></thead>
-            <tbody id="engine-tbody"><tr><td colspan="4" style="text-align:center;color:var(--c-text-3);padding:16px;">${_t("加载中...")}</td></tr></tbody>
-          </table>
+          <div class="param-row">
+            <div class="param-label">${_t("Block Size")}<div class="param-key">--block-size</div></div>
+            <div class="param-input"><input type="number" id="sg_block_size" value="256" min="0"></div>
           </div>
-          <button class="btn-reset" id="engine-refresh-btn" style="margin-top:10px;padding:6px 16px;font-size:13px;">${_t("刷新")}</button>
+          <div class="param-row">
+            <div class="param-label">${_t("Tokenizer 模式")}<div class="param-key">--tokenizer-mode</div></div>
+            <div class="param-input"><input type="text" id="sg_tokenizer_mode" placeholder="deepseek_v4"></div>
+          </div>
+          <div class="param-row">
+            <div class="param-label">${_t("工具解析器")}<div class="param-key">--tool-call-parser</div></div>
+            <div class="param-input"><input type="text" id="sg_tool_parser" placeholder="deepseek_v4"></div>
+          </div>
+          <div class="param-row">
+            <div class="param-label">${_t("推理解析器")}<div class="param-key">--reasoning-parser</div></div>
+            <div class="param-input"><input type="text" id="sg_reasoning_parser" placeholder="deepseek_v4"></div>
+          </div>
+          <div class="param-row">
+            <div class="param-label">${_t("自动工具选择")}<div class="param-key">--enable-auto-tool-choice</div></div>
+            <div class="param-input"><div class="checkbox-wrap"><input type="checkbox" id="sg_auto_tool_choice" checked></div></div>
+          </div>
+          <div class="param-row">
+            <div class="param-label">${_t("信任远程代码")}<div class="param-key">--trust-remote-code</div></div>
+            <div class="param-input"><div class="checkbox-wrap"><input type="checkbox" id="sg_trust_remote" checked></div></div>
+          </div>
         </div>
 
         <div class="param-group">
@@ -320,47 +346,20 @@ const template = `
             <div class="param-input"><input type="number" id="sg_tp" value="1" min="1"><div class="param-desc">${_t("单机多卡时拆分模型权重到多张 GPU（如 2 张卡填 2）；单卡填 1。2 台 Spark 跨机部署需要多节点模式，当前版本暂不支持")}</div></div>
           </div>
           <div class="param-row">
-            <div class="param-label">${_t("静态内存占比")}<div class="param-key">--mem-fraction-static</div></div>
-            <div class="param-input"><input type="number" id="sg_mem_frac" value="0" min="0" max="1" step="0.01"><div class="param-desc">${_t("0 = 自动；KV 缓存池/权重内存占比，OOM 时调小")}</div></div>
-          </div>
-          <div class="param-row">
-            <div class="param-label">${_t("数据类型")}<div class="param-key">--dtype</div></div>
-            <div class="param-input">
-              <select id="sg_dtype">
-                <option value="">${_t("auto（默认）")}</option>
-                <option value="half">half (FP16)</option>
-                <option value="float16">float16</option>
-                <option value="bfloat16">bfloat16</option>
-                <option value="float">float (FP32)</option>
-                <option value="float32">float32</option>
-              </select>
-            </div>
+            <div class="param-label">${_t("GPU 显存利用率")}<div class="param-key">--gpu-memory-utilization</div></div>
+            <div class="param-input"><input type="number" id="sg_gpu_mem_util" value="0" min="0" max="1" step="0.01"><div class="param-desc">${_t("0 = 自动；KV 缓存池/权重内存占比，OOM 时调小")}</div></div>
           </div>
           <div class="param-row">
             <div class="param-label">${_t("量化方法")}<div class="param-key">--quantization</div></div>
             <div class="param-input">
               <select id="sg_quant">
-                <option value="">${_t("不指定（NVFP4/FP8 模型自动从 config 解析）")}</option>
+                <option value="">${_t("不指定（自动从 config 解析）")}</option>
+                <option value="deepseek_v4_fp8">deepseek_v4_fp8</option>
                 <option value="fp8">fp8</option>
                 <option value="mxfp8">mxfp8</option>
-                <option value="modelopt_fp8">modelopt_fp8</option>
-                <option value="modelopt_fp4">modelopt_fp4（NVFP4）</option>
-                <option value="nvfp4_online">nvfp4_online（在线量化）</option>
-                <option value="modelopt">modelopt</option>
-                <option value="modelopt_mixed">modelopt_mixed</option>
-                <option value="petit_nvfp4">petit_nvfp4</option>
+                <option value="nvfp4">nvfp4</option>
                 <option value="awq">awq</option>
                 <option value="gptq">gptq</option>
-                <option value="marlin">marlin</option>
-                <option value="gptq_marlin">gptq_marlin</option>
-                <option value="awq_marlin">awq_marlin</option>
-                <option value="w8a8_fp8">w8a8_fp8</option>
-                <option value="w8a8_int8">w8a8_int8</option>
-                <option value="w4afp8">w4afp8</option>
-                <option value="moe_wna16">moe_wna16</option>
-                <option value="mxfp4">mxfp4</option>
-                <option value="bitsandbytes">bitsandbytes</option>
-                <option value="gguf">gguf</option>
                 <option value="compressed-tensors">compressed-tensors</option>
               </select>
               <div class="param-desc">${_t("预量化模型（如 unsloth NVFP4）无需指定，加载时自动识别")}</div>
@@ -375,64 +374,19 @@ const template = `
             <div class="param-input">
               <select id="sg_kv_dtype">
                 <option value="">${_t("auto（默认）")}</option>
-                <option value="fp8_e5m2">fp8_e5m2</option>
+                <option value="fp8">fp8</option>
                 <option value="fp8_e4m3">fp8_e4m3</option>
                 <option value="bf16">bf16</option>
-                <option value="bfloat16">bfloat16</option>
-                <option value="nvfp4">nvfp4（需 CUDA 12.8+）</option>
-                <option value="fp4_mx_block16">fp4_mx_block16（需 CUDA 12.8+）</option>
               </select>
             </div>
           </div>
           <div class="param-row">
-            <div class="param-label">${_t("调度策略")}<div class="param-key">--schedule-policy</div></div>
-            <div class="param-input">
-              <select id="sg_sched">
-                <option value="">${_t("fcfs（默认）")}</option>
-                <option value="lpm">lpm</option>
-                <option value="random">random</option>
-                <option value="dfs-weight">dfs-weight</option>
-                <option value="lof">lof</option>
-                <option value="priority">priority</option>
-                <option value="routing-key">routing-key</option>
-              </select>
-            </div>
+            <div class="param-label">${_t("最大并发序列数")}<div class="param-key">--max-num-seqs</div></div>
+            <div class="param-input"><input type="number" id="sg_max_seqs" value="0" min="0"><div class="param-desc">${_t("0 = 自动")}</div></div>
           </div>
           <div class="param-row">
-            <div class="param-label">${_t("最大运行请求数")}<div class="param-key">--max-running-requests</div></div>
-            <div class="param-input"><input type="number" id="sg_max_run" value="0" min="0"><div class="param-desc">${_t("0 = 自动")}</div></div>
-          </div>
-          <div class="param-row">
-            <div class="param-label">${_t("最大排队请求数")}<div class="param-key">--max-queued-requests</div></div>
-            <div class="param-input"><input type="number" id="sg_max_queue" value="0" min="0"><div class="param-desc">${_t("0 = 自动")}</div></div>
-          </div>
-          <div class="param-row">
-            <div class="param-label">${_t("Chunked Prefill")}<div class="param-key">--chunked-prefill-size</div></div>
-            <div class="param-input"><input type="number" id="sg_chunk" value="0" min="-1"><div class="param-desc">${_t("0 = 自动，-1 = 禁用；长提示词 OOM 时调小（如 4096）")}</div></div>
-          </div>
-        </div>
-
-        <div class="param-group">
-          <div class="param-group-title">${_t("模型解析与日志")}</div>
-          <div class="param-row">
-            <div class="param-label">${_t("日志级别")}<div class="param-key">--log-level</div></div>
-            <div class="param-input">
-              <select id="sg_log_level">
-                <option value="">${_t("info（默认）")}</option>
-                <option value="debug">debug</option>
-                <option value="warning">warning</option>
-                <option value="error">error</option>
-                <option value="critical">critical</option>
-              </select>
-            </div>
-          </div>
-          <div class="param-row">
-            <div class="param-label">${_t("请求日志")}<div class="param-key">--log-requests</div></div>
-            <div class="param-input"><div class="checkbox-wrap"><input type="checkbox" id="sg_log_requests"><span>${_t("记录所有请求的元数据/输入/输出")}</span></div></div>
-          </div>
-          <div class="param-row">
-            <div class="param-label">${_t("监控指标")}<div class="param-key">--enable-metrics</div></div>
-            <div class="param-input"><div class="checkbox-wrap"><input type="checkbox" id="sg_metrics"><span>${_t("启动 Prometheus metrics")}</span></div></div>
+            <div class="param-label">${_t("单批最大 Token 数")}<div class="param-key">--max-num-batched-tokens</div></div>
+            <div class="param-input"><input type="number" id="sg_max_batched_tokens" value="0" min="-1"><div class="param-desc">${_t("0 = 自动，-1 = 禁用；长提示词 OOM 时调小（如 4096）")}</div></div>
           </div>
         </div>
 
@@ -443,6 +397,13 @@ const template = `
             <div class="param-input" style="max-width:480px;">
               <textarea id="sg_extra_args" rows="4" style="width:100%;resize:vertical;background:var(--c-panel-2);border:1px solid var(--c-border);border-radius:6px;color:var(--c-text);font-size:13px;padding:8px 12px;font-family:monospace;outline:none;" placeholder="disable-cuda-graph&#10;reasoning-parser=deepseek&#10;# 注释行以 # 开头会被忽略"></textarea>
               <div class="param-desc">${_t("每行一个参数：key=value 拼成 --key value；无等号的整行作为纯开关参数（如 disable-cuda-graph）；# 开头为注释。多机 NCCL 卡死排查可加 disable-cuda-graph")}</div>
+            </div>
+          </div>
+          <div class="param-row" style="align-items:flex-start;">
+            <div class="param-label">${_t("额外环境变量")}<div class="param-key">extra_env</div></div>
+            <div class="param-input" style="max-width:480px;">
+              <textarea id="sg_extra_env" rows="3" style="width:100%;resize:vertical;background:var(--c-panel-2);border:1px solid var(--c-border);border-radius:6px;color:var(--c-text);font-size:13px;padding:8px 12px;font-family:monospace;outline:none;" placeholder="NCCL_DEBUG=TRACE&#10;NCCL_CUMEM_ENABLE=1&#10;# 每行 KEY=VALUE 注入容器环境变量"></textarea>
+              <div class="param-desc">${_t("每行 KEY=VALUE 注入容器环境变量（docker run -e）")}</div>
             </div>
           </div>
         </div>
@@ -514,22 +475,8 @@ const template = `
         <div class="param-group">
           <div class="param-group-title">${_t("互联参数")}</div>
           <div class="param-row">
-            <div class="param-label">${_t("引导端口")}<div class="param-key">--dist-init-addr</div></div>
-            <div class="param-input"><input type="number" id="multi_dist_port" value="6464" min="1" max="65535" style="max-width:160px;"><div class="param-desc">${_t("SGLang 分布式引导 TCP 端口（所有节点通过节点 0 的该端口握手），不得与模型服务端口冲突")}</div></div>
-          </div>
-          <div class="param-row">
-            <div class="param-label">${_t("NCCL 端口")}<div class="param-key">--nccl-port</div></div>
-            <div class="param-input"><input type="number" id="multi_nccl_port" value="0" min="0" max="65535" style="max-width:160px;"><div class="param-desc">${_t("0 = 随机端口；固定端口便于防火墙放行")}</div></div>
-          </div>
-          <div class="param-row">
-            <div class="param-label">${_t("并行模式")}<div class="param-key">parallel_mode</div></div>
-            <div class="param-input">
-              <select id="multi_parallel_mode" style="max-width:160px;">
-                <option value="tp">${_t("张量并行 (TP)")}</option>
-                <option value="pp">${_t("流水线并行 (PP)")}</option>
-              </select>
-              <div class="param-desc">${_t("DGX Spark (GB10) 双机 TP 存在 NCCL 死锁（平台级 bug），PP 可绕过；单机或无死锁时用 TP")}</div>
-            </div>
+            <div class="param-label">${_t("Ray 端口")}<div class="param-key">--ray-init-address</div></div>
+            <div class="param-input"><input type="number" id="multi_dist_port" value="6379" min="1" max="65535" style="max-width:160px;"><div class="param-desc">${_t("Ray 分布式引导端口（所有节点通过节点 0 的该端口握手），不得与模型服务端口冲突")}</div></div>
           </div>
           <div class="param-row" style="align-items:flex-start;">
             <div class="param-label">${_t("额外环境变量")}<div class="param-key">extra_env</div></div>
@@ -618,7 +565,7 @@ const template = `
 </div>
 `;
 
-const DEFAULT_CTX_SIZE = 25600;
+const DEFAULT_CTX_SIZE = 0;
 
 const invoke = () => window.__adm_invoke;
 
@@ -694,6 +641,13 @@ async function probeNode(rank) {
   // 模型目录留空不提前拦截：后端按默认 /home/<SSH用户>/models 根目录探测
   mnProbeState[rank] = { probing: true };
   renderMultiNodeTable();
+  // 镜像从当前运行中模型的 remote vllm_image 取（未运行或字段缺失时不传，后端跳过镜像检查）
+  const image = (() => {
+    const state = window.__ADM_STATE || {};
+    const runningId = state.runningModelId;
+    const model = (state.modelList || []).find(function (m) { return m.model_id === runningId; });
+    return model && model.vllm_image ? model.vllm_image : null;
+  })();
   try {
     const res = await invoke()("multi_node_probe", {
       ip: n.ip,
@@ -701,6 +655,7 @@ async function probeNode(rank) {
       port: n.sshPort || 22,
       key: null,
       modelDir: n.modelDir,
+      image: image,
     });
     if (res.ok) {
       const detail = "GPU:" + (res.gpu || "?") + " Docker:" + (res.docker || "?");
@@ -736,12 +691,10 @@ function getMultiNodeArgsFromForm() {
     nodes: mnNodes.slice(0, 2).map(function (x) {
       return { ip: x.ip.trim(), ssh_user: x.sshUser.trim(), ssh_port: x.sshPort || 22, is_self: !!x.isSelf, model_dir: x.modelDir.trim() };
     }),
-    dist_init_port: n("multi_dist_port", 6464),
-    nccl_port: n("multi_nccl_port", 0),
+    dist_init_port: n("multi_dist_port", 6379),
     iface: "",
     ssh_key_path: "",
     extra_env: s("multi_extra_env"),
-    parallel_mode: s("multi_parallel_mode") || "tp",
   };
 }
 
@@ -774,10 +727,15 @@ async function pushImageToRemote() {
   const n = mnNodes[1];
   if (!n) return;
   if (mnImgSyncBusy || (btn && btn.disabled)) return;
-  const imageEl = document.getElementById("sglang_image");
-  const image = imageEl ? imageEl.value.trim() : "";
+  const image = (() => {
+    const model = (window.__ADM_STATE && window.__ADM_STATE.modelList || []).find(m => {
+      const rid = window.__ADM_STATE && window.__ADM_STATE.runningModelId;
+      return rid && m.model_id === rid;
+    });
+    return (model && model.vllm_image) || "";
+  })();
   if (!image) {
-    showToast(_t("请先在模型启动参数中选择镜像"), true);
+    showToast(_t("未找到当前模型的镜像配置"), true);
     return;
   }
   mnImgSyncBusy = true;
@@ -933,56 +891,57 @@ async function fillMultiNodeArgsForm(m) {
   const set = function (id, val) { const el = document.getElementById(id); if (el) el.value = val; };
   const setB = function (id, val) { const el = document.getElementById(id); if (el) el.checked = !!val; };
   setB("multi_enabled", v.enabled);
-  set("multi_dist_port", v.dist_init_port || 6464);
-  set("multi_nccl_port", v.nccl_port || 0);
-  set("multi_parallel_mode", v.parallel_mode || "tp");
+  set("multi_dist_port", v.dist_init_port || 6379);
   set("multi_extra_env", v.extra_env || "");
   renderMultiNodeTable();
 }
 
-function getSglangArgsFromForm() {
+function getVllmArgsFromForm() {
   const num = function (id) { return parseInt(document.getElementById(id).value) || 0; };
   const str = function (id) { const el = document.getElementById(id); return el ? el.value.trim() : ""; };
   const bool = function (id) { const el = document.getElementById(id); return el ? el.checked : false; };
   return {
-    image: str("sglang_image"),
-    shm_size: str("sglang_shm"),
-    context_length: 0,
+    shm_size: str("vllm_shm"),
     tensor_parallel_size: num("sg_tp") || 1,
-    mem_fraction_static: parseFloat(document.getElementById("sg_mem_frac").value) || 0,
-    dtype: str("sg_dtype"),
+    gpu_memory_utilization: parseFloat(document.getElementById("sg_gpu_mem_util").value) || 0,
     quantization: str("sg_quant"),
     kv_cache_dtype: str("sg_kv_dtype"),
-    schedule_policy: str("sg_sched"),
-    max_running_requests: num("sg_max_run"),
-    max_queued_requests: num("sg_max_queue"),
-    chunked_prefill_size: parseInt(document.getElementById("sg_chunk").value) || 0,
-    log_level: str("sg_log_level"),
-    log_requests: bool("sg_log_requests"),
-    enable_metrics: bool("sg_metrics"),
+    distributed_executor_backend: str("sg_dist_backend"),
+    load_format: str("sg_load_format"),
+    block_size: num("sg_block_size"),
+    tokenizer_mode: str("sg_tokenizer_mode"),
+    tool_call_parser: str("sg_tool_parser"),
+    reasoning_parser: str("sg_reasoning_parser"),
+    enable_auto_tool_choice: bool("sg_auto_tool_choice"),
+    trust_remote_code: bool("sg_trust_remote"),
+    max_num_seqs: num("sg_max_seqs"),
+    max_num_batched_tokens: parseInt(document.getElementById("sg_max_batched_tokens").value) || 0,
     extra_args: str("sg_extra_args").trim(),
+    extra_env: str("sg_extra_env").trim(),
   };
 }
 
-function fillSglangArgsForm(a) {
+function fillVllmArgsForm(a) {
   const v = a || {};
   const set = function (id, val) { const el = document.getElementById(id); if (el) el.value = val; };
   const setB = function (id, val) { const el = document.getElementById(id); if (el) el.checked = !!val; };
-  set("sglang_image", v.image || "");
-  set("sglang_shm", v.shm_size || "");
+  set("vllm_shm", v.shm_size || "");
   set("sg_tp", v.tensor_parallel_size || 1);
-  set("sg_mem_frac", v.mem_fraction_static || 0);
-  set("sg_dtype", v.dtype || "");
+  set("sg_gpu_mem_util", v.gpu_memory_utilization || 0);
   set("sg_quant", v.quantization || "");
   set("sg_kv_dtype", v.kv_cache_dtype || "");
-  set("sg_sched", v.schedule_policy || "");
-  set("sg_max_run", v.max_running_requests || 0);
-  set("sg_max_queue", v.max_queued_requests || 0);
-  set("sg_chunk", v.chunked_prefill_size || 0);
-  set("sg_log_level", v.log_level || "");
-  setB("sg_log_requests", v.log_requests);
-  setB("sg_metrics", v.enable_metrics);
+  set("sg_dist_backend", v.distributed_executor_backend || "");
+  set("sg_load_format", v.load_format || "");
+  set("sg_block_size", v.block_size || 256);
+  set("sg_tokenizer_mode", v.tokenizer_mode || "");
+  set("sg_tool_parser", v.tool_call_parser || "");
+  set("sg_reasoning_parser", v.reasoning_parser || "");
+  setB("sg_auto_tool_choice", v.enable_auto_tool_choice !== false);
+  setB("sg_trust_remote", v.trust_remote_code !== false);
+  set("sg_max_seqs", v.max_num_seqs || 0);
+  set("sg_max_batched_tokens", v.max_num_batched_tokens == null ? 0 : v.max_num_batched_tokens);
   set("sg_extra_args", v.extra_args || "");
+  set("sg_extra_env", v.extra_env || "");
 }
 
 function getParamsFromForm() {
@@ -990,7 +949,7 @@ function getParamsFromForm() {
   const portEl = document.getElementById("port");
   return {
     ctx_size: ctxVal,
-    port: portEl ? (parseInt(portEl.value) || 5678) : 5678,
+    port: portEl ? (parseInt(portEl.value) || 8000) : 8000,
     host: "127.0.0.1",
   };
 }
@@ -999,17 +958,17 @@ function fillFormFromParams(params) {
   const p = params || {};
   document.getElementById("ctx_size").value = p.ctx_size ?? p.ctxSize ?? DEFAULT_CTX_SIZE;
   const portEl = document.getElementById("port");
-  if (portEl) portEl.value = p.port ?? 5678;
+  if (portEl) portEl.value = p.port ?? 8000;
 }
 
 async function saveParams() {
   const params = getParamsFromForm();
   console.log("[settings] 保存参数:", JSON.stringify(params));
   try {
-    // 加载完整设置，仅替换 launch_params 与 sglang_args
+    // 加载完整设置，仅替换 launch_params 与 vllm_args
     let s = await invoke()("load_settings");
     s.launch_params = params;
-    s.sglang_args = getSglangArgsFromForm();
+    s.vllm_args = getVllmArgsFromForm();
     s.multi_node_args = getMultiNodeArgsFromForm();
     await invoke()("save_settings", { settings: s });
     console.log("[settings] 保存成功");
@@ -1022,15 +981,15 @@ async function saveParams() {
 
 function resetParams() {
   fillFormFromParams({ ctx_size: DEFAULT_CTX_SIZE });
-  fillSglangArgsForm(null);
+  fillVllmArgsForm(null);
   autoSave();
 }
 
 function autoSave() { saveParams(); }
 
 function setupAutoSave() {
-  ["ctx_size", "port", "host", "sglang_image", "sglang_shm", "sg_tp", "sg_mem_frac", "sg_dtype", "sg_quant", "sg_kv_dtype", "sg_sched", "sg_max_run", "sg_max_queue", "sg_chunk", "sg_log_level", "sg_log_requests", "sg_metrics", "sg_extra_args",
-   "multi_enabled", "multi_dist_port", "multi_nccl_port", "multi_parallel_mode", "multi_extra_env"].forEach(function (id) {
+  ["ctx_size", "port", "vllm_shm", "sg_tp", "sg_gpu_mem_util", "sg_quant", "sg_kv_dtype", "sg_dist_backend", "sg_load_format", "sg_block_size", "sg_tokenizer_mode", "sg_tool_parser", "sg_reasoning_parser", "sg_auto_tool_choice", "sg_trust_remote", "sg_max_seqs", "sg_max_batched_tokens", "sg_extra_args", "sg_extra_env",
+   "multi_enabled", "multi_dist_port", "multi_extra_env"].forEach(function (id) {
     var el = document.getElementById(id);
     if (el) el.addEventListener("change", autoSave);
   });
@@ -1199,78 +1158,6 @@ function renderThemeGrid() {
   });
 }
 
-// ===== 推理引擎镜像管理 =====
-
-// 下拉与列表联动：下拉实时反映配置（即当前选中的本地版本），列表标出使用中/已配置
-async function loadEngineImages() {
-  const tbody = document.getElementById("engine-tbody");
-  if (!tbody) return;
-  try {
-    let configured = "";
-    try {
-      const s = await invoke()("load_settings");
-      configured = (s.sglang_args && s.sglang_args.image) || "";
-    } catch (_) {}
-
-    const images = await invoke()("list_engine_images");
-    const sel = document.getElementById("sglang_image");
-
-    // 下拉：本地镜像 + 配置值（不在本地时前置追加，保证默认选中）
-    if (sel) {
-      const tags = images.map(function (i) { return i.repoTag; });
-      if (configured && tags.indexOf(configured) === -1) tags.unshift(configured);
-      sel.innerHTML = tags.map(function (t) {
-        return '<option value="' + escHtml(t) + '"' + (t === configured ? ' selected' : '') + '>' + escHtml(t) + '</option>';
-      }).join("");
-      if (tags.length === 0) {
-        sel.innerHTML = '<option value="">--</option>';
-      }
-    }
-
-    if (!images || images.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--c-text-3);padding:16px;">' + _t("本地没有已拉取的推理引擎镜像") + '</td></tr>';
-      return;
-    }
-    tbody.innerHTML = images.map(function (img) {
-      const inUse = img.inUse;
-      const isCurrent = configured === img.repoTag;
-      const status = inUse ? '<span style="color:#4caf50;">' + _t("使用中") + '</span>' : (isCurrent ? _t("已配置") : _t("未使用"));
-      const delBtn = inUse ? "" : '<button class="btn-reset engine-del-btn" data-tag="' + escHtml(img.repoTag) + '" style="margin:0;padding:4px 12px;font-size:12px;color:#f44336;">' + _t("删除") + '</button>';
-      return '<tr>' +
-        '<td style="font-family:monospace;font-size:12px;">' + escHtml(img.repoTag) + '</td>' +
-        '<td style="text-align:center;font-size:12px;">' + escHtml(img.size) + '</td>' +
-        '<td style="text-align:center;font-size:12px;">' + status + '</td>' +
-        '<td style="text-align:center;white-space:nowrap;">' + delBtn + '</td>' +
-      '</tr>';
-    }).join("");
-    tbody.querySelectorAll(".engine-del-btn").forEach(function (btn) {
-      btn.addEventListener("click", function () { deleteEngineImage(btn.dataset.tag, btn); });
-    });
-  } catch (e) {
-    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#f44336;padding:16px;">' + _t("列表加载失败: ") + escHtml(String(e)) + '</td></tr>';
-  }
-}
-
-async function deleteEngineImage(tag, btn) {
-  const ok = await showConfirmDialog(_t("确认删除镜像 ") + tag + _t("？此操作不可恢复"));
-  if (!ok) return;
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = _t("正在删除...");
-  }
-  try {
-    await invoke()("delete_engine_image", { repoTag: tag });
-    showToast(_t("镜像已删除"));
-    loadEngineImages();
-  } catch (e) {
-    if (btn) {
-      btn.disabled = false;
-      btn.textContent = _t("删除");
-    }
-    showToast(_t("删除失败: ") + e, true);
-  }
-}
-
 // ===== Docker 镜像配置（daemon.json registry-mirrors）=====
 
 // 解析后端错误消息：FALLBACK_MANUAL|xxx 携带手动执行命令；PKEXEC_CANCELLED / UAC_CANCELLED 为用户取消
@@ -1408,7 +1295,6 @@ export default {
 
     setupAutoSave();
     renderThemeGrid();
-    loadEngineImages();
 
     // ===== 多机互联：节点表交互（tbody 事件委托，change 写回并自动保存）=====
     var mnTbody = document.getElementById("mn-tbody");
@@ -1459,24 +1345,16 @@ export default {
     var mnModelStatusEl = document.getElementById("mn-sync-model-status");
     if (mnModelStatusEl && mnModelSyncStatus) mnModelStatusEl.textContent = mnModelSyncStatus;
 
-    var engineRefresh = document.getElementById("engine-refresh-btn");
-    if (engineRefresh) engineRefresh.addEventListener("click", loadEngineImages);
-    // 下拉切换镜像：setupAutoSave 已负责保存，这里仅联动刷新列表标注
-    var engineSel = document.getElementById("sglang_image");
-    if (engineSel) engineSel.addEventListener("change", loadEngineImages);
-
     (async function() {
       try {
         const settings = await invoke()("load_settings");
         console.log("[settings] 加载设置成功, keys:", Object.keys(settings));
         const params = settings.launch_params || settings.launchParams;
         if (settings && params) fillFormFromParams(params);
-        // SGLang 详细参数回填
-        if (settings && settings.sglang_args) fillSglangArgsForm(settings.sglang_args);
+        // vLLM 详细参数回填
+        if (settings && settings.vllm_args) fillVllmArgsForm(settings.vllm_args);
         // 多机互联配置回填
         if (settings) await fillMultiNodeArgsForm(settings.multi_node_args);
-        // 参数回填后再刷一次镜像列表，保证"当前配置镜像/已配置"标记准确
-        loadEngineImages();
       } catch (e) {
         console.error("加载设置失败:", e);
       }
