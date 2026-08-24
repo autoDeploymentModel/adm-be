@@ -1227,8 +1227,10 @@ fn push_vllm_flags(args: &mut Vec<String>, vllm_flags: &Option<Vec<String>>) {
 
 /// 多机 head（本机 rank 0）docker run 参数：跑 `vllm serve` + Ray 后端，
 /// 末尾固定追加 `--distributed-executor-backend ray --nnodes N --node-rank 0
-/// --tensor-parallel-size N --ray-init-address 127.0.0.1:<dist_init_port>`，
+/// --tensor-parallel-size N --master-addr <node0_ip> --master-port <dist_init_port>`，
 /// 保证跨节点 TP 拓扑不被设置页/模型清单同名参数覆盖。
+/// 用 fork 推荐的 `--master-addr/--master-port` 代替项目历史使用的 `--ray-init-address 127.0.0.1:<port>`
+/// （127.0.0.1 让 worker 无法从外部连到 Ray head；fork 公开仓库无 `--ray-init-address`）。
 fn build_multi_node_head_args(
     model_id: &str,
     model_dir: &std::path::Path,
@@ -1244,6 +1246,7 @@ fn build_multi_node_head_args(
 ) -> Vec<String> {
     let container_name = format!("adm-vllm-{}-rank-0", model_id);
     let mount_dst = format!("/models/{}", model_id);
+    let node0_ip = mn.nodes[0].ip.clone();
     let mut args = build_common_docker_prefix(&container_name, shm_size, iface, has_infiniband, &mn.extra_env);
     args.push("-v".to_string());
     args.push(format!("{}:{}:ro", model_dir.to_string_lossy(), mount_dst));
@@ -1255,6 +1258,11 @@ fn build_multi_node_head_args(
     args.push("0.0.0.0".to_string());
     args.push("--port".to_string());
     args.push(port.to_string());
+
+    // 注入 RAY_ADDRESS env 到容器，确保 vllm 内部 ray.init() 加入我们启动的 Ray head 集群
+    // （不必靠 fork 默认 auto-detect，减少与 head 容器内已有 ray 实例的竞争）
+    args.push("-e".to_string());
+    args.push(format!("RAY_ADDRESS={}:{}", node0_ip, mn.dist_init_port));
 
     push_vllm_args(&mut args, vllm_args, ctx_size);
     push_vllm_flags(&mut args, vllm_flags);
@@ -1269,23 +1277,34 @@ fn build_multi_node_head_args(
         "0".to_string(),
         "--tensor-parallel-size".to_string(),
         n_nodes.to_string(),
-        "--ray-init-address".to_string(),
-        format!("127.0.0.1:{}", mn.dist_init_port),
+        "--master-addr".to_string(),
+        node0_ip,
+        "--master-port".to_string(),
+        mn.dist_init_port.to_string(),
     ]);
     args
 }
 
-/// 多机 worker（远端 rank i）docker run 参数：跑 `python -m vllm.distributed.ray_utils`
-/// 加入 head 的 Ray 集群（`--ray-address <head_ip>:<dist_init_port>`）；不跑 vllm serve。
-/// 与单机差异：仅共享 docker 前缀 + 模型挂载，entrypoint 是 Ray worker。
-/// 启动顺序：先起 worker（加入 Ray head），再起 head 的 vllm serve。
+/// 多机 worker（远端 rank i）docker run 参数：跑 `sleep infinity`（fork `launch-cluster.sh` keepalive）。
+///
+/// 严格对齐 eugr/spark-vllm-docker fork `launch-cluster.sh --ray` 模式：
+/// 1. 容器仅跑 `sleep infinity`，不做任何业务逻辑
+/// 2. Ray 进程由本函数返回 docker run 完成后，由 `start_multi_node` 通过 SSH `docker exec -d` 启动
+///    `ray start --block --address=<head>:<port> ...` 加入 head 的 Ray 集群
+/// 3. 这避免了项目历史方案 `python -m vllm.distributed.ray_utils` 的两个隐患：
+///    - 镜像无 `python` 软链导致 nvidia_entrypoint.sh 报 `exec: python: not found`
+///    - `vllm.distributed.ray_utils` 模块并未出现在 fork 公开仓库里（依赖隐性维护分支）
+///
+/// Ray 启动参数与 fork `start_ray_worker` 完全一致：
+///   ray start --block --object-store-memory=1073741824 --num-cpus=2 --disable-usage-stats
+///            --address=<head_ip>:<dist_init_port> --node-ip-address=<worker_ip>
 fn build_multi_node_worker_args(
     model_id: &str,
     model_dir: &std::path::Path,
     image: &str,
     shm_size: &str,
     rank: usize,
-    node0_ip: &str,
+    _node0_ip: &str,
     mn: &MultiNodeArgs,
     iface: Option<&str>,
     has_infiniband: bool,
@@ -1295,13 +1314,12 @@ fn build_multi_node_worker_args(
     let mut args = build_common_docker_prefix(&container_name, shm_size, iface, has_infiniband, &mn.extra_env);
     args.push("-v".to_string());
     args.push(format!("{}:{}:ro", model_dir.to_string_lossy(), mount_dst));
+    // fork 默认 `--entrypoint=` 清空镜像 ENTRYPOINT（避免 nvidia_entrypoint.sh 触发），
+    // 命令仅 `sleep infinity`，让容器保活等待后续 docker exec 启动 Ray worker
+    args.push("--entrypoint=".to_string());
     args.push(image.to_string());
-    // Ray worker entrypoint（eugr/spark-vllm fork 自定义模块；upstream vLLM 无此 CLI）
-    args.push("python".to_string());
-    args.push("-m".to_string());
-    args.push("vllm.distributed.ray_utils".to_string());
-    args.push("--ray-address".to_string());
-    args.push(format!("{}:{}", node0_ip, mn.dist_init_port));
+    args.push("sleep".to_string());
+    args.push("infinity".to_string());
     args
 }
 
@@ -1586,6 +1604,50 @@ async fn start_multi_node(
             "line": format!("[多机] 远端节点 {}（rank {}）容器已就绪", node.ip, i),
             "source": "stdout",
         }));
+
+        // ===== 在已起的 sleep infinity 容器内 fork Ray worker（fork 标准做法）=====
+        // ray start --block --address=<head>:<port> 通过 docker exec -d 派到容器后台；
+        // docker exec 自身立即返回（不阻塞启动）。ray 进程随后在容器里 block 等 head。
+        // 日志跟容器 nohup 同路径（/tmp/adm_vllm_<model>_rank_<i>.log），便于出错时排查。
+        // 失败不回滚：vllm serve 启动时若 cluster 节点数不足会自然超时失败，
+        // 这里只记日志 + 前端可见，简化启动逻辑。
+        let ray_script = crate::common::ssh::start_ray_worker_script(
+            &container,
+            &node0_ip,
+            mn.dist_init_port,
+            &node.ip,
+            &log_path,
+            use_sudo,
+        );
+        match crate::common::ssh::ssh_run(
+            &node.ip, &node.ssh_user, node.ssh_port, key_ref, &ray_script,
+            std::time::Duration::from_secs(15),
+        ).await {
+            Ok((true, _, _)) => {
+                let _ = app.emit("model-log", serde_json::json!({
+                    "model_id": model_id,
+                    "line": format!("[多机] 远端节点 {}（rank {}）Ray worker 已派发（等待 head cluster）", node.ip, i),
+                    "source": "stdout",
+                }));
+            }
+            Ok((false, _, err)) => {
+                crate::common::utils::logger::write_log(
+                    "WARN", "MODEL",
+                    &format!("[{}] 远端节点 {}（rank {}）Ray worker 派发失败: {}（继续，等 vllm 端超时）", model_id, node.ip, i, err),
+                );
+                let _ = app.emit("model-log", serde_json::json!({
+                    "model_id": model_id,
+                    "line": format!("[多机] 远端节点 {}（rank {}）Ray worker 派发失败（继续）", node.ip, i),
+                    "source": "stderr",
+                }));
+            }
+            Err(e) => {
+                crate::common::utils::logger::write_log(
+                    "WARN", "MODEL",
+                    &format!("[{}] 远端节点 {}（rank {}）Ray worker 派发异常: {}", model_id, node.ip, i, e),
+                );
+            }
+        }
     }
 
     // ===== 本机（rank 0）=====

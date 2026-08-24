@@ -222,6 +222,37 @@ pub fn start_container_script(container_name: &str, docker_args: &[String], log_
     )
 }
 
+/// 远端 `docker exec -d <container> bash -c "ray start --block --address=…"` 脚本：
+/// 在已起来的 sleep infinity 容器内 fork Ray worker 进程，对接 head 的 Ray 集群。
+/// 严格对齐 eugr/spark-vllm-docker fork `launch-cluster.sh` 的 `start_ray_worker`：
+///   ray start --block --object-store-memory=1073741824 --num-cpus=2 --disable-usage-stats
+///            --address=<head_ip>:<port> --node-ip-address=<worker_ip>
+/// 日志落盘到 `log_path`（与 docker run 的 worker 日志同路径，便于统一排查）。
+/// `use_sudo=true` 时 docker 命令加 `sudo -n` 前缀（远端非 docker 组环境）。
+pub fn start_ray_worker_script(
+    container_name: &str,
+    head_ip: &str,
+    ray_port: u16,
+    worker_ip: &str,
+    log_path: &str,
+    use_sudo: bool,
+) -> String {
+    let dk = if use_sudo { "sudo -n docker" } else { "docker" };
+    // ray start --block 以前台进程形式运行；通过 docker exec -d 把 ray 进程派到容器后台，
+    // docker exec 自身立即返回（所以这条 SSH 调用是快的，不会阻塞启动）
+    let inner = format!(
+        "ray start --block --object-store-memory=1073741824 --num-cpus=2 --disable-usage-stats \
+         --address={}:{} --node-ip-address={} >> {} 2>&1",
+        head_ip, ray_port, worker_ip, log_path
+    );
+    format!(
+        "{dk} exec -d {c} bash -c {inner_q} && echo RAY_STARTED",
+        dk = dk,
+        c = sh_quote(container_name),
+        inner_q = sh_quote(&inner)
+    )
+}
+
 /// 同步版 ssh 执行（应用退出兜底清理用，进程内轮询等待，超时强杀）。
 pub fn ssh_run_blocking(
     host: &str,
