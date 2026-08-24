@@ -1026,12 +1026,17 @@ async fn detect_remote_iface(
 
 /// 共享 docker run 前缀（多机 head/worker 都用）：
 /// `--name --gpus --shm-size --cap-add --ulimit --ipc host --network host` +
-/// 可选 `--device /dev/infiniband` + 可选 `-e NCCL_SOCKET_IFNAME/GLOO_SOCKET_IFNAME` +
+/// 可选 `--device /dev/infiniband` + 可选 fork `get_env_flags` 全套网卡 env（VLLM_HOST_IP /
+/// MN_IF_NAME / UCX_NET_DEVICES / NCCL_SOCKET_IFNAME / OMPI_MCA_btl_tcp_if_include /
+/// GLOO_SOCKET_IFNAME / TP_SOCKET_IFNAME / NCCL_IB_HCA / NCCL_IB_DISABLE）+ 
 /// `multi_node_args.extra_env` 每行 `-e KEY=VALUE` + `NCCL_DEBUG=INFO` 默认值。
+/// `node_ip`：该容器所在节点自身的互联 IP（VLLM_HOST_IP 用，避免 vllm 取 WiFi 等错误地址）。
 fn build_common_docker_prefix(
     container_name: &str,
     shm_size: &str,
+    node_ip: &str,
     iface: Option<&str>,
+    ib_iface: Option<&str>,
     has_infiniband: bool,
     mn_extra_env: &str,
 ) -> Vec<String> {
@@ -1062,14 +1067,39 @@ fn build_common_docker_prefix(
     if has_infiniband {
         args.push("--device".to_string());
         args.push("/dev/infiniband".to_string());
+        // 对齐 fork get_env_flags：IB 存在时注入 NCCL_IB_HCA 并显式 NCCL_IB_DISABLE=0
+        // （不指定 HCA 时 NCCL 可能自检到错误设备卡在建连；IB 不可用时由用户 extra_env 覆盖 IB_DISABLE=1）
+        if let Some(ib) = ib_iface.filter(|s| !s.trim().is_empty()) {
+            args.extend([
+                "-e".to_string(),
+                format!("NCCL_IB_HCA={}", ib.trim()),
+                "-e".to_string(),
+                "NCCL_IB_DISABLE=0".to_string(),
+            ]);
+        }
     }
     // 网卡名注入 NCCL/GLOO（多机 collective 必需）；None 时让 NCCL 自动发现
+    // 对齐 fork launch-cluster.sh 的 get_env_flags，避免多网卡（WiFi/docker0）抢互联口：
+    // VLLM_HOST_IP 让 vllm 用互联 IP（否则可能取 WiFi 地址导致跨节点握手走错网卡）；
+    // TP_SOCKET_IFNAME/UCX_NET_DEVICES/OMPI_MCA_btl_tcp_if_include 显式约束通信接口；
+    // MN_IF_NAME 为 fork 自定义变量。
     if let Some(iface_name) = iface.filter(|s| !s.trim().is_empty()) {
+        let ifn = iface_name.trim();
         args.extend([
             "-e".to_string(),
-            format!("NCCL_SOCKET_IFNAME={}", iface_name.trim()),
+            format!("VLLM_HOST_IP={}", node_ip),
             "-e".to_string(),
-            format!("GLOO_SOCKET_IFNAME={}", iface_name.trim()),
+            format!("MN_IF_NAME={}", ifn),
+            "-e".to_string(),
+            format!("UCX_NET_DEVICES={}", ifn),
+            "-e".to_string(),
+            format!("NCCL_SOCKET_IFNAME={}", ifn),
+            "-e".to_string(),
+            format!("OMPI_MCA_btl_tcp_if_include={}", ifn),
+            "-e".to_string(),
+            format!("GLOO_SOCKET_IFNAME={}", ifn),
+            "-e".to_string(),
+            format!("TP_SOCKET_IFNAME={}", ifn),
         ]);
     }
     // 设置页「额外环境变量」每行 KEY=VALUE → -e KEY=VALUE（NCCL 排查如 NCCL_DEBUG=TRACE / NCCL_SOCKET_NTHREADS=1）
@@ -1224,12 +1254,14 @@ fn build_multi_node_head_args(
     image: &str,
     shm_size: &str,
     mn: &MultiNodeArgs,
+    node_ip: &str,
     iface: Option<&str>,
+    ib_iface: Option<&str>,
     has_infiniband: bool,
 ) -> Vec<String> {
     let container_name = format!("adm-vllm-{}-rank-0", model_id);
     let mount_dst = format!("/models/{}", model_id);
-    let mut args = build_common_docker_prefix(&container_name, shm_size, iface, has_infiniband, &mn.extra_env);
+    let mut args = build_common_docker_prefix(&container_name, shm_size, node_ip, iface, ib_iface, has_infiniband, &mn.extra_env);
     args.push("-v".to_string());
     args.push(format!("{}:{}:ro", model_dir.to_string_lossy(), mount_dst));
     // 容器必须 detached（本地回头要 `docker exec -d` 起 worker/head 的 vllm serve），`-d` 放 image 之前
@@ -1353,12 +1385,14 @@ fn build_multi_node_worker_args(
     rank: usize,
     _node0_ip: &str,
     mn: &MultiNodeArgs,
+    node_ip: &str,
     iface: Option<&str>,
+    ib_iface: Option<&str>,
     has_infiniband: bool,
 ) -> Vec<String> {
     let container_name = format!("adm-vllm-{}-rank-{}", model_id, rank);
     let mount_dst = format!("/models/{}", model_id);
-    let mut args = build_common_docker_prefix(&container_name, shm_size, iface, has_infiniband, &mn.extra_env);
+    let mut args = build_common_docker_prefix(&container_name, shm_size, node_ip, iface, ib_iface, has_infiniband, &mn.extra_env);
     args.push("-v".to_string());
     args.push(format!("{}:{}:ro", model_dir.to_string_lossy(), mount_dst));
     // fork 默认 `--entrypoint=` 清空镜像 ENTRYPOINT（避免 nvidia_entrypoint.sh 触发），
@@ -1564,6 +1598,16 @@ async fn start_multi_node(
                 "source": "stdout",
             }));
         }
+        // 远端 IB 接口名（NCCL_IB_HCA 用）：取 ib 口名，如 mlx5_0；拿不到则留空让 NCCL 自检
+        let remote_ib_iface = if remote_has_ib {
+            crate::common::ssh::ssh_run(
+                &node.ip, &node.ssh_user, node.ssh_port, key_ref,
+                "ls /sys/class/infiniband 2>/dev/null | head -3 | tr '\\n' ',' | sed 's/,$//'",
+                std::time::Duration::from_secs(10),
+            ).await.ok().map(|(_, o, _)| o.trim().to_string()).filter(|s| !s.is_empty() && s != "No such file or directory")
+        } else {
+            None
+        };
         let args = build_multi_node_worker_args(
             model_id,
             &std::path::Path::new(&node_model_dir),
@@ -1572,7 +1616,9 @@ async fn start_multi_node(
             i,
             &node0_ip,
             &mn,
+            &node.ip,
             remote_iface.as_deref(),
+            remote_ib_iface.as_deref(),
             remote_has_ib,
         );
         let container = multi_container_name(model_id, i);
@@ -1690,8 +1736,19 @@ async fn start_multi_node(
         }));
     }
     let local_has_ib = std::path::Path::new("/dev/infiniband").exists();
+    // 本机 IB 接口名（NCCL_IB_HCA 用）
+    let local_ib_iface = if local_has_ib {
+        std::process::Command::new("sh")
+            .args(["-c", "ls /sys/class/infiniband 2>/dev/null | head -3 | tr '\\n' ',' | sed 's/,$//'"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    };
     let args0 = build_multi_node_head_args(
-        model_id, model_dir, &image, &shm_size, &mn, local_iface.as_deref(), local_has_ib,
+        model_id, model_dir, &image, &shm_size, &mn, &node0_ip, local_iface.as_deref(), local_ib_iface.as_deref(), local_has_ib,
     );
 
     dbg_log!("[DEBUG] vllm multi-node head container args (rank0): {:?}", args0);
