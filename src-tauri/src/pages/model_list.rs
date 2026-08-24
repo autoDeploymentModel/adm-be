@@ -1436,6 +1436,9 @@ async fn start_multi_node(
 
     // ===== 远端节点：预检 + 启动 + 快速就绪确认（任一失败回滚）=====
     let node0_ip = mn.nodes[0].ip.clone();
+    // 收集各 worker 的 (rank, container, use_sudo, log_path)，供 Phase 5 复用——
+    // 避免再对每个节点重复 SSH 探测 sudo（SSH 抖动可能导致 sudo 判定与容器启动时不一致）
+    let mut worker_runtime: Vec<(usize, String, bool, String)> = Vec::new();
     for (i, node) in mn.nodes.iter().enumerate().skip(1) {
         let node_model_dir = effective_remote_model_dir(&node.model_dir, &node.ssh_user, model_id);
         // 预检：docker daemon / GPU / 本机所用镜像 / 模型目录（含 .done）
@@ -1611,6 +1614,8 @@ async fn start_multi_node(
             "line": format!("[多机] 远端节点 {}（rank {}）容器已就绪", node.ip, i),
             "source": "stdout",
         }));
+        // 记录 (rank, container, use_sudo, log_path) 供 Phase 5 ray join 复用（避免重复 sudo 探测）
+        worker_runtime.push((i, container.clone(), use_sudo, log_path));
     }
 
     // ===== 本机（rank 0）=====
@@ -1669,11 +1674,14 @@ async fn start_multi_node(
     }
 
     // ===== Phase 2: 等待 head 容器 Up =====
+    // 本地 `std::process::Command` 直传参数（不经 shell）：`--filter name=<container>` 里的容器名
+    // 是合法 docker 名（无空格/引号），不能套 sh_quote——单引号会原样传给 docker 导致永远匹配不上。
+    let ps_filter0 = format!("name={}", container0);
     let mut head_up = false;
     for _ in 0..15 {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         if let Ok(o) = crate::common::utils::platform::docker_cmd()
-            .args(["ps", "-a", "--filter", &format!("name={}", crate::common::ssh::sh_quote(&container0)), "--format", "{{.Names}} {{.Status}}"])
+            .args(["ps", "-a", "--filter", &ps_filter0, "--format", "{{.Names}} {{.Status}}"])
             .output() {
             let s = String::from_utf8_lossy(&o.stdout);
             if s.contains(&container0) && s.contains("Up") {
@@ -1689,7 +1697,7 @@ async fn start_multi_node(
     if !head_up {
         // 抓取 docker ps 输出以便诊断
         let ps_out = crate::common::utils::platform::docker_cmd()
-            .args(["ps", "-a", "--filter", &format!("name={}", crate::common::ssh::sh_quote(&container0)), "--format", "{{.Names}} {{.Status}}"])
+            .args(["ps", "-a", "--filter", &ps_filter0, "--format", "{{.Names}} {{.Status}}"])
             .output()
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
@@ -1712,9 +1720,11 @@ async fn start_multi_node(
     }));
 
     // ===== Phase 3: 在 head 容器内启动 Ray head（fork `start_ray_head` 标准做法）=====
+    // 输出重定向到容器 stdout（/proc/1/fd/1）与 fork 一致，便于 `docker logs <head>` 排查
     let ray_head_inner = format!(
         "ray start --block --head --port {} --object-store-memory=1073741824 --num-cpus=2 \
-         --node-ip-address={} --include-dashboard=false --disable-usage-stats",
+         --node-ip-address={} --include-dashboard=false --disable-usage-stats \
+         >> /proc/1/fd/1 2>&1",
         mn.dist_init_port, node0_ip
     );
     let _ = app.emit("model-log", serde_json::json!({
@@ -1722,16 +1732,24 @@ async fn start_multi_node(
         "line": "[多机] 本机（rank 0）派发 Ray start --head".to_string(),
         "source": "stdout",
     }));
-    if let Ok(s) = crate::common::utils::platform::docker_cmd()
+    match crate::common::utils::platform::docker_cmd()
         .args(["exec", "-d", &container0, "bash", "-c", &ray_head_inner])
         .status() {
-        if !s.success() {
+        Ok(s) if !s.success() => {
             let _ = crate::common::utils::platform::docker_cmd()
                 .args(["rm", "-f", &container0])
                 .output();
             stop_remote_containers(app, &mn, key_ref, model_id, 1).await;
             return Err(AppError::msg("ray start --head 派发失败（exit 非 0）".to_string()));
         }
+        Err(e) => {
+            let _ = crate::common::utils::platform::docker_cmd()
+                .args(["rm", "-f", &container0])
+                .output();
+            stop_remote_containers(app, &mn, key_ref, model_id, 1).await;
+            return Err(AppError::msg(format!("本地 docker exec 启动失败: {}", e)));
+        }
+        _ => {}
     }
 
     // ===== Phase 4: 等待 head Ray 集群就绪（轮询 `docker exec ray status`）=====
@@ -1766,21 +1784,11 @@ async fn start_multi_node(
     }));
 
     // ===== Phase 5: 此时 head Ray 已就绪，worker 的 ray start --block --address 会立即 join =====
-    for (i, node) in mn.nodes.iter().enumerate().skip(1) {
-        let container = multi_container_name(model_id, i);
-        // node_model_dir 在 worker loop 启动 docker run 时已用到；Phase 5 仅派发 ray start，
-        // 直接用 worker loop 留下的 log_path / container / use_sudo 状态即可。
-        let log_path = format!("/tmp/adm_vllm_{}_rank_{}.log", model_id, i);
-        // 探测 sudo 状态与上面 worker loop 一致（前面已探过，但这阶段复用 use_sudo 没必要重探，假设不变；
-        // 与本机 docker run 不同：远端 docker 子命令需要 sudo 兜底，简单起见用稳定探测方式）
-        let (rsok, rcout, _) = crate::common::ssh::ssh_run(
-            &node.ip, &node.ssh_user, node.ssh_port, key_ref,
-            "sudo -n true 2>/dev/null && echo SUDO_OK || echo SUDO_NO",
-            std::time::Duration::from_secs(10),
-        ).await.unwrap_or((false, String::new(), String::new()));
-        let use_sudo = rsok && rcout.contains("SUDO_OK");
+    // 复用 worker loop 里已确定的 (container, use_sudo, log_path)，避免重复 SSH sudo 探测
+    for (i, container, use_sudo, log_path) in &worker_runtime {
+        let node = &mn.nodes[*i];
         let ray_script = crate::common::ssh::start_ray_worker_script(
-            &container, &node0_ip, mn.dist_init_port, &node.ip, &log_path, use_sudo,
+            container, &node0_ip, mn.dist_init_port, &node.ip, log_path, *use_sudo,
         );
         match crate::common::ssh::ssh_run(
             &node.ip, &node.ssh_user, node.ssh_port, key_ref, &ray_script,
@@ -1836,6 +1844,9 @@ async fn start_multi_node(
             .arg("-e").arg("TERM=xterm")
             .arg(&container0)
             .arg("bash").arg("-c").arg(&vllm_inner)
+            // 显式 stdin null：`docker exec -i` 默认继承父进程 stdin，
+            // Windows 无控制台（windows_subsystem）下可能拿到失效句柄导致 docker 报错
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         match cmd.spawn() {
