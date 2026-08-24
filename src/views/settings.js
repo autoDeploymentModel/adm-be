@@ -297,8 +297,8 @@ const template = `
             <div class="param-input">
               <select id="sg_dist_backend">
                 <option value="">${_t("auto（单机）")}</option>
-                <option value="ray">${_t("ray（多机）")}</option>
-                <option value="mp">mp</option>
+                <option value="mp">${_t("mp（多机）")}</option>
+                <option value="ray">${_t("ray（慎用：多机镜像不支持）")}</option>
               </select>
             </div>
           </div>
@@ -475,8 +475,8 @@ const template = `
         <div class="param-group">
           <div class="param-group-title">${_t("互联参数")}</div>
           <div class="param-row">
-            <div class="param-label">${_t("Ray 端口")}<div class="param-key">--ray-init-address</div></div>
-            <div class="param-input"><input type="number" id="multi_dist_port" value="6379" min="1" max="65535" style="max-width:160px;"><div class="param-desc">${_t("Ray 分布式引导端口（所有节点通过节点 0 的该端口握手），不得与模型服务端口冲突")}</div></div>
+            <div class="param-label">${_t("master 端口")}<div class="param-key">--master-port</div></div>
+            <div class="param-input"><input type="number" id="multi_dist_port" value="6379" min="1" max="65535" style="max-width:160px;"><div class="param-desc">${_t("分布式 master 端口（所有节点通过节点 0 的该端口握手，fork `launch-cluster.sh` 的 MASTER_PORT），不得与模型服务端口冲突")}</div></div>
           </div>
           <div class="param-row" style="align-items:flex-start;">
             <div class="param-label">${_t("额外环境变量")}<div class="param-key">extra_env</div></div>

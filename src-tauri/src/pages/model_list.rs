@@ -948,10 +948,10 @@ fn validate_multi_node(mn: &MultiNodeArgs, port: u16) -> Result<(), AppError> {
         bail!("本机（rank 0）IP 不能为空（其他节点需通过该地址互联）");
     }
     if mn.dist_init_port == 0 {
-        bail!("Ray 端口（--ray-init-address）不能为 0");
+        bail!("多机 master 端口（--master-port）不能为 0");
     }
     if mn.dist_init_port == port {
-        bail!("Ray 端口 {} 与模型服务端口冲突，请在设置页修改 Ray 端口", port);
+        bail!("多机 master 端口 {} 与模型服务端口冲突，请在设置页修改 master 端口", port);
     }
     for (i, n) in mn.nodes.iter().enumerate() {
         if n.ip.trim().is_empty() {
@@ -1229,17 +1229,11 @@ fn build_multi_node_head_args(
 ) -> Vec<String> {
     let container_name = format!("adm-vllm-{}-rank-0", model_id);
     let mount_dst = format!("/models/{}", model_id);
-    let node0_ip = mn.nodes[0].ip.clone();
     let mut args = build_common_docker_prefix(&container_name, shm_size, iface, has_infiniband, &mn.extra_env);
-    // RAY_ADDRESS env 必须放在 image 之前（docker [OPTIONS] IMAGE [CMD] 语法，
-    // 否则 docker 会把 `-e RAY_ADDRESS=...` 当作 `vllm serve` 的位置参数，
-    // vllm 报 `unrecognized arguments: RAY_ADDRESS=...` 直接退出）
-    args.push("-e".to_string());
-    args.push(format!("RAY_ADDRESS={}:{}", node0_ip, mn.dist_init_port));
     args.push("-v".to_string());
     args.push(format!("{}:{}:ro", model_dir.to_string_lossy(), mount_dst));
-    // 容器必须 detached（本地回头要 `docker exec -d` 起 ray start --head、再 `docker exec -i` 起 vllm serve），
-    // `-d` 放 image 之前
+    // 容器必须 detached（本地回头要 `docker exec -d` 起 worker/head 的 vllm serve），`-d` 放 image 之前
+    // 不再注入 RAY_ADDRESS：fork 镜像禁止 ray backend + nnodes>1，多机走 no-Ray(mp) 模式
     args.push("-d".to_string());
     args.push(image.to_string());
     args.push("sleep".to_string());
@@ -1248,10 +1242,12 @@ fn build_multi_node_head_args(
 }
 
 /// 多机 head 本地 `docker exec -i <container> bash -c "..."` 内部 `vllm serve ...` 命令的参数。
-/// 末尾固定追加 fork 风格的多机参数：
-///   `--distributed-executor-backend ray --nnodes N --node-rank 0 --tensor-parallel-size N
+/// 末尾固定追加 fork `launch-cluster.sh exec_no_ray_cluster` 的 head 多机参数：
+///   `--distributed-executor-backend mp --nnodes N --node-rank 0 --tensor-parallel-size N
 ///    --master-addr <node0_ip> --master-port <dist_init_port>`
-/// 自动 join head 容器内已起的 Ray 集群（`RAY_ADDRESS` env 引导）。
+/// 注意：fork 镜像 pydantic 校验 `nnodes > 1 can only be set when distributed executor
+/// backend is mp, uni or external_launcher`——因此 backend 必须显式 mp（覆盖用户 vllm_flags
+/// 里可能自带的 ray），绝不能再用 ray。
 /// 调用方负责 shell escape 并拼成 `bash -c "<joined tokens>"`。
 fn build_head_vllm_exec_args(
     model_id: &str,
@@ -1277,7 +1273,7 @@ fn build_head_vllm_exec_args(
     let n_nodes = mn.nodes.len();
     args.extend([
         "--distributed-executor-backend".to_string(),
-        "ray".to_string(),
+        "mp".to_string(),
         "--nnodes".to_string(),
         n_nodes.to_string(),
         "--node-rank".to_string(),
@@ -1288,6 +1284,50 @@ fn build_head_vllm_exec_args(
         node0_ip,
         "--master-port".to_string(),
         mn.dist_init_port.to_string(),
+    ]);
+    args
+}
+
+/// 多机 worker（远端 rank i）vllm serve 命令参数：与 head 相同但末尾追加 `--headless`。
+/// 严格对齐 fork `exec_no_ray_cluster`：每条 worker 都完整起一个 vllm serve（不 serve API，
+/// 仅参与分布式初始化），master 地址指向 head（node 0），由 head 端等待所有 rank join。
+fn build_multi_node_worker_vllm_args(
+    model_id: &str,
+    port: u16,
+    vllm_args: &VllmArgs,
+    vllm_flags: &Option<Vec<String>>,
+    rank: usize,
+    mn: &MultiNodeArgs,
+    ctx_size: Option<i32>,
+) -> Vec<String> {
+    let mount_dst = format!("/models/{}", model_id);
+    let node0_ip = mn.nodes[0].ip.clone();
+    let mut args = vec![
+        "vllm".to_string(),
+        "serve".to_string(),
+        mount_dst,
+        "--host".to_string(),
+        "0.0.0.0".to_string(),
+        "--port".to_string(),
+        port.to_string(),
+    ];
+    push_vllm_args(&mut args, vllm_args, ctx_size);
+    push_vllm_flags(&mut args, vllm_flags);
+    let n_nodes = mn.nodes.len();
+    args.extend([
+        "--distributed-executor-backend".to_string(),
+        "mp".to_string(),
+        "--nnodes".to_string(),
+        n_nodes.to_string(),
+        "--node-rank".to_string(),
+        rank.to_string(),
+        "--tensor-parallel-size".to_string(),
+        n_nodes.to_string(),
+        "--master-addr".to_string(),
+        node0_ip,
+        "--master-port".to_string(),
+        mn.dist_init_port.to_string(),
+        "--headless".to_string(),
     ]);
     args
 }
@@ -1431,11 +1471,11 @@ async fn start_multi_node(
             bail!("端口 {} 已被占用，请先关闭占用该端口的进程，或在设置页更换监听端口", port);
         }
     }
-    // Ray 端口占用检查（worker 通过该端口 join head 的 Ray 集群）
+    // master 端口占用检查（worker 通过该端口与 head 建立分布式连接）
     {
         let probe = std::net::TcpListener::bind(("0.0.0.0", mn.dist_init_port));
         if probe.is_err() {
-            bail!("Ray 端口 {} 已被占用，请在设置页更换 Ray 端口", mn.dist_init_port);
+            bail!("多机 master 端口 {} 已被占用，请在设置页更换 master 端口", mn.dist_init_port);
         }
     }
 
@@ -1735,109 +1775,56 @@ async fn start_multi_node(
         "source": "stdout",
     }));
 
-    // ===== Phase 3: 在 head 容器内启动 Ray head（fork `start_ray_head` 标准做法）=====
-    // 输出重定向到容器 stdout（/proc/1/fd/1）与 fork 一致，便于 `docker logs <head>` 排查
-    let ray_head_inner = format!(
-        "ray start --block --head --port {} --object-store-memory=1073741824 --num-cpus=2 \
-         --node-ip-address={} --include-dashboard=false --disable-usage-stats \
-         >> /proc/1/fd/1 2>&1",
-        mn.dist_init_port, node0_ip
-    );
+    // ===== Phase 3: 派发远端 worker 的 `vllm serve --headless`（no-Ray 多机，对齐 fork exec_no_ray_cluster）=====
+    // fork 镜像 pydantic 校验：nnodes > 1 只允许 mp / uni / external_launcher backend，
+    // 因此 worker 与 head 都用 `--distributed-executor-backend mp`（build 函数末尾强推，覆盖
+    // 用户 vllm_flags 里可能自带的 ray）。worker 必须先于 head 启动（但 docker exec -d 后台，
+    // 只派发不等待；head 的 vllm serve 会阻塞等所有 rank join）。
     let _ = app.emit("model-log", serde_json::json!({
         "model_id": model_id,
-        "line": "[多机] 本机（rank 0）派发 Ray start --head".to_string(),
+        "line": format!("[多机] 派发远端 worker 的 vllm serve --headless（rank 1..{}）", n_nodes - 1),
         "source": "stdout",
     }));
-    match crate::common::utils::platform::docker_cmd()
-        .args(["exec", "-d", &container0, "bash", "-c", &ray_head_inner])
-        .status() {
-        Ok(s) if !s.success() => {
-            let _ = crate::common::utils::platform::docker_cmd()
-                .args(["rm", "-f", &container0])
-                .output();
-            stop_remote_containers(app, &mn, key_ref, model_id, 1).await;
-            return Err(AppError::msg("ray start --head 派发失败（exit 非 0）".to_string()));
-        }
-        Err(e) => {
-            let _ = crate::common::utils::platform::docker_cmd()
-                .args(["rm", "-f", &container0])
-                .output();
-            stop_remote_containers(app, &mn, key_ref, model_id, 1).await;
-            return Err(AppError::msg(format!("本地 docker exec 启动失败: {}", e)));
-        }
-        _ => {}
-    }
-
-    // ===== Phase 4: 等待 head Ray 集群就绪（轮询 `docker exec ray status`）=====
-    // 远端 worker 此时还没派发 ray start --address；下面 Phase 5 一并处理
-    let mut ray_head_ready = false;
-    for _ in 0..30 {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        if let Ok(o) = crate::common::utils::platform::docker_cmd()
-            .args(["exec", &container0, "ray", "status"])
-            .output() {
-            if o.status.success() {
-                let s = String::from_utf8_lossy(&o.stdout);
-                // ray status 输出包含 "Node status" / "Active" 等关键字即可判定集群已注册
-                if s.contains("Node status") || s.contains("Active") || s.contains("======== Autoscaler status") {
-                    ray_head_ready = true;
-                    break;
-                }
-            }
-        }
-    }
-    if !ray_head_ready {
-        let _ = crate::common::utils::platform::docker_cmd()
-            .args(["rm", "-f", &container0])
-            .output();
-        stop_remote_containers(app, &mn, key_ref, model_id, 1).await;
-        return Err(AppError::msg("Ray head 60s 内未 ready".to_string()));
-    }
-    let _ = app.emit("model-log", serde_json::json!({
-        "model_id": model_id,
-        "line": "[多机] 本机（rank 0）Ray head ready".to_string(),
-        "source": "stdout",
-    }));
-
-    // ===== Phase 5: 此时 head Ray 已就绪，worker 的 ray start --block --address 会立即 join =====
-    // 复用 worker loop 里已确定的 (container, use_sudo, log_path)，避免重复 SSH sudo 探测
-    for (i, container, use_sudo, log_path) in &worker_runtime {
+    for (i, container, use_sudo, _log_path) in &worker_runtime {
         let node = &mn.nodes[*i];
-        let ray_script = crate::common::ssh::start_ray_worker_script(
-            container, &node0_ip, mn.dist_init_port, &node.ip, log_path, *use_sudo,
+        let worker_vllm_args = build_multi_node_worker_vllm_args(
+            model_id, port, &vllm_args, &vllm_flags, *i, &mn, params.ctx_size,
+        );
+        let start_script = crate::common::ssh::start_vllm_worker_script(
+            container, &worker_vllm_args, *use_sudo,
         );
         match crate::common::ssh::ssh_run(
-            &node.ip, &node.ssh_user, node.ssh_port, key_ref, &ray_script,
+            &node.ip, &node.ssh_user, node.ssh_port, key_ref, &start_script,
             std::time::Duration::from_secs(15),
         ).await {
             Ok((true, _, _)) => {
                 let _ = app.emit("model-log", serde_json::json!({
                     "model_id": model_id,
-                    "line": format!("[多机] 远端节点 {}（rank {}）Ray worker 已 join head cluster", node.ip, i),
+                    "line": format!("[多机] 远端节点 {}（rank {}）vllm serve --headless 已派发", node.ip, *i),
                     "source": "stdout",
                 }));
             }
             Ok((false, _, err)) => {
                 crate::common::utils::logger::write_log(
                     "WARN", "MODEL",
-                    &format!("[{}] 远端节点 {}（rank {}）Ray worker 派发失败: {}（继续，vllm 端可能因节点数不足超时）", model_id, node.ip, i, err),
+                    &format!("[{}] 远端节点 {}（rank {}）vllm worker 派发失败: {}", model_id, node.ip, *i, err),
                 );
                 let _ = app.emit("model-log", serde_json::json!({
                     "model_id": model_id,
-                    "line": format!("[多机] 远端节点 {}（rank {}）Ray worker 派发失败（继续）", node.ip, i),
+                    "line": format!("[多机] 远端节点 {}（rank {}）vllm worker 派发失败（继续，head 端可能超时）", node.ip, *i),
                     "source": "stderr",
                 }));
             }
             Err(e) => {
                 crate::common::utils::logger::write_log(
                     "WARN", "MODEL",
-                    &format!("[{}] 远端节点 {}（rank {}）Ray worker 派发异常: {}", model_id, node.ip, i, e),
+                    &format!("[{}] 远端节点 {}（rank {}）vllm worker 派发异常: {}", model_id, node.ip, *i, e),
                 );
             }
         }
     }
 
-    // ===== Phase 6: 在 head 容器内 exec vllm serve（本地 docker exec -i 捕获 stdout）=====
+    // ===== Phase 4: 在 head 容器内 exec vllm serve（本地 docker exec -i 捕获 stdout）=====
     // 用 build_head_vllm_exec_args 拼 vllm serve 的命令 tokens；经 sh_quote + bash -c 串成一行，
     // 整段塞进 `docker exec -i <head_container> bash -c "<cmd>"`，child stdout/stderr 仍归
     // 我们管（沿用原 spawn_docker_run 的转发链路，避免再换 docker logs -f 拉一条新轮询线程）。
@@ -1856,7 +1843,7 @@ async fn start_multi_node(
     let vllm_inner = format!("{} 2>&1 | tee /proc/1/fd/1", vllm_inner_cmd);
     let _ = app.emit("model-log", serde_json::json!({
         "model_id": model_id,
-        "line": format!("[多机] 本机（rank 0）启动 vllm serve（docker exec -i）"),
+        "line": format!("[多机] 本机（rank 0）启动 vllm serve（docker exec -i，mp 多机模式）"),
         "source": "stdout",
     }));
     let mut child = {
