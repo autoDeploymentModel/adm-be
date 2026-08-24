@@ -1396,6 +1396,22 @@ async fn start_multi_node(
     };
     let key_ref = key.as_deref();
 
+    // 本地 vllm 日志落盘：<data_dir>/logs/adm_vllm_<model_id>_rank_0.log
+    // vllm 每行输出实时写文件（每行 flush），容器被清理后日志依然可查——
+    // 排查"启动即失败被 docker rm 删掉、原因无处可看"的关键。
+    let local_vllm_log = crate::common::config::get_data_dir(Some(app))?
+        .join("logs")
+        .join(format!("adm_vllm_{}_rank_0.log", model_id));
+    if let Some(parent) = local_vllm_log.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let log_writer = std::sync::Arc::new(std::sync::Mutex::new(
+        std::io::BufWriter::new(
+            std::fs::File::create(&local_vllm_log)
+                .map_err(|e| AppError::msg(format!("创建 vllm 日志文件失败（{}）: {}", local_vllm_log.display(), e)))?,
+        ),
+    ));
+
     // 镜像由远程 model.json 的 vllm_image 字段唯一指定（每模型独立配置），缺字段视为清单错误。
     let image = vllm_image
         .as_deref()
@@ -1828,10 +1844,16 @@ async fn start_multi_node(
     let vllm_exec_args = build_head_vllm_exec_args(
         model_id, port, &vllm_args, &vllm_flags, &mn, params.ctx_size,
     );
-    let vllm_inner: String = vllm_exec_args.iter()
+    let vllm_inner_cmd: String = vllm_exec_args.iter()
         .map(|s| crate::common::ssh::sh_quote(s))
         .collect::<Vec<_>>()
         .join(" ");
+    // 双通道输出：`vllm ... 2>&1 | tee /proc/1/fd/1`
+    //  - tee 的 stdout 进 docker exec 的 stdout pipe（我们的 child 转发线程 → 前端日志）
+    //  - tee 同时写 `/proc/1/fd/1`（容器 PID 1 的 stdout → `docker logs <head>` 可见）
+    // 这样 vllm 启动即失败（参数解析/镜像不兼容等）时，失败原因在 docker logs 里也有，
+    // 不会再出现"全部日志就这些然后容器被清理"、原因不可见的情况。
+    let vllm_inner = format!("{} 2>&1 | tee /proc/1/fd/1", vllm_inner_cmd);
     let _ = app.emit("model-log", serde_json::json!({
         "model_id": model_id,
         "line": format!("[多机] 本机（rank 0）启动 vllm serve（docker exec -i）"),
@@ -1894,17 +1916,31 @@ async fn start_multi_node(
     let container_clone0 = container0.clone();
     let mn_clone = mn.clone();
     let key_clone = key.clone();
+    let log_writer_stdout = std::sync::Arc::clone(&log_writer);
+    let log_writer_stderr = std::sync::Arc::clone(&log_writer);
+
+    // 提示用户本地日志路径（便于事后排查）
+    let _ = app.emit("model-log", serde_json::json!({
+        "model_id": model_id,
+        "line": format!("[多机] vllm 日志实时落盘：{}", local_vllm_log.display()),
+        "source": "stdout",
+    }));
 
     std::thread::spawn(move || {
-        use std::io::{BufRead, BufReader};
+        use std::io::{BufRead, BufReader, Write};
 
         let stdout_handle = if let Some(stdout) = child.stdout.take() {
             let app_c = app_clone.clone();
             let mid = model_id_clone.clone();
+            let lw = std::sync::Arc::clone(&log_writer_stdout);
             Some(std::thread::spawn(move || {
                 let reader = BufReader::new(stdout);
                 for line in reader.lines().map_while(Result::ok) {
                     crate::common::utils::logger::write_log("INFO", "vLLM", &line);
+                    if let Ok(mut w) = lw.lock() {
+                        let _ = writeln!(w, "{}", line);
+                        let _ = w.flush();
+                    }
                     app_c.emit("model-log", serde_json::json!({
                         "model_id": &mid, "line": line.clone(), "source": "stdout",
                     })).ok();
@@ -1925,10 +1961,15 @@ async fn start_multi_node(
         let stderr_handle = if let Some(stderr) = child.stderr.take() {
             let app_c = app_clone2.clone();
             let mid = model_id_clone2.clone();
+            let lw = std::sync::Arc::clone(&log_writer_stderr);
             Some(std::thread::spawn(move || {
                 let reader = BufReader::new(stderr);
                 for line in reader.lines().map_while(Result::ok) {
                     crate::common::utils::logger::write_log("WARN", "vLLM", &line);
+                    if let Ok(mut w) = lw.lock() {
+                        let _ = writeln!(w, "{}", line);
+                        let _ = w.flush();
+                    }
                     app_c.emit("model-log", serde_json::json!({
                         "model_id": &mid, "line": line, "source": "stderr",
                     })).ok();
@@ -1941,6 +1982,28 @@ async fn start_multi_node(
         if let Some(h) = stdout_handle { let _ = h.join(); }
         if let Some(h) = stderr_handle { let _ = h.join(); }
         let _ = child.wait();
+
+        // vllm 已退出（可能是启动即失败）：删除容器前抓取 docker logs 尾部，
+        // 把 vllm 侧真实报错转发到前端（vllm 输出已 tee 到容器 stdout），
+        // 避免"容器被清理 + 失败原因无处可查"。
+        if let Ok(o) = crate::common::utils::platform::docker_cmd()
+            .args(["logs", "--tail", "60", &container_clone0])
+            .output()
+        {
+            let tail = String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .chain(String::from_utf8_lossy(&o.stderr).lines())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !tail.trim().is_empty() {
+                crate::common::utils::logger::write_log("ERROR", "vLLM", &tail);
+                app_clone2.emit("model-log", serde_json::json!({
+                    "model_id": &model_id_clone2,
+                    "line": format!("[vllm exited] 容器日志尾部（清理前抓取）:\n{}", tail),
+                    "source": "stderr",
+                })).ok();
+            }
+        }
 
         // 容器退出：清理本机容器与状态，并尽力停止远端节点
         let _ = crate::common::utils::platform::docker_cmd()
