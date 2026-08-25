@@ -330,6 +330,20 @@ fn parse_up_ifaces(out: &str) -> Vec<(String, String)> {
     res
 }
 
+/// 两侧 Up 口集合是否一致（顺序无关）：
+/// DGX Spark 插 1 根线时同一物理口会呈现为 2 个 Up（如 rocep1s0f1 / roceP2p1s0f1
+/// 镜像），所以不做数量判定，只要求 A、B 两侧的 Up 集合完全相同 = 插口方向一致。
+fn same_up_set(a: &[(String, String)], b: &[(String, String)]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut a2 = a.to_vec();
+    let mut b2 = b.to_vec();
+    a2.sort();
+    b2.sort();
+    a2 == b2
+}
+
 /// 返回 (iface_a, iface_b)
 async fn step2_iface(c: &Ctx) -> Result<(String, String), AppError> {
     // 探测命令：优先 ibdev2netdev，缺失时用 sysfs fallback（mlx5_core + operstate=up）
@@ -351,34 +365,49 @@ async fn step2_iface(c: &Ctx) -> Result<(String, String), AppError> {
     }
     let list_b = parse_up_ifaces(&out);
 
-    let pick = |list: &[(String, String)], who: &str| -> Result<(String, String), AppError> {
-        match list.len() {
-            0 => Err(AppError::msg(format!(
-                "{} 未检测到已插好的光口（Up 数 = 0），请检查直连线是否插紧/被系统识别",
-                who
-            ))),
-            1 => Ok(list[0].clone()),
-            _ => Err(AppError::msg(format!(
-                "{} 检测到 {} 个 Up 光口，请只保留 1 根直连线（插 2 根受内存带宽限制提升不大且增加复杂度）",
-                who,
-                list.len()
-            ))),
-        }
+    // 探测结果完整列出（便于日志核对插口方向）
+    let fmt_list = |l: &[(String, String)]| -> String {
+        l.iter()
+            .map(|(r, i)| format!("{} → {} (Up)", if r.is_empty() { i.clone() } else { r.clone() }, i))
+            .collect::<Vec<_>>()
+            .join("；")
     };
-    let (rocep_a, iface_a) = pick(&list_a, "A 机")?;
-    let (rocep_b, iface_b) = pick(&list_b, "B 机")?;
-    // 一致性：rocep 相同（fallback 无 rocep 时退化为 iface 名相同）
-    let key_a = if rocep_a.is_empty() { iface_a.clone() } else { rocep_a.clone() };
-    let key_b = if rocep_b.is_empty() { iface_b.clone() } else { rocep_b.clone() };
-    if key_a != key_b {
+    if !list_a.is_empty() {
+        c.emit(2, "run", &format!("A 检测到 {} 个 Up 光口：{}", list_a.len(), fmt_list(&list_a)));
+    }
+    if !list_b.is_empty() {
+        c.emit(2, "run", &format!("B 检测到 {} 个 Up 光口：{}", list_b.len(), fmt_list(&list_b)));
+    }
+
+    // 判定：任一侧为 0 → 线没插好；两侧集合不一致 → 插口方向不一致
+    if list_a.is_empty() {
+        return Err(AppError::msg(
+            "A 未检测到已插好的光口（Up 数 = 0），请检查直连线是否插紧/被系统识别".to_string(),
+        ));
+    }
+    if list_b.is_empty() {
+        return Err(AppError::msg(
+            "B 未检测到已插好的光口（Up 数 = 0），请检查直连线是否插紧/被系统识别".to_string(),
+        ));
+    }
+    if list_a.len() != list_b.len() {
         return Err(AppError::msg(format!(
-            "插口方向不一致：A 插的是「{}」({})，B 插的是「{}」({})。请保持 A、B 插同一方向的口（如都插左边）",
-            key_a, iface_a, key_b, iface_b
+            "A/B 检测结果不一致：A 检测到 {} 个 Up 光口，B 检测到 {} 个。请确认 A/B 都插好直连线，且插同一方向的口（如都插左边）",
+            list_a.len(),
+            list_b.len()
+        )));
+    }
+    if !same_up_set(&list_a, &list_b) {
+        return Err(AppError::msg(format!(
+            "插口方向不一致：A 检测到 [{}]，B 检测到 [{}]。请保持 A、B 插同一方向的口（如都插左边）",
+            fmt_list(&list_a),
+            fmt_list(&list_b)
         )));
     }
 
-    c.emit(2, "run", &format!("A: {} → {} (Up)", rocep_a, iface_a));
-    c.emit(2, "run", &format!("B: {} → {} (Up)", rocep_b, iface_b));
+    // 两侧 Up 集合一致 → 通过；netplan 只配置首个网卡（与手工流程一致，另一条是镜像/备用）
+    let iface_a = list_a[0].1.clone();
+    let iface_b = list_b[0].1.clone();
     Ok((iface_a, iface_b))
 }
 
@@ -828,6 +857,45 @@ mod tests {
         let list = parse_up_ifaces("==> enp1s0f1np1 (Up)\n==> enp1s0f0np0 (Down)");
         assert_eq!(list.len(), 1);
         assert_eq!(list[0], (String::new(), "enp1s0f1np1".to_string()));
+    }
+
+    #[test]
+    fn parse_ibdev_dual_up_single_cable() {
+        // 插 1 根线：同一物理口呈现 2 个 Up（用户实测样例），不应误判为插了 2 根
+        let out = "rocep1s0f0 port 1 ==> enp1s0f0np0 (Down)\n\
+                   rocep1s0f1 port 1 ==> enp1s0f1np1 (Up)\n\
+                   roceP2p1s0f0 port 1 ==> enP2p1s0f0np0 (Down)\n\
+                   roceP2p1s0f1 port 1 ==> enP2p1s0f1np1 (Up)";
+        let list = parse_up_ifaces(out);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0], ("rocep1s0f1".to_string(), "enp1s0f1np1".to_string()));
+        assert_eq!(list[1], ("roceP2p1s0f1".to_string(), "enP2p1s0f1np1".to_string()));
+        // 两侧同方向插线 → 集合一致（顺序无关）
+        assert!(same_up_set(&list, &list));
+    }
+
+    #[test]
+    fn same_up_set_order_insensitive() {
+        let a = vec![
+            ("rocep1s0f1".to_string(), "enp1s0f1np1".to_string()),
+            ("roceP2p1s0f1".to_string(), "enP2p1s0f1np1".to_string()),
+        ];
+        let b = vec![
+            ("roceP2p1s0f1".to_string(), "enP2p1s0f1np1".to_string()),
+            ("rocep1s0f1".to_string(), "enp1s0f1np1".to_string()),
+        ];
+        assert!(same_up_set(&a, &b));
+        // 方向不一致（A 插 f1、B 插 f0）→ 集合不同
+        let b_f0 = vec![
+            ("rocep1s0f0".to_string(), "enp1s0f0np0".to_string()),
+            ("roceP2p1s0f0".to_string(), "enP2p1s0f0np0".to_string()),
+        ];
+        assert!(!same_up_set(&a, &b_f0));
+        // 数量不同 → 不一致
+        assert!(!same_up_set(&a, &b[..1].to_vec()));
+        // 空集合
+        assert!(same_up_set(&[], &[]));
+        assert!(!same_up_set(&a, &[]));
     }
 
     #[test]
