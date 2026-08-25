@@ -14,12 +14,40 @@ pub struct BenchmarkParams {
     pub num_prompts: Option<u64>,
 }
 
-/// 在 vLLM 容器内执行 `vllm bench serve` 性能测试
+/// 探测容器内 `vllm bench serve` 支持的 backend
 ///
-/// 注意：`--backend vllm-scan` 是 `eugr/spark-vllm` fork 自定义后端
-/// （同 fork 的 Ray worker entrypoint 也是 `python -m vllm.distributed.ray_utils`），
-/// upstream vLLM 用 `--backend vllm`。本应用部署的镜像均为 eugr fork，
-/// 切到 upstream vLLM 镜像时需把后端改回 `vllm`。
+/// 原本硬编码 `--backend vllm-scan`，但该 backend 未在 `eugr/spark-vllm-docker`
+/// fork 官方文档中出现（README/CHANGELOG 全部翻过只字未提；fork 推荐压测工具是
+/// 独立的 `llama-benchy`，不是 vLLM 内置后端）。本地部署的 `eugr/spark-vllm`
+/// nightly 镜像实测也不包含 `vllm-scan`（启动直接报 invalid choice），所以这里
+/// 启动前先查 `--help`，能选到 `vllm-scan` 就用，否则回退 `vllm`（标准 vLLM
+/// 压测后端，upstream 和 fork 都支持）。
+fn detect_bench_backend(container: &str) -> String {
+    use std::process::Stdio;
+    let mut probe = crate::common::utils::platform::docker_cmd();
+    probe.args(["exec", container, "vllm", "bench", "serve", "--help"]);
+    let output = probe
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+    match output {
+        Ok(o) => {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            if o.status.success() && text.contains("vllm-scan") {
+                "vllm-scan".to_string()
+            } else {
+                "vllm".to_string()
+            }
+        }
+        Err(_) => "vllm".to_string(),
+    }
+}
+
+/// 在 vLLM 容器内执行 `vllm bench serve` 性能测试
 #[tauri::command]
 pub async fn start_benchmark(
     app: tauri::AppHandle,
@@ -45,23 +73,31 @@ pub async fn start_benchmark(
 
     let base_url = format!("http://127.0.0.1:{}", port);
 
-    // vLLM `--dataset-name random` 自带随机 prompt 生成，无需额外 dataset-path 文件。
-    let mut cmd = crate::common::utils::platform::docker_cmd();
-    cmd.args([
-        "exec", "-e", "HF_HUB_OFFLINE=1", &container_name,
-        "vllm", "bench", "serve",
-        "--backend", "vllm-scan",
-        "--base-url", &base_url,
-        "--model", "default",
-        "--dataset-name", "random",
-        "--random-input-len", &input_len.to_string(),
-        "--random-output-len", &output_len.to_string(),
-        "--num-prompts", &num_prompts.to_string(),
-    ]);
-
     let app_clone = app.clone();
 
     std::thread::spawn(move || {
+        // 先探测 backend（fork 镜像有 `vllm-scan`，upstream 只有 `vllm`）
+        let backend = detect_bench_backend(&container_name);
+        let _ = app_clone.emit(
+            "benchmark-log",
+            serde_json::json!({"line": format!("[INFO] 使用 benchmark backend: {}", backend)}),
+        );
+
+        // vLLM `--dataset-name random` 自带随机 prompt 生成，无需额外 dataset-path 文件。
+        let mut cmd = crate::common::utils::platform::docker_cmd();
+        cmd.args([
+            "exec", "-e", "HF_HUB_OFFLINE=1", &container_name,
+            "vllm", "bench", "serve",
+            "--backend", &backend,
+            "--base-url", &base_url,
+            // 不传 --model，让 bench 从服务 /v1/models 自动取首个登记的 model 名。
+            // 写死 'default' 大概率与服务侧 served-model-name 不匹配，API 会 404。
+            "--dataset-name", "random",
+            "--random-input-len", &input_len.to_string(),
+            "--random-output-len", &output_len.to_string(),
+            "--num-prompts", &num_prompts.to_string(),
+        ]);
+
         let mut child = match cmd
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

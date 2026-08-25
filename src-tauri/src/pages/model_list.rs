@@ -1124,6 +1124,19 @@ fn build_common_docker_prefix(
         args.push("-e".to_string());
         args.push("NCCL_DEBUG=INFO".to_string());
     }
+    // DGX Spark 多机默认注入 NCCL_CUMEM_ENABLE=1 / NCCL_NVLS_ENABLE=1（fork 官方 inkling
+    // recipe 要求；实测双 Spark 缺少这两条会在 NCCL 建连互等、vllm 卡在 "Reducing Torch threads"
+    // 后无下文）。仅 IB 机型注入；extra_env 显式写了就用用户值（想回退 0 可自行覆盖）。
+    if has_infiniband {
+        if !extra_keys.contains("NCCL_CUMEM_ENABLE") {
+            args.push("-e".to_string());
+            args.push("NCCL_CUMEM_ENABLE=1".to_string());
+        }
+        if !extra_keys.contains("NCCL_NVLS_ENABLE") {
+            args.push("-e".to_string());
+            args.push("NCCL_NVLS_ENABLE=1".to_string());
+        }
+    }
     args
 }
 
@@ -2178,6 +2191,9 @@ async fn start_vllm_docker(
             vllm_args = parsed.vllm_args;
         }
     }
+    // 单机路径：分布式后端由 vllm 自动选择（mp），忽略设置中可能残留的 ray/mp 旧值——
+    // 多机模式由 start_multi_node 强制 mp，用户无需（也不应）手动配置分布式后端。
+    vllm_args.distributed_executor_backend.clear();
 
     // 镜像由远程 model.json 的 vllm_image 字段唯一指定（每模型独立配置），本地不再保留硬编码兜底；
     // 缺字段视为模型清单配置错误，直接拒绝启动。

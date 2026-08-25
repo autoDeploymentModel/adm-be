@@ -293,16 +293,6 @@ const template = `
         <div class="param-group">
           <div class="param-group-title">${_t("vLLM 基础参数")}</div>
           <div class="param-row">
-            <div class="param-label">${_t("分布式后端")}<div class="param-key">--distributed-executor-backend</div></div>
-            <div class="param-input">
-              <select id="sg_dist_backend">
-                <option value="">${_t("auto（单机）")}</option>
-                <option value="mp">${_t("mp（多机）")}</option>
-                <option value="ray">${_t("ray（慎用：多机镜像不支持）")}</option>
-              </select>
-            </div>
-          </div>
-          <div class="param-row">
             <div class="param-label">${_t("加载格式")}<div class="param-key">--load-format</div></div>
             <div class="param-input">
               <select id="sg_load_format">
@@ -893,7 +883,6 @@ function getVllmArgsFromForm() {
     gpu_memory_utilization: parseFloat(document.getElementById("sg_gpu_mem_util").value) || 0,
     quantization: str("sg_quant"),
     kv_cache_dtype: str("sg_kv_dtype"),
-    distributed_executor_backend: str("sg_dist_backend"),
     load_format: str("sg_load_format"),
     block_size: num("sg_block_size"),
     tokenizer_mode: str("sg_tokenizer_mode"),
@@ -917,7 +906,6 @@ function fillVllmArgsForm(a) {
   set("sg_gpu_mem_util", v.gpu_memory_utilization || 0);
   set("sg_quant", v.quantization || "");
   set("sg_kv_dtype", v.kv_cache_dtype || "");
-  set("sg_dist_backend", v.distributed_executor_backend || "");
   set("sg_load_format", v.load_format || "");
   set("sg_block_size", v.block_size || 256);
   set("sg_tokenizer_mode", v.tokenizer_mode || "");
@@ -975,7 +963,7 @@ function resetParams() {
 function autoSave() { saveParams(); }
 
 function setupAutoSave() {
-  ["ctx_size", "port", "vllm_shm", "sg_tp", "sg_gpu_mem_util", "sg_quant", "sg_kv_dtype", "sg_dist_backend", "sg_load_format", "sg_block_size", "sg_tokenizer_mode", "sg_tool_parser", "sg_reasoning_parser", "sg_auto_tool_choice", "sg_trust_remote", "sg_max_seqs", "sg_max_batched_tokens", "sg_extra_args", "sg_extra_env",
+  ["ctx_size", "port", "vllm_shm", "sg_tp", "sg_gpu_mem_util", "sg_quant", "sg_kv_dtype", "sg_load_format", "sg_block_size", "sg_tokenizer_mode", "sg_tool_parser", "sg_reasoning_parser", "sg_auto_tool_choice", "sg_trust_remote", "sg_max_seqs", "sg_max_batched_tokens", "sg_extra_args", "sg_extra_env",
    "multi_enabled", "multi_dist_port", "multi_extra_env"].forEach(function (id) {
     var el = document.getElementById(id);
     if (el) el.addEventListener("change", autoSave);
