@@ -953,7 +953,9 @@ async fn detect_remote_iface(
 /// 可选 `--device /dev/infiniband` + 可选 fork `get_env_flags` 全套网卡 env（VLLM_HOST_IP /
 /// MN_IF_NAME / UCX_NET_DEVICES / NCCL_SOCKET_IFNAME / OMPI_MCA_btl_tcp_if_include /
 /// GLOO_SOCKET_IFNAME / TP_SOCKET_IFNAME / NCCL_IB_HCA / NCCL_IB_DISABLE）+ 
-/// `multi_node_args.extra_env` 每行 `-e KEY=VALUE` + `NCCL_DEBUG=INFO` 默认值。
+/// `multi_node_args.extra_env` 每行 `-e KEY=VALUE` + `vllm_env`（模型清单）每行 `-e KEY=VALUE` 
+/// + `NCCL_DEBUG=INFO` 默认值。模型清单 env 在 extra_env 之后注入（docker 同名 `-e` 后者生效），
+/// 与 vllm_flags「模型清单优先级最高」的语义一致。
 /// `node_ip`：该容器所在节点自身的互联 IP（VLLM_HOST_IP 用，避免 vllm 取 WiFi 等错误地址）。
 fn build_common_docker_prefix(
     container_name: &str,
@@ -963,6 +965,7 @@ fn build_common_docker_prefix(
     ib_iface: Option<&str>,
     has_infiniband: bool,
     mn_extra_env: &str,
+    model_env: &[String],
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "run".to_string(),
@@ -1043,7 +1046,24 @@ fn build_common_docker_prefix(
             }
         }
     }
-    // NCCL_DEBUG 默认 INFO（extra_env 未显式设置时注入；与 doc §4.4 的 WARN 略有差异，便于双机排障）
+    // 模型清单 vllm_env（每行 KEY=VALUE → -e KEY=VALUE）：紧跟 extra_env 之后注入，
+    // 同名键后者生效 → 模型清单 env 优先级最高（与 vllm_flags 语义一致，用户可在设置页 extra_env 覆盖同名键之外的变量）
+    for raw in model_env {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = raw.split_once('=') {
+            let k = k.trim();
+            let v = v.trim();
+            if !k.is_empty() && !v.is_empty() {
+                extra_keys.insert(k.to_string());
+                args.push("-e".to_string());
+                args.push(format!("{}={}", k, v));
+            }
+        }
+    }
+    // NCCL_DEBUG 默认 INFO（extra_env / vllm_env 未显式设置时注入；与 doc §4.4 的 WARN 略有差异，便于双机排障）
     if !extra_keys.contains("NCCL_DEBUG") {
         args.push("-e".to_string());
         args.push("NCCL_DEBUG=INFO".to_string());
@@ -1195,10 +1215,11 @@ fn build_multi_node_head_args(
     iface: Option<&str>,
     ib_iface: Option<&str>,
     has_infiniband: bool,
+    model_env: &[String],
 ) -> Vec<String> {
     let container_name = format!("adm-vllm-{}-rank-0", model_id);
     let mount_dst = format!("/models/{}", model_id);
-    let mut args = build_common_docker_prefix(&container_name, shm_size, node_ip, iface, ib_iface, has_infiniband, &mn.extra_env);
+    let mut args = build_common_docker_prefix(&container_name, shm_size, node_ip, iface, ib_iface, has_infiniband, &mn.extra_env, model_env);
     args.push("-v".to_string());
     args.push(format!("{}:{}:ro", model_dir.to_string_lossy(), mount_dst));
     // 容器必须 detached（本地回头要 `docker exec -d` 起 worker/head 的 vllm serve），`-d` 放 image 之前
@@ -1326,10 +1347,11 @@ fn build_multi_node_worker_args(
     iface: Option<&str>,
     ib_iface: Option<&str>,
     has_infiniband: bool,
+    model_env: &[String],
 ) -> Vec<String> {
     let container_name = format!("adm-vllm-{}-rank-{}", model_id, rank);
     let mount_dst = format!("/models/{}", model_id);
-    let mut args = build_common_docker_prefix(&container_name, shm_size, node_ip, iface, ib_iface, has_infiniband, &mn.extra_env);
+    let mut args = build_common_docker_prefix(&container_name, shm_size, node_ip, iface, ib_iface, has_infiniband, &mn.extra_env, model_env);
     args.push("-v".to_string());
     args.push(format!("{}:{}:ro", model_dir.to_string_lossy(), mount_dst));
     // fork 默认 `--entrypoint=` 清空镜像 ENTRYPOINT（避免 nvidia_entrypoint.sh 触发），
@@ -1395,6 +1417,7 @@ async fn start_multi_node(
     params: LaunchParams,
     vllm_image: Option<String>,
     vllm_flags: Option<Vec<String>>,
+    vllm_env: Option<Vec<String>>,
 ) -> Result<(), AppError> {
     let (mn, mut vllm_args) = load_multi_node_config(app);
     // 多机路径：backend 由下方 build_head/worker_vllm_exec_args 末尾强制追加 mp，
@@ -1560,6 +1583,7 @@ async fn start_multi_node(
             remote_iface.as_deref(),
             remote_ib_iface.as_deref(),
             remote_has_ib,
+            vllm_env.as_deref().unwrap_or(&[]),
         );
         let container = multi_container_name(model_id, i);
         let log_path = format!("/tmp/adm_vllm_{}_rank_{}.log", model_id, i);
@@ -1689,6 +1713,7 @@ async fn start_multi_node(
     };
     let args0 = build_multi_node_head_args(
         model_id, model_dir, &image, &shm_size, &mn, &node0_ip, local_iface.as_deref(), local_ib_iface.as_deref(), local_has_ib,
+        vllm_env.as_deref().unwrap_or(&[]),
     );
 
     dbg_log!("vllm multi-node head container args (rank0): {:?}", args0);
@@ -2106,6 +2131,7 @@ async fn start_vllm_docker(
     device: Option<String>,
     vllm_image: Option<String>,
     vllm_flags: Option<Vec<String>>,
+    vllm_env: Option<Vec<String>>,
 ) -> Result<(), AppError> {
     const CONTAINER_PREFIX: &str = "adm-vllm-";
     let container_name = format!("{}{}", CONTAINER_PREFIX, model_id);
@@ -2189,6 +2215,46 @@ async fn start_vllm_docker(
             }
         }
     }
+    // ===== 模型清单 vllm_env 注入（docker 同名 -e 后者生效 → 模型清单优先级最高，与 vllm_flags 语义一致）=====
+    // 每条 KEY=VALUE → -e KEY=VALUE，紧接 extra_env 之后追加（与多机 build_common_docker_prefix 顺序一致：
+    // extra_env → vllm_env → NCCL_DEBUG 默认值检查，模型显式设置的键会被跳过默认值注入）。
+    // KEY 校验与 extra_env 同规则（全大写+数字+下划线 + 长度 > 1），非法键静默跳过。
+    if let Some(env_list) = vllm_env.as_deref().filter(|e| !e.is_empty()) {
+        let mut applied = Vec::new();
+        for raw in env_list {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                continue;
+            }
+            if let Some((k, v)) = raw.split_once('=') {
+                let k = k.trim();
+                let v = v.trim();
+                let valid_key = !k.is_empty()
+                    && !v.is_empty()
+                    && k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                    && k.len() > 1;
+                if valid_key {
+                    extra_env_keys.insert(k.to_string());
+                    extra_env_args.push("-e".to_string());
+                    extra_env_args.push(format!("{}={}", k, v));
+                    applied.push(format!("{}={}", k, v));
+                }
+            }
+        }
+        if !applied.is_empty() {
+            app.emit(
+                "model-log",
+                serde_json::json!({
+                    "model_id": model_id,
+                    "line": format!("[模型配置] 已应用模型清单 vllm_env（优先级最高）：{}", applied.join(", ")),
+                    "source": "stdout",
+                }),
+            )
+            .ok();
+            crate::common::utils::logger::write_log("INFO", "MODEL", &format!("[{}] 应用模型清单 vllm_env: {}", model_id, applied.join(", ")));
+        }
+    }
+    // NCCL_DEBUG 默认值：extra_env / vllm_env 均未显式设置时才注入（键集合已含模型清单键）
     if !extra_env_keys.contains("NCCL_DEBUG") {
         extra_env_args.push("-e".to_string());
         extra_env_args.push("NCCL_DEBUG=INFO".to_string());
@@ -2437,9 +2503,10 @@ pub async fn start_model(
     device: Option<String>,
     vllm_image: Option<String>,
     vllm_flags: Option<Vec<String>>,
+    vllm_env: Option<Vec<String>>,
 ) -> Result<(), AppError> {
     // 统一捕获启动失败并写入本地日志
-    let result = start_model_inner(&app, &state, &model_id, params, device, vllm_image, vllm_flags).await;
+    let result = start_model_inner(&app, &state, &model_id, params, device, vllm_image, vllm_flags, vllm_env).await;
     if let Err(ref e) = result {
         crate::common::utils::logger::write_log("ERROR", "MODEL", &format!("[{}] 启动失败: {}", model_id, e));
     }
@@ -2454,6 +2521,7 @@ async fn start_model_inner(
     device: Option<String>,
     vllm_image: Option<String>,
     vllm_flags: Option<Vec<String>>,
+    vllm_env: Option<Vec<String>>,
 ) -> Result<(), AppError> {
     {
         let pid_lock = state.running_process.lock().map_err(|e| e.to_string())?;
@@ -2473,9 +2541,9 @@ async fn start_model_inner(
         // 多机互联：设置页启用且节点数 >= 2 时走集群启动（单机路径不变）
         let (mn, _) = load_multi_node_config(app);
         if mn.enabled && mn.nodes.len() >= 2 {
-            return start_multi_node(app, state, model_id, &model_dir, params, vllm_image, vllm_flags).await;
+            return start_multi_node(app, state, model_id, &model_dir, params, vllm_image, vllm_flags, vllm_env).await;
         }
-        return start_vllm_docker(app, state, model_id, &model_dir, params, device, vllm_image, vllm_flags).await;
+        return start_vllm_docker(app, state, model_id, &model_dir, params, device, vllm_image, vllm_flags, vllm_env).await;
     }
 
     // 仅支持 vLLM Docker 部署（safetensors 目录模型）

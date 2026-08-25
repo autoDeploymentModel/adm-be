@@ -827,11 +827,13 @@ async function handleStart(btn) {
     const vllmImage = (model && model.vllm_image) || null;
     // 模型配置的 vllm_flags（官方推荐启动参数）→ 优先级最高
     const vllmFlags = (model && model.vllm_flags) || null;
+    // 模型配置的 vllm_env（官方推荐容器环境变量，KEY=VALUE）→ 注入 docker -e，优先级最高
+    const vllmEnv = (model && model.vllm_env) || null;
 
     S().startingModelId = modelId;
     renderModelTable();
 
-    await invoke()("start_model", { modelId: modelId, params: params, device: device, vllmImage: vllmImage, vllmFlags: vllmFlags });
+    await invoke()("start_model", { modelId: modelId, params: params, device: device, vllmImage: vllmImage, vllmFlags: vllmFlags, vllmEnv: vllmEnv });
     console.log("[model_list] 启动模型 invoke 完成:", modelId);
   } catch (e) {
     console.error("[model_list] 启动失败:", e);

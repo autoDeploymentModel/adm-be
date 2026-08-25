@@ -48,6 +48,9 @@ pub struct RemoteModel {
     /// vLLM 启动参数（如 ["--max-model-len 262144"]）；每条为完整 `--key value` 或 `--flag`，远程覆盖本地同名参数
     #[serde(default)]
     pub vllm_flags: Vec<String>,
+    /// vLLM 容器环境变量（如 ["VLLM_USE_AOT_COMPILE=1"]）；每条 `KEY=VALUE`，注入 docker `-e`，与 vllm_flags 同级（模型清单优先级最高）
+    #[serde(default)]
+    pub vllm_env: Vec<String>,
     #[serde(default)]
     pub model_size: String,
     #[serde(default)]

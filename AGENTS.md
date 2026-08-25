@@ -46,7 +46,7 @@
   - **不要** 在 `vllm serve` 命令里手动加 `--distributed-executor-backend`、`--nnodes`、`--node-rank`、`--master-addr`、`--master-port`、`--headless`——本应用 `start_multi_node` 已在命令尾部追加这些参数；用户把它们写进 `vllm_flags` / `extra_args` 反而会被后追加的同名参数覆盖导致行为异常（vLLM 后值生效）。
   - fork 多机为 no-Ray 后端（`--distributed-executor-backend mp` + worker `--headless`）；本应用严格走 fork no-Ray 模式，**不要用 `--distributed-executor-backend ray`**（镜像校验 nnodes>1 时 ray 直接崩）。
   - `--tensor-parallel-size / -tp` 由 launch-cluster 自动从 active 节点数派生；本应用多机 TP 固定等于 `n_nodes`，不要让用户在 `vllm_flags` 里覆盖。
-- **模型清单 `vllm_flags`**：`RemoteModel` 可带 fork 官方推荐启动参数数组（每条 `--key value` 或 `--flag`，如 `--speculative-config {...}` JSON 配置），启动时最后追加、优先级最高（可覆盖设置页同名参数，vLLM 后值生效），经前端 `start_model` 的 `vllmFlags` 透传。示例见 `doc/model.json`（DeepSeek-V4-Flash DGX Spark 配方）。
+- **模型清单 `vllm_flags` / `vllm_env`**：`RemoteModel` 可带 fork 官方推荐启动参数数组（每条 `--key value` 或 `--flag`，如 `--speculative-config {...}` JSON 配置），启动时最后追加、优先级最高（可覆盖设置页同名参数，vLLM 后值生效），经前端 `start_model` 的 `vllmFlags` 透传；`vllm_env` 为容器环境变量数组（每条 `KEY=VALUE`，如 `VLLM_USE_AOT_COMPILE=1`），注入 docker `-e`，同名键优先级高于设置页 `extra_env`（与 vllm_flags 语义一致），单机 `start_vllm_docker` 与多机 `build_common_docker_prefix`（head/worker 容器）均生效，经前端 `vllmEnv` 透传。示例见 `doc/model.json`（DeepSeek-V4-Flash DGX Spark 配方）。
 - **硬件优先级**：`hwinfo` 插件数据覆盖 `sysinfo`。
 - **更新流程**：启动后延迟 3 秒 → 应用更新（不再有 llamacpp / VC++ 运行库流程）。
 - **窗口关闭**：`cleanup_processes`（托盘退出 / 窗口关闭 / `ExitRequested` 统一入口，幂等）停止 vLLM 容器（`docker stop/rm`，单机容器名 `adm-vllm-<model>`、多机容器名 `adm-vllm-<model>-rank-<R>`）+ 杀 llama-server 进程残留兜底。
@@ -65,4 +65,4 @@
 ## 注意事项
 - vLLM 部署流程完整文档：`doc/vllm-deployment.md`（架构 / 前置条件 / 镜像策略 / 模型清单格式 / 下载 / 启动命令 / 参数表 / 排查）。当新的功能发生变化时候即时更新文档
 - 多机互联（2+ 台 DGX Spark 集群）：v1 已实现（设置页「多机互联」Tab）。**严格对齐 fork `launch-cluster.sh` 的 no-Ray 模式**：关键注意：总开关 + 节点清单（首条必须本机）；多机容器必须 `--network host`（无 `-p`）；容器名 `adm-vllm-<model>-rank-<R>`（据此识别多机停止）；head + worker 容器均跑 `sleep infinity`（fork 的 keepalive），**启动顺序对齐 fork `exec_no_ray_cluster`**——容器全部就绪后，先向每个 worker 派发 `docker exec -d <container> bash -c "vllm serve ... --distributed-executor-backend mp --nnodes N --node-rank R --tensor-parallel-size N --master-addr <head_ip> --master-port <port> --headless"`（后台，日志落盘 `/tmp/adm_vllm_<model>_rank_<R>.log`），最后 head 起完整 `vllm serve ...`（同参数，node-rank 0、无 `--headless`）并等待所有 rank join；**绝对不能用 `--distributed-executor-backend ray`**（fork 镜像 pydantic 校验 `nnodes > 1` 只允许 mp/uni/external_launcher，ray 直接 ValidationError 崩掉）。master 端口（dist_init_port）默认 9090，不得与模型服务端口冲突。细节见 `doc/vllm-deployment.md` 与 `doc/dgx-spark-multinode-plan.md`
-- 模型列表远端配置 `https://adm.tuduoduo.top/b/model.json`（本地示例 `doc/model.json`）：新格式 `model_download_files` + `model_support_devices` + `vllm_image` + `vllm_flags`。
+- 模型列表远端配置 `https://adm.tuduoduo.top/b/model.json`（本地示例 `doc/model.json`）：新格式 `model_download_files` + `model_support_devices` + `vllm_image` + `vllm_flags` + `vllm_env`。
