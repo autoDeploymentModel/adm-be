@@ -85,6 +85,9 @@ pub struct Settings {
     /// 界面语言（"zh" 中文 / "en" English，空或未知回退中文）
     #[serde(default)]
     pub language: String,
+    /// 本地代理地址（模型文件 / Docker 镜像下载用，如 "http://127.0.0.1:1080"；空 = 直连）
+    #[serde(default)]
+    pub proxy_url: String,
 }
 
 /// 多机互联配置（DGX Spark 集群）

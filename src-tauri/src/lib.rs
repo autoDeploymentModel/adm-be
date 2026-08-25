@@ -186,6 +186,8 @@ pub fn run() {
             settings::clear_all_logs,
             settings::get_docker_mirror_config,
             settings::save_docker_mirror_config,
+            settings::get_docker_proxy_config,
+            settings::save_docker_proxy_config,
             settings::multi_node_probe,
             settings::ensure_ssh_key,
             settings::push_image_to_remote,

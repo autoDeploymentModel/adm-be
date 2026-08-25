@@ -250,13 +250,11 @@ pub async fn download_model(
             }
             let _guard = CleanupGuard2 { h: app.clone(), id: model_id.clone() };
 
-            let download_client = reqwest::Client::builder()
-                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                .build()
-                .map_err(|e| format!("创建下载客户端失败: {}", e))?;
+            // 下载客户端：开启代理 → 挂代理 + Direct（源链接直下）；否则 hf-mirror 优先
+            let http = crate::common::utils::proxy::build_download_http(&app, None).await?;
 
             for (idx, url) in files.iter().enumerate() {
-                // 镜像策略由 download_with_resume 内部处理（先 mirror，失败回退原 URL）
+                // 镜像策略见 download_with_resume 的 MirrorPolicy（代理开启时直接源链接）
                 let filename = url
                     .rsplit('/')
                     .next()
@@ -304,7 +302,7 @@ pub async fn download_model(
                 let idx_f = idx;
                 let total_f = total;
                 download_with_resume(
-                    &download_client, &url, &final_path, &part_path,
+                    &http.client, &url, &final_path, &part_path, http.mirror_policy,
                     |progress, _downloaded, _total| {
                         // 总进度 = 已完成文件 + 当前文件进度折算
                         let overall = ((idx_f as f32 + progress as f32 / 100.0) * 100.0 / total_f as f32) as u8;
@@ -342,7 +340,7 @@ pub async fn download_model(
         }
     }
 
-    // 镜像策略由 download_with_resume 内部处理（先 mirror，失败回退原 URL）
+    // 镜像策略见 download_with_resume 的 MirrorPolicy（代理开启时直接源链接）
     let model_filename = model_url
         .rsplit('/')
         .next()
@@ -351,10 +349,8 @@ pub async fn download_model(
     let final_path = model_dir.join(&model_filename);
     let part_path = model_dir.join(format!("{}.part", model_filename));
 
-    let download_client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        .build()
-        .map_err(|e| format!("创建下载客户端失败: {}", e))?;
+    // 下载客户端：开启代理 → 挂代理 + Direct（源链接直下）；否则 hf-mirror 优先
+    let http = crate::common::utils::proxy::build_download_http(&app, None).await?;
 
     app.state::<AppState>().downloading_progress.lock().unwrap_or_else(|e| e.into_inner()).insert(model_id.clone(), 0u8);
 
@@ -379,7 +375,7 @@ pub async fn download_model(
         let app_clone = app.clone();
         let mid = model_id.clone();
         download_with_resume(
-            &download_client, &model_url, &final_path, &part_path,
+            &http.client, &model_url, &final_path, &part_path, http.mirror_policy,
             |progress, downloaded, total| {
                 app_clone.emit(
                     "download-progress",
@@ -408,7 +404,7 @@ pub async fn download_model(
             app.state::<AppState>().downloading_phase.lock().unwrap_or_else(|e| e.into_inner()).insert(model_id.clone(), "mmproj".to_string());
             download_extra_file(
                 &app, &model_id, &model_dir, &mmproj_url,
-                &download_client, "mmproj"
+                &http, "mmproj"
             ).await?;
         }
     }
@@ -419,14 +415,14 @@ pub async fn download_model(
             app.state::<AppState>().downloading_phase.lock().unwrap_or_else(|e| e.into_inner()).insert(model_id.clone(), "diffusion".to_string());
             download_extra_file(
                 &app, &model_id, &model_dir, &diffusion_url,
-                &download_client, "diffusion"
+                &http, "diffusion"
             ).await?;
         }
         if let Some(vae_url) = model_vae {
             app.state::<AppState>().downloading_phase.lock().unwrap_or_else(|e| e.into_inner()).insert(model_id.clone(), "vae".to_string());
             download_extra_file(
                 &app, &model_id, &model_dir, &vae_url,
-                &download_client, "vae"
+                &http, "vae"
             ).await?;
         }
     }
@@ -476,10 +472,10 @@ async fn download_extra_file(
     model_id: &str,
     model_dir: &std::path::Path,
     file_url: &str,
-    download_client: &reqwest::Client,
+    http: &crate::common::utils::proxy::DownloadHttp,
     file_type: &str,
 ) -> Result<(), AppError> {
-    // 镜像策略由 download_with_resume 内部处理（先 mirror，失败回退原 URL）
+    // 镜像策略见 download_with_resume 的 MirrorPolicy（代理开启时直接源链接）
     let filename = file_url
         .rsplit('/')
         .next()
@@ -506,7 +502,7 @@ async fn download_extra_file(
     let mid = model_id.to_string();
     let ft = file_type.to_string();
     download_with_resume(
-        download_client, &file_url, &final_path, &part_path,
+        &http.client, &file_url, &final_path, &part_path, http.mirror_policy,
         |progress, downloaded, total| {
             app_clone.emit(
                 "download-progress",
@@ -579,13 +575,13 @@ async fn pull_docker_image(
     match pull_image(app, model_id, image, PULL_TIMEOUT).await {
         Ok(true) => Ok(image.to_string()),
         Ok(false) => Err(AppError::msg(format!(
-            "镜像 {} 拉取失败（无进度输出超时 {} 分钟）；请检查网络或镜像地址后手动执行 docker pull {}；国内网络可改用镜像加速：设置页「Docker 镜像配置」写入加速器地址（如 https://docker.1ms.run）并重启 Docker",
+            "镜像 {} 拉取失败（无进度输出超时 {} 分钟）；请检查网络或镜像地址后手动执行 docker pull {}；国内网络可改用镜像加速：设置页「Docker 镜像配置」写入加速器地址（如 https://docker.1ms.run）并重启 Docker；或设置页「代理」填写本地代理并点「保存并重启 Docker」",
             image,
             PULL_TIMEOUT.as_secs() / 60,
             image
         ))),
         Err(e) => Err(AppError::msg(format!(
-            "镜像 {} 拉取中止: {}；请检查网络或手动执行 docker pull {}",
+            "镜像 {} 拉取中止: {}；请检查网络（可尝试设置页「代理」）或手动执行 docker pull {}",
             image, e, image
         ))),
     }
@@ -699,7 +695,29 @@ async fn pull_image(
     image: &str,
     timeout: std::time::Duration,
 ) -> Result<bool, AppError> {
-    let mut child = crate::common::utils::platform::docker_cmd_tokio()
+    // 客户端侧代理 env 兜底（rootless / podman-docker 等客户端直连场景）；
+    // 标准 dockerd 拉取由 daemon 完成，需设置页「代理」→「保存并重启 Docker」
+    // 把代理写入 daemon.json proxies 才真正生效。
+    let mut docker_cmd = crate::common::utils::platform::docker_cmd_tokio();
+    let proxy_url = crate::common::utils::proxy::proxy_url(app).await;
+    if !proxy_url.is_empty() {
+        crate::common::utils::logger::write_log(
+            "INFO",
+            "DOCKER",
+            &format!("[{}] docker pull 注入代理: {}", model_id, proxy_url),
+        );
+        let no_proxy = "localhost,127.0.0.0/8,::1";
+        docker_cmd
+            .env("HTTP_PROXY", &proxy_url)
+            .env("HTTPS_PROXY", &proxy_url)
+            .env("ALL_PROXY", &proxy_url)
+            .env("http_proxy", &proxy_url)
+            .env("https_proxy", &proxy_url)
+            .env("all_proxy", &proxy_url)
+            .env("NO_PROXY", no_proxy)
+            .env("no_proxy", no_proxy);
+    }
+    let mut child = docker_cmd
         .args(["pull", image])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1472,7 +1490,10 @@ async fn start_multi_node(
     vllm_image: Option<String>,
     vllm_flags: Option<Vec<String>>,
 ) -> Result<(), AppError> {
-    let (mn, vllm_args) = load_multi_node_config(app);
+    let (mn, mut vllm_args) = load_multi_node_config(app);
+    // 多机路径：backend 由下方 build_head/worker_vllm_exec_args 末尾强制追加 mp，
+    // 清除残留值避免 push_vllm_args 先推一个旧值再被 mp 覆盖（产生重复 flag）。
+    vllm_args.distributed_executor_backend.clear();
     let port: u16 = params.port.unwrap_or(8000);
     validate_multi_node(&mn, port)?;
     let n_nodes = mn.nodes.len();

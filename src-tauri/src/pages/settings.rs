@@ -196,10 +196,86 @@ pub async fn save_docker_mirror_config(mirrors: Vec<String>) -> Result<String, A
         cleaned.iter().map(|m| serde_json::Value::String(m.clone())).collect(),
     );
 
-    // 3. 写入临时文件（当前用户可写），再提权安装到 daemon.json
+    // 3. 写入临时文件 + 提权安装 + 重启 Docker
+    install_daemon_json_and_restart(&daemon).await
+}
+
+// ===== Docker daemon 代理配置（daemon.json "proxies"，镜像拉取用）=====
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerProxyConfig {
+    pub daemon_path: String,
+    pub exists: bool,
+    /// 当前 daemon.json 中配置的 https-proxy（空 = 未配置）
+    pub proxy: String,
+    pub platform: &'static str,
+}
+
+/// 读取 daemon.json 中已配置的 daemon 代理（https-proxy 字段）
+#[tauri::command]
+pub async fn get_docker_proxy_config() -> Result<DockerProxyConfig, AppError> {
+    let path = docker_daemon_path();
+    let path_obj = std::path::Path::new(&path);
+    let exists = path_obj.exists();
+    let proxy = if exists {
+        std::fs::read_to_string(path_obj)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v["proxies"]["https-proxy"].as_str().map(str::to_string))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    Ok(DockerProxyConfig {
+        daemon_path: path,
+        exists,
+        proxy,
+        platform: if cfg!(target_os = "windows") { "windows" } else { "linux" },
+    })
+}
+
+/// 把代理写入 Docker daemon.json 的 `proxies` 段并重启 Docker 服务（镜像拉取走代理）。
+/// proxy 为空 = 清除 daemon 代理配置（恢复直连）。
+/// Linux：pkexec 提权写 /etc/docker/daemon.json + systemctl/service 重启；
+/// Windows：UAC 提权写 ProgramData + 重启 Docker Desktop（Docker Desktop 可能忽略 daemon.json proxies，需在其设置中配置）。
+#[tauri::command]
+pub async fn save_docker_proxy_config(proxy: String) -> Result<String, AppError> {
+    let cleaned = proxy.trim().to_string();
+    let path = docker_daemon_path();
+    let path_obj = std::path::Path::new(&path);
+    let mut daemon: serde_json::Value = if path_obj.exists() {
+        std::fs::read_to_string(path_obj)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .unwrap_or_else(|| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    if cleaned.is_empty() {
+        // 清空代理配置（与 Docker 默认 no-proxy 一致保留私网段直连）
+        if let Some(obj) = daemon.as_object_mut() {
+            obj.remove("proxies");
+        }
+    } else {
+        daemon["proxies"] = serde_json::json!({
+            "http-proxy": cleaned,
+            "https-proxy": cleaned,
+            "no-proxy": "localhost,127.0.0.0/8"
+        });
+    }
+
+    install_daemon_json_and_restart(&daemon).await
+}
+
+/// 写入临时文件（当前用户可写），再提权安装到 daemon.json 并重启 Docker 服务。
+/// 供 save_docker_mirror_config / save_docker_proxy_config 共用。
+async fn install_daemon_json_and_restart(daemon: &serde_json::Value) -> Result<String, AppError> {
+    let path = docker_daemon_path();
     let tmp_dir = std::env::temp_dir();
     let tmp_json = tmp_dir.join("adm-daemon.json");
-    std::fs::write(&tmp_json, serde_json::to_string_pretty(&daemon).map_err(|e| AppError::msg(format!("序列化 daemon.json 失败: {}", e)))?)
+    std::fs::write(&tmp_json, serde_json::to_string_pretty(daemon).map_err(|e| AppError::msg(format!("序列化 daemon.json 失败: {}", e)))?)
         .map_err(|e| AppError::msg(format!("写入临时文件失败: {}", e)))?;
 
     #[cfg(target_os = "windows")]

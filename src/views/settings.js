@@ -260,6 +260,7 @@ const template = `
     <nav id="settings-nav">
       <div class="nav-item active" data-panel="launch-params" id="nav-launch-params">${_t("模型启动参数")}</div>
       <div class="nav-item" data-panel="docker-mirror" id="nav-docker-mirror">${_t("Docker 镜像配置")}</div>
+      <div class="nav-item" data-panel="proxy" id="nav-proxy">${_t("代理")}</div>
       <div class="nav-item" data-panel="multinode" id="nav-multinode">${_t("DGX直连配置")}</div>
       <div class="nav-item" data-panel="appearance" id="nav-appearance">${_t("外观主题")}</div>
       <div class="nav-item" data-panel="logs" id="nav-logs">${_t("运行日志")}</div>
@@ -423,6 +424,37 @@ const template = `
             <div class="param-input" style="max-width:none;display:flex;align-items:center;gap:10px;">
               <button class="btn-save" id="mirror-save-btn" style="margin-top:0;font-size:13px;padding:8px 20px;">${_t("保存并重启 Docker")}</button>
               <span id="mirror-status" style="font-size:12px;color:var(--c-text-3);"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="panel-proxy" class="panel">
+        <div class="panel-title">${_t("代理")}</div>
+
+        <div class="param-group">
+          <div class="param-group-title">${_t("本地代理")}</div>
+          <div class="param-row" style="align-items:flex-start;">
+            <div class="param-label">${_t("代理地址")}<div class="param-key">proxy_url</div></div>
+            <div class="param-input" style="max-width:480px;">
+              <input type="text" id="proxy_url" placeholder="http://127.0.0.1:1080" style="max-width:320px;">
+              <div class="param-desc">${_t("模型文件下载（HF 模型 / SD 模型）走该代理，填写后保存即生效；留空 = 直连。仅支持 HTTP(S) 代理地址")}</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="param-group">
+          <div class="param-group-title">${_t("Docker 镜像拉取")}</div>
+          <div class="param-desc" style="margin-bottom:10px;">${_t("Docker 镜像由 Docker 守护进程下载，需把代理写入 daemon.json 的 proxies 配置并重启 Docker 服务后生效（镜像拉取期间不要关闭代理软件）")}</div>
+          <div class="param-row">
+            <div class="param-label">${_t("配置文件")}<div class="param-key">daemon.json</div></div>
+            <div class="param-input" style="max-width:none;"><span id="proxy-daemon-path" style="font-family:monospace;font-size:12px;color:var(--c-text-2);"></span></div>
+          </div>
+          <div class="param-row">
+            <div class="param-label">${_t("操作")}</div>
+            <div class="param-input" style="max-width:none;display:flex;align-items:center;gap:10px;">
+              <button class="btn-save" id="proxy-save-btn" style="margin-top:0;font-size:13px;padding:8px 20px;">${_t("保存并重启 Docker")}</button>
+              <span id="proxy-status" style="font-size:12px;color:var(--c-text-3);"></span>
             </div>
           </div>
         </div>
@@ -945,6 +977,8 @@ async function saveParams() {
     s.launch_params = params;
     s.vllm_args = getVllmArgsFromForm();
     s.multi_node_args = getMultiNodeArgsFromForm();
+    var proxyEl = document.getElementById("proxy_url");
+    s.proxy_url = proxyEl ? proxyEl.value.trim() : "";
     await invoke()("save_settings", { settings: s });
     console.log("[settings] 保存成功");
     showToast(_t("设置已保存，重启模型后生效"));
@@ -964,7 +998,7 @@ function autoSave() { saveParams(); }
 
 function setupAutoSave() {
   ["ctx_size", "port", "vllm_shm", "sg_tp", "sg_gpu_mem_util", "sg_quant", "sg_kv_dtype", "sg_load_format", "sg_block_size", "sg_tokenizer_mode", "sg_tool_parser", "sg_reasoning_parser", "sg_auto_tool_choice", "sg_trust_remote", "sg_max_seqs", "sg_max_batched_tokens", "sg_extra_args", "sg_extra_env",
-   "multi_enabled", "multi_dist_port", "multi_extra_env"].forEach(function (id) {
+   "multi_enabled", "multi_dist_port", "multi_extra_env", "proxy_url"].forEach(function (id) {
     var el = document.getElementById(id);
     if (el) el.addEventListener("change", autoSave);
   });
@@ -1190,6 +1224,52 @@ async function saveDockerMirrorConfig() {
   }
 }
 
+// ===== 代理配置（daemon.json proxies，镜像拉取走代理）=====
+
+async function loadDockerProxyConfig() {
+  const statusEl = document.getElementById("proxy-status");
+  try {
+    const cfg = await invoke()("get_docker_proxy_config");
+    const pathEl = document.getElementById("proxy-daemon-path");
+    if (pathEl) pathEl.textContent = cfg.daemonPath + (cfg.exists ? "" : _t("（不存在，保存时将新建）"));
+    if (statusEl) statusEl.textContent = cfg.proxy ? _t("当前 daemon 代理: ") + cfg.proxy : "";
+  } catch (e) {
+    if (statusEl) statusEl.textContent = _t("读取失败: ") + e;
+  }
+}
+
+async function saveDockerProxyConfig() {
+  const input = document.getElementById("proxy_url");
+  const statusEl = document.getElementById("proxy-status");
+  const btn = document.getElementById("proxy-save-btn");
+  if (!input || btn.disabled) return;
+  const proxy = (input.value || "").trim();
+  btn.disabled = true;
+  if (statusEl) statusEl.textContent = _t("正在写入配置并重启 Docker，请稍候...");
+  try {
+    const res = await invoke()("save_docker_proxy_config", { proxy: proxy });
+    if (res === "DOCKER_RESTARTED") {
+      if (statusEl) statusEl.textContent = _t("配置已写入，Docker 已重启");
+      showToast(proxy ? _t("代理配置已生效，镜像拉取将走代理") : _t("已清除 Docker 代理配置"));
+      loadDockerProxyConfig();
+    } else {
+      if (statusEl) statusEl.textContent = String(res);
+    }
+  } catch (e) {
+    const parsed = parseMirrorError(e);
+    if (parsed.kind === "manual") {
+      if (statusEl) statusEl.textContent = _t("需要权限，请手动执行");
+      await showConfirmDialog(_t("需要管理员权限手动执行以下命令：\n\n") + parsed.message);
+    } else if (parsed.kind === "cancelled") {
+      if (statusEl) statusEl.textContent = _t("已取消");
+    } else {
+      if (statusEl) statusEl.textContent = _t("保存失败: ") + parsed.message;
+    }
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 export default {
   template,
   mount(root) {
@@ -1224,6 +1304,15 @@ export default {
     var mirrorSaveBtn = document.getElementById("mirror-save-btn");
     if (mirrorSaveBtn) {
       mirrorSaveBtn.addEventListener("click", saveDockerMirrorConfig);
+    }
+    // 代理配置：进入面板时加载当前 daemon.json 代理
+    var navProxy = document.getElementById("nav-proxy");
+    if (navProxy) {
+      navProxy.addEventListener("click", loadDockerProxyConfig);
+    }
+    var proxySaveBtn = document.getElementById("proxy-save-btn");
+    if (proxySaveBtn) {
+      proxySaveBtn.addEventListener("click", saveDockerProxyConfig);
     }
     var logRefresh = document.getElementById("log-refresh-btn");
     if (logRefresh) logRefresh.addEventListener("click", function() {
@@ -1330,6 +1419,9 @@ export default {
         if (settings && settings.vllm_args) fillVllmArgsForm(settings.vllm_args);
         // 多机互联配置回填
         if (settings) await fillMultiNodeArgsForm(settings.multi_node_args);
+        // 代理地址回填
+        var proxyEl = document.getElementById("proxy_url");
+        if (proxyEl) proxyEl.value = (settings && settings.proxy_url) || "";
       } catch (e) {
         console.error("加载设置失败:", e);
       }

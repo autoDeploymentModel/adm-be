@@ -348,6 +348,17 @@ const EN = {
   "需要管理员权限手动执行以下命令：\n\n": "Run the following commands as administrator:\n\n",
   "已取消": "Cancelled",
 
+  // ===== settings.js - 代理 =====
+  "代理": "Proxy",
+  "本地代理": "Local Proxy",
+  "代理地址": "Proxy URL",
+  "模型文件下载（HF 模型 / SD 模型）走该代理，填写后保存即生效；留空 = 直连。仅支持 HTTP(S) 代理地址": "Model downloads (HF / SD) go through this proxy and take effect on save; empty = direct connection. HTTP(S) proxy URLs only",
+  "Docker 镜像拉取": "Docker Image Pull",
+  "Docker 镜像由 Docker 守护进程下载，需把代理写入 daemon.json 的 proxies 配置并重启 Docker 服务后生效（镜像拉取期间不要关闭代理软件）": "Images are pulled by the Docker daemon; write the proxy into daemon.json proxies and restart Docker to apply (keep your proxy software running while pulling)",
+  "当前 daemon 代理: ": "Current daemon proxy: ",
+  "代理配置已生效，镜像拉取将走代理": "Proxy applied, image pulls will go through the proxy",
+  "已清除 Docker 代理配置": "Docker proxy config cleared",
+
   // ===== settings.js - 运行日志 =====
   "选择日期": "Date",
   "刷新": "Refresh",

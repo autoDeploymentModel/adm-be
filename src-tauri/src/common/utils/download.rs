@@ -9,9 +9,25 @@ use crate::common::error::AppError;
 /// - 如果 `part_path` 存在，从当前大小处续传（使用 HTTP Range 头）。
 /// - 下载完成后，`part_path` 会重命名为 `final_path`。
 ///
-/// 镜像策略：传入 `huggingface.co` 原 URL 后，内部先尝试 `hf-mirror.com`（国内加速），
-/// 连接失败（DNS/连接/TLS）时回退到原始 `huggingface.co`。回退时若有未完成的 `.part`
-/// 会先删除（不同源字节布局不同，避免续传错位）。
+/// 下载源选择策略
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MirrorPolicy {
+    /// 直连场景：先试 hf-mirror.com 加速，失败回退 huggingface.co 原链接
+    HfMirrorFirst,
+    /// 开启代理时直接用源链接（代理已能访问源站，镜像内容还可能滞后，替换无意义）
+    Direct,
+}
+
+/// 带断点续传的通用文件下载函数。
+///
+/// - 如果 `final_path` 已存在，跳过下载（文件已完成）。
+/// - 如果 `part_path` 存在，从当前大小处续传（使用 HTTP Range 头）。
+/// - 下载完成后，`part_path` 会重命名为 `final_path`。
+///
+/// 镜像策略：`MirrorPolicy::HfMirrorFirst` 时传入 `huggingface.co` 原 URL，内部先尝试
+/// `hf-mirror.com`（国内加速），连接失败（DNS/连接/TLS）时回退到原始 `huggingface.co`；
+/// `MirrorPolicy::Direct`（设置页「代理」开启）时直接用源链接，不做镜像替换。
+/// 回退时若有未完成的 `.part` 会先删除（不同源字节布局不同，避免续传错位）。
 ///
 /// `on_progress` 回调在下载过程中被调用，参数为 `(progress, downloaded, total_size)`：
 /// - `progress`: 0-99 的百分比
@@ -22,16 +38,23 @@ pub async fn download_with_resume(
     url: &str,
     final_path: &Path,
     part_path: &Path,
+    policy: MirrorPolicy,
     on_progress: impl Fn(u8, u64, u64),
 ) -> Result<(), AppError> {
-    // 镜像优先（国内加速），回退到原 URL；不同时持有 .part 续传文件，避免源切换导致字节错位
-    let candidates: Vec<String> = if let Some(rest) = url.strip_prefix("https://huggingface.co/") {
-        vec![
-            format!("https://hf-mirror.com/{}", rest),
-            url.to_string(),
-        ]
-    } else {
-        vec![url.to_string()]
+    // 镜像优先（国内加速），回退到原 URL；Direct（开启代理）时只用源链接。
+    // 不同时持有 .part 续传文件，避免源切换导致字节错位
+    let candidates: Vec<String> = match policy {
+        MirrorPolicy::HfMirrorFirst => {
+            if let Some(rest) = url.strip_prefix("https://huggingface.co/") {
+                vec![
+                    format!("https://hf-mirror.com/{}", rest),
+                    url.to_string(),
+                ]
+            } else {
+                vec![url.to_string()]
+            }
+        }
+        MirrorPolicy::Direct => vec![url.to_string()],
     };
 
     let mut last_err: Option<AppError> = None;

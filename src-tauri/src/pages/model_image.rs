@@ -177,17 +177,14 @@ pub async fn download_and_extract_sd(app: tauri::AppHandle, state: tauri::State<
 
     std::fs::create_dir_all(&temp_dir).map_err(|e| format!("创建临时目录失败: {}", e))?;
 
-    // 断点续传下载
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(600))
-        .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+    // 断点续传下载（设置页「代理」配置的 proxy_url 会走本地代理）
+    let http = crate::common::utils::proxy::build_download_http(&app, Some(std::time::Duration::from_secs(600))).await?;
 
     let part_path = archive_path.with_extension("part");
 
     let app_clone = app.clone();
     download_with_resume(
-        &client, &download_url, &archive_path, &part_path,
+        &http.client, &download_url, &archive_path, &part_path, http.mirror_policy,
         |progress, _downloaded, _total| {
             let st = app_clone.state::<AppState>();
             if let Ok(mut p) = st.sd_download_progress.lock() {
