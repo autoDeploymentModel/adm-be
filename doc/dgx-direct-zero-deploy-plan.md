@@ -171,7 +171,7 @@ A 本机：
   7. sudo systemctl restart systemd-networkd
   8. 校验: ip -4 addr show <iface> | grep 192.168.177.1X/24 → 未出现则失败回滚
 ```
-- **特别说明（写进日志文案与文档）**：绝不执行 `netplan apply`（DGX-Spark 已知坑，报错）。配置生效靠 `systemd-networkd` 重启。
+- **特别说明（写进日志文案与文档）**：绝不执行 `netplan apply`（DGX-Spark 已知坑，报错）。配置生效靠**写入后先 `netplan generate`（仅生成 systemd-networkd 配置，不 apply、不接管接口）+ 重启 systemd-networkd**——只写 yaml 重启不生效（networkd 只读 `/run/systemd/network/` 生成文件）；回滚同样先 generate 再重启服务。
 - 回滚：`sudo cp 40-cx7.yaml.adm-bak-<ts> 40-cx7.yaml`（无备份则删文件）+ `sudo nmcli device set <iface> managed yes` + `sudo systemctl restart NetworkManager` + 重启 systemd-networkd。B 侧回滚同样经 ssh 执行（B 的 SSH 走管理网地址，不受光口配置影响，回滚必然可达）。
 
 ### Step 4 连通检测（走光口）

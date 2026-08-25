@@ -462,6 +462,28 @@ async fn apply_netplan(c: &Ctx, is_a: bool, iface: &str, addr: &str) -> Result<(
         return Err(AppError::msg(format!("{} 写入 netplan 失败: {}", who, err)));
     }
 
+    // 2.5) netplan generate：仅生成 systemd-networkd 配置（/run/systemd/network/），不 apply。
+    //      ⚠ 关键：systemd-networkd 重启不会自动重读 40-cx7.yaml，必须 generate 后才生效；
+    //      generate 只写文件不接管接口，不会触发 DGX-Spark 的 netplan apply 报错坑。
+    c.emit(3, "run", &format!("{}：netplan generate 生成 networkd 配置", who));
+    let gen = format!(
+        "echo '{}' | sudo -S -p '' netplan generate 2>&1",
+        sh_quote(pass)
+    );
+    let (ok, out, err) = if is_a {
+        local_run(&gen, Duration::from_secs(30)).await?
+    } else {
+        remote_run(c, &gen, Duration::from_secs(30)).await?
+    };
+    if !ok {
+        restore_one(c, is_a, iface).await;
+        let detail = if out.trim().is_empty() { err } else { out.trim().to_string() };
+        return Err(AppError::msg(format!(
+            "{} netplan generate 失败（yaml 与现有 netplan 配置冲突？）: {}",
+            who, detail
+        )));
+    }
+
     // 3) 网卡移交 networkd（nmcli managed no）+ 重启 NetworkManager
     c.emit(3, "run", &format!("{}：nmcli 移交网卡并重启 NetworkManager", who));
     let nm = format!(
@@ -486,13 +508,14 @@ async fn apply_netplan(c: &Ctx, is_a: bool, iface: &str, addr: &str) -> Result<(
     let netd = format!(
         "echo '{}' | sudo -S -p '' systemctl daemon-reload; \
          echo '{}' | sudo -S -p '' systemctl enable --now systemd-networkd; \
-         echo '{}' | sudo -S -p '' systemctl restart systemd-networkd; sleep 2; \
-         ip -4 addr show {} | grep -q \"{}/24\" && echo NETD_OK || echo NETD_FAIL",
+         echo '{}' | sudo -S -p '' systemctl restart systemd-networkd; sleep 3; \
+         if ip -4 addr show {} | grep -q \"{}/24\"; then echo NETD_OK; else echo NETD_FAIL; ip -4 addr show {} | head -5; fi",
         sh_quote(pass),
         sh_quote(pass),
         sh_quote(pass),
         sh_quote(iface),
-        addr
+        addr,
+        sh_quote(iface)
     );
     let (ok, out, err) = if is_a {
         local_run(&netd, Duration::from_secs(90)).await?
@@ -506,8 +529,8 @@ async fn apply_netplan(c: &Ctx, is_a: bool, iface: &str, addr: &str) -> Result<(
     if !out.contains("NETD_OK") {
         restore_one(c, is_a, iface).await;
         return Err(AppError::msg(format!(
-            "{} 固定 IP 未生效（{} 上未出现 {}/24）",
-            who, iface, addr
+            "{} 固定 IP 未生效（{} 上未出现 {}/24）\n{}",
+            who, iface, addr, out
         )));
     }
     Ok(())
@@ -518,6 +541,7 @@ async fn restore_one(c: &Ctx, is_a: bool, iface: &str) {
     let pass = if is_a { &c.a_pass } else { &c.b_pass };
     let script = format!(
         "if ls {f}.adm-bak-* >/dev/null 2>&1; then echo '{p}' | sudo -S -p '' cp -a $(ls -t {f}.adm-bak-* | head -1) {f}; else echo '{p}' | sudo -S -p '' rm -f {f}; fi; \
+         echo '{p}' | sudo -S -p '' netplan generate || true; \
          echo '{p}' | sudo -S -p '' nmcli device set {ifc} managed yes || true; \
          echo '{p}' | sudo -S -p '' systemctl restart NetworkManager || true; \
          echo '{p}' | sudo -S -p '' systemctl daemon-reload || true; \
