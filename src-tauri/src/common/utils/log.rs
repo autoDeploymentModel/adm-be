@@ -1,7 +1,9 @@
-/// Debug log macro: always writes to the daily log file under ~/.adm-be/logs/.
+/// Debug log macro: always writes to the daily log file under
+/// ~/.local/share/com.adm.be/logs/ (Linux) or ~/.adm-be/logs/ (Windows).
 /// In debug builds, also prints to stderr.
 ///
 /// Usage: `dbg_log!("...")` or `dbg_log!("{:?}", val)`
+/// 注意：消息内容不要再带 `[DEBUG]` 等级别前缀，宏会自动加。
 #[macro_export]
 macro_rules! dbg_log {
     ($($arg:tt)*) => {

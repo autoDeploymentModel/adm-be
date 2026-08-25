@@ -438,7 +438,7 @@ const template = `
             <div class="param-label">${_t("代理地址")}<div class="param-key">proxy_url</div></div>
             <div class="param-input" style="max-width:480px;">
               <input type="text" id="proxy_url" placeholder="http://127.0.0.1:1080" style="max-width:320px;">
-              <div class="param-desc">${_t("模型文件下载（HF 模型 / SD 模型）走该代理，填写后保存即生效；留空 = 直连。仅支持 HTTP(S) 代理地址")}</div>
+              <div class="param-desc">${_t("模型文件下载（HF 模型）走该代理，填写后保存即生效；留空 = 直连。仅支持 HTTP(S) 代理地址")}</div>
             </div>
           </div>
         </div>

@@ -11,7 +11,7 @@ use tauri::Manager;
 
 #[tauri::command]
 pub async fn save_settings(app: tauri::AppHandle, settings: Settings) -> Result<(), AppError> {
-    dbg_log!("[DEBUG] save_settings called with: {:?}", settings);
+    dbg_log!("save_settings called with: {:?}", settings);
     // 持有 config 写锁：防止 read-modify-write 并发互相覆盖
     let state = app.state::<AppState>();
     let _lock = state.config_write_lock.lock().map_err(|e| e.to_string())?;
@@ -19,8 +19,8 @@ pub async fn save_settings(app: tauri::AppHandle, settings: Settings) -> Result<
     let config_path = data_dir.join("config.json");
 
     let json = serde_json::to_string_pretty(&settings).map_err(|e| AppError::msg(format!("序列化配置失败: {}", e)))?;
-    dbg_log!("[DEBUG] Writing config.json to: {:?}", config_path);
-    dbg_log!("[DEBUG] config.json content: {}", json);
+    dbg_log!("Writing config.json to: {:?}", config_path);
+    dbg_log!("config.json content: {}", json);
     
     // 直接写入目标文件，避免 macOS 上 rename 操作可能因文件系统属性/权限/沙盒问题失败
     std::fs::write(&config_path, &json).map_err(|e| AppError::msg(format!("写入配置文件失败: {}", e)))?;
@@ -30,7 +30,7 @@ pub async fn save_settings(app: tauri::AppHandle, settings: Settings) -> Result<
         let _ = file.sync_all();
     }
 
-    dbg_log!("[DEBUG] Config saved successfully to: {:?}", config_path);
+    dbg_log!("Config saved successfully to: {:?}", config_path);
     Ok(())
 }
 
@@ -39,16 +39,16 @@ pub async fn load_settings(app: tauri::AppHandle) -> Result<Settings, AppError> 
     let data_dir = config::get_data_dir(Some(&app))?;
     let config_path = data_dir.join("config.json");
 
-    dbg_log!("[DEBUG] load_settings: reading from {:?}", config_path);
+    dbg_log!("load_settings: reading from {:?}", config_path);
     if !config_path.exists() {
-        dbg_log!("[DEBUG] load_settings: config.json not found, returning defaults");
+        dbg_log!("load_settings: config.json not found, returning defaults");
         return Ok(Settings::default());
     }
 
     let json = std::fs::read_to_string(&config_path).map_err(|e| AppError::msg(format!("读取配置文件失败: {}", e)))?;
-    dbg_log!("[DEBUG] load_settings raw json: {}", json);
+    dbg_log!("load_settings raw json: {}", json);
     let settings: Settings = serde_json::from_str(&json).map_err(|e| AppError::msg(format!("解析配置文件失败: {}", e)))?;
-    dbg_log!("[DEBUG] load_settings parsed: {:?}", settings);
+    dbg_log!("load_settings parsed: {:?}", settings);
 
     Ok(settings)
 }

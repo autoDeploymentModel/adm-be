@@ -87,19 +87,18 @@ fn process_image_name(pid: u32) -> Option<String> {
         .map(|s| s.trim().to_lowercase())
 }
 
-/// 仅当 pid 当前仍指向已知的模型进程（docker/sudo/llama-server/sd-cli）时才强杀。
+/// 仅当 pid 当前仍指向已知的模型进程（docker/sudo/llama-server）时才强杀。
 /// 防止 pid 失效后被操作系统复用于无关进程（如远程会话组件）导致误杀。
 fn is_known_model_process(pid: u32) -> bool {
     matches!(
         process_image_name(pid).as_deref(),
         Some(
             "docker" | "docker.exe" | "sudo" | "sudo.exe" | "llama-server" | "llama-server.exe"
-                | "sd-cli" | "sd-cli.exe"
         )
     )
 }
 
-/// 强杀整个进程树（含子进程），避免 llama-server / SD 派生的子进程残留为孤儿。
+/// 强杀整个进程树（含子进程），避免 llama-server 派生的子进程残留为孤儿。
 ///
 /// - Windows: `taskkill /PID <pid> /T /F`
 /// - Unix: 先尝试按进程组（kill -9 -<pgid>），失败再直接 kill PID
@@ -218,62 +217,4 @@ pub fn get_gpu_info() -> (u64, u64, bool) {
     }
 
     (total_vram, used_vram, has_gpu)
-}
-
-pub fn detect_gpu_vendor() -> Option<String> {
-    #[cfg(target_os = "windows")]
-    {
-        // 使用 PowerShell Get-CimInstance 替代已弃用的 wmic
-        if let Ok(output) = create_hidden_command("powershell")
-            .args([
-                "-NoProfile", "-NonInteractive", "-Command",
-                "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name",
-            ])
-            .output()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let mut nvidia_found = None;
-            let mut amd_found = None;
-            let mut intel_found = None;
-
-            for line in stdout.lines() {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let lower = trimmed.to_lowercase();
-                if lower.contains("nvidia")
-                    || lower.contains("geforce")
-                    || lower.contains("rtx")
-                    || lower.contains("gtx")
-                {
-                    nvidia_found = Some(());
-                } else if lower.contains("amd") || lower.contains("radeon") {
-                    amd_found = Some(());
-                } else if lower.contains("intel") {
-                    intel_found = Some(());
-                }
-            }
-
-            if nvidia_found.is_some() {
-                return Some("nvidia".to_string());
-            } else if amd_found.is_some() {
-                return Some("amd".to_string());
-            } else if intel_found.is_some() {
-                return Some("intel".to_string());
-            }
-        }
-        return None;
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        // Linux：nvidia-smi 存在即为 NVIDIA
-        if let Ok(output) = create_hidden_command("nvidia-smi").arg("--version").output() {
-            if output.status.success() {
-                return Some("nvidia".to_string());
-            }
-        }
-        None
-    }
 }

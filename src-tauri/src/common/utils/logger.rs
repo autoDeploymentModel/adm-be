@@ -8,6 +8,18 @@ const MAX_LOG_DAYS: i64 = 7;
 const MAX_READ_LINES: usize = 5000;
 
 pub fn get_log_dir() -> Result<PathBuf, AppError> {
+    // Linux: ~/.local/share/com.adm.be/logs/（与多机 vLLM 流水日志同目录，统一管理）
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(dir) = dirs::data_local_dir() {
+            let log_dir = dir.join("com.adm.be").join("logs");
+            std::fs::create_dir_all(&log_dir)
+                .map_err(|e| AppError::msg(format!("创建日志目录失败: {}", e)))?;
+            return Ok(log_dir);
+        }
+    }
+
+    // Windows / 兜底：保持原样 ~/.adm-be/logs/
     let home = dirs::home_dir()
         .ok_or(AppError::msg("无法获取用户目录"))?;
     let log_dir = home.join(".adm-be").join("logs");

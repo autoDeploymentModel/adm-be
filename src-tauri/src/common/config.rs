@@ -25,7 +25,3 @@ pub fn get_data_dir(app: Option<&tauri::AppHandle>) -> Result<PathBuf, AppError>
     let _ = app;
     get_exe_dir()
 }
-
-pub fn get_base_dir(app: Option<&tauri::AppHandle>) -> Result<PathBuf, AppError> {
-    get_data_dir(app)
-}

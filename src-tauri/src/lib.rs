@@ -3,7 +3,7 @@ mod common;
 mod pages;
 
 use app_state::AppState;
-use pages::{index, model_list, model_image, settings, benchmark};
+use pages::{index, model_list, settings, benchmark};
 
 use tauri::Manager;
 use tauri::menu::{Menu, MenuItem};
@@ -70,16 +70,14 @@ fn cleanup_processes(app: &tauri::AppHandle) {
             .args(["rm", "-f", &container])
             .output();
     }
-    // 兜底：按进程名清理任何残留的 llama-server / SD 子进程
+    // 兜底：按进程名清理任何残留的 llama-server 子进程
     #[cfg(target_os = "windows")]
     {
         crate::common::utils::platform::kill_process_by_name("llama-server.exe");
-        crate::common::utils::platform::kill_process_by_name("sd-cli.exe");
     }
     #[cfg(not(target_os = "windows"))]
     {
         crate::common::utils::platform::kill_process_by_name("llama-server");
-        crate::common::utils::platform::kill_process_by_name("sd-cli");
     }
 }
 
@@ -168,12 +166,6 @@ pub fn run() {
             model_list::delete_local_model,
             model_list::get_downloading_models,
             model_list::get_downloading_phases,
-            // model_image.rs
-            model_image::get_sd_status,
-            model_image::download_and_extract_sd,
-            model_image::start_sd_generation,
-            model_image::stop_sd,
-            model_image::save_sd_image_as,
             // settings.rs
             settings::save_settings,
             settings::load_settings,

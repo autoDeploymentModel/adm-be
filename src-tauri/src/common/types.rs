@@ -62,12 +62,6 @@ pub struct RemoteModel {
     pub support_reasoning: bool,
     #[serde(default)]
     pub support_images: bool,
-    #[serde(default)]
-    pub model_mmproj: Option<String>,
-    #[serde(default)]
-    pub model_diffusion: Option<String>,
-    #[serde(default)]
-    pub model_vae: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]

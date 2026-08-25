@@ -504,22 +504,6 @@ function isModelDownloaded(modelId) {
       return fname && local.files.includes(fname);
     });
   }
-  if (model && model.model_type === "文本生成图片") {
-    const mainFile = getUrlFilename(model.model_url);
-    if (mainFile && !local.files.includes(mainFile)) return false;
-    if (model.model_diffusion) {
-      const diffusionFile = getUrlFilename(model.model_diffusion);
-      if (diffusionFile && !local.files.includes(diffusionFile)) return false;
-    }
-    if (model.model_vae) {
-      const vaeFile = getUrlFilename(model.model_vae);
-      if (vaeFile && !local.files.includes(vaeFile)) return false;
-    }
-    return true;
-  }
-  if (model && model.model_type === "视觉多模态理解") {
-    return local.files.some(f => f.startsWith("mmproj"));
-  }
   return true;
 }
 
@@ -617,9 +601,6 @@ function renderModelTable() {
 
     const partSize = st.partFiles[model.model_id];
     const downloadingProgress = st.downloadingModels[model.model_id];
-    const isDownloadingMmproj = st.downloadingMmproj[model.model_id];
-    const isDownloadingDiffusion = st.downloadingDiffusion[model.model_id];
-    const isDownloadingVae = st.downloadingVae[model.model_id];
     const safeModelId = escapeHtml(model.model_id);
     const modelFilesAttr = model.model_download_files && model.model_download_files.length > 0
       ? ' data-model-files="' + escapeHtml(JSON.stringify(model.model_download_files)) + '"'
@@ -630,18 +611,12 @@ function renderModelTable() {
     let downloadBtnHtml = "";
     if (downloaded) {
       downloadBtnHtml = '';
-    } else if (isDownloadingMmproj) {
-      downloadBtnHtml = '<button class="btn btn-download" data-model-id="' + safeModelId + '" disabled>' + _t("下载 mmproj...") + '</button>';
-    } else if (isDownloadingDiffusion) {
-      downloadBtnHtml = '<button class="btn btn-download" data-model-id="' + safeModelId + '" disabled>' + _t("下载 diffusion...") + '</button>';
-    } else if (isDownloadingVae) {
-      downloadBtnHtml = '<button class="btn btn-download" data-model-id="' + safeModelId + '" disabled>' + _t("下载 vae...") + '</button>';
     } else if (downloadingProgress !== undefined) {
       downloadBtnHtml = '<button class="btn btn-download" data-model-id="' + safeModelId + '" disabled>' + downloadingProgress + '%</button>';
     } else if (partSize && partSize > 0) {
-      downloadBtnHtml = '<button class="btn btn-download" data-model-id="' + safeModelId + '" data-model-url="' + escapeHtml(model.model_url) + '" data-model-mmproj="' + escapeHtml(model.model_mmproj || '') + '" data-model-diffusion="' + escapeHtml(model.model_diffusion || '') + '" data-model-vae="' + escapeHtml(model.model_vae || '') + '" data-model-type="' + escapeHtml(model.model_type || '') + '"' + modelFilesAttr + modelImageAttr + ' id="dl-' + safeModelId + '">' + _t("继续下载") + '</button>';
+      downloadBtnHtml = '<button class="btn btn-download" data-model-id="' + safeModelId + '" data-model-url="' + escapeHtml(model.model_url) + '"' + modelFilesAttr + modelImageAttr + ' id="dl-' + safeModelId + '">' + _t("继续下载") + '</button>';
     } else if (available) {
-      downloadBtnHtml = '<button class="btn btn-download" data-model-id="' + safeModelId + '" data-model-url="' + escapeHtml(model.model_url) + '" data-model-mmproj="' + escapeHtml(model.model_mmproj || '') + '" data-model-diffusion="' + escapeHtml(model.model_diffusion || '') + '" data-model-vae="' + escapeHtml(model.model_vae || '') + '" data-model-type="' + escapeHtml(model.model_type || '') + '"' + modelFilesAttr + modelImageAttr + ' id="dl-' + safeModelId + '">' + _t("下载") + '</button>';
+      downloadBtnHtml = '<button class="btn btn-download" data-model-id="' + safeModelId + '" data-model-url="' + escapeHtml(model.model_url) + '"' + modelFilesAttr + modelImageAttr + ' id="dl-' + safeModelId + '">' + _t("下载") + '</button>';
     } else {
       downloadBtnHtml = '<button class="btn btn-download" disabled>' + _t("下载") + '</button>';
     }
@@ -657,8 +632,6 @@ actionsHtml = '<button class="btn btn-view" id="view-' + safeModelId + '">' + _t
         ? _t("拉取镜像 ") + pullPct + "%"
         : _t("启动中...");
       actionsHtml = '<button class="btn btn-start" disabled id="start-' + safeModelId + '" data-pull-pct="' + (pullPct || 0) + '">' + startBtnText + '</button>';
-    } else if (model.model_type === "文本生成图片" && downloaded) {
-      actionsHtml = '<button class="btn btn-start" id="img-' + safeModelId + '">' + _t("生成图片") + '</button>';
     } else if (downloaded && available) {
       actionsHtml = '<button class="btn btn-start" data-start-btn="' + safeModelId + '" id="start-' + safeModelId + '">' + _t("启动") + '</button>';
     } else if (downloaded) {
@@ -676,8 +649,7 @@ actionsHtml = '<button class="btn btn-view" id="view-' + safeModelId + '">' + _t
     if (model.support_images) features.push('<span class="feature-badge feature-supported">' + _t("图片识别") + '</span>');
     const featuresHtml = features.length > 0 ? '<div class="card-features">' + features.join('') + '</div>' : '';
 
-    const isDownloadingPhase = isDownloadingMmproj || isDownloadingDiffusion || isDownloadingVae;
-    const progressVisible = downloadingProgress !== undefined || isDownloadingPhase;
+    const progressVisible = downloadingProgress !== undefined;
     const progressValue = downloadingProgress !== undefined ? downloadingProgress : 0;
 
     card.innerHTML =
@@ -716,13 +688,6 @@ function bindRowEvents() {
       goModel(modelId);
     });
   });
-  const imgBtns = document.querySelectorAll('#model-grid .btn-start[id^="img-"]');
-  imgBtns.forEach(function(btn) {
-    btn.addEventListener('click', function() {
-      const modelId = btn.id.replace('img-', '');
-      openImageGen(modelId);
-    });
-  });
   const deleteBtns = document.querySelectorAll('#model-grid .btn-delete[data-delete-btn]');
   deleteBtns.forEach(function(btn) {
     btn.addEventListener('click', function() {
@@ -736,10 +701,6 @@ async function handleDownload(btn) {
   const modelId = btn.dataset.modelId;
   const modelUrl = btn.dataset.modelUrl;
   console.log("[model_list] 开始下载模型:", modelId, "URL:", modelUrl);
-  const modelMmproj = btn.dataset.modelMmproj || null;
-  const modelDiffusion = btn.dataset.modelDiffusion || null;
-  const modelVae = btn.dataset.modelVae || null;
-  const modelType = btn.dataset.modelType || '';
   const vllmImage = btn.dataset.modelImage || null;
   let modelFiles = null;
   if (btn.dataset.modelFiles) {
@@ -752,7 +713,7 @@ async function handleDownload(btn) {
   }
 
   try {
-    await invoke()("download_model", { modelId: modelId, modelUrl: modelUrl, modelMmproj: modelMmproj, modelDiffusion: modelDiffusion, modelVae: modelVae, modelType: modelType, modelFiles: modelFiles, vllmImage: vllmImage });
+    await invoke()("download_model", { modelId: modelId, modelUrl: modelUrl, modelFiles: modelFiles, vllmImage: vllmImage });
     console.log("[model_list] 下载模型 invoke 完成:", modelId);
   } catch (e) {
     console.error("[model_list] 下载失败:", e);
@@ -903,10 +864,6 @@ async function handleStop(btn) {
   }
 }
 
-function openImageGen(modelId) {
-  location.hash = "#/image?model_id=" + encodeURIComponent(modelId);
-}
-
 function goModel(modelId) {
   const port = S().runningModelPort || 5678;
   // 直接用系统浏览器打开模型 WebUI（壳层 openUrl 走 opener 插件）
@@ -952,11 +909,7 @@ function handleTauriEvent(type, payload) {
     case "download-progress": {
       const btn = document.querySelector('[data-model-id="' + model_id + '"]');
       if (btn) {
-        const t = payload.type || "model";
-        if (t === "mmproj") btn.textContent = "mmproj " + progress + "%";
-        else if (t === "diffusion") btn.textContent = "diffusion " + progress + "%";
-        else if (t === "vae") btn.textContent = "vae " + progress + "%";
-        else btn.textContent = progress + "%";
+        btn.textContent = progress + "%";
       }
       updateProgressBar(model_id, progress);
       break;
@@ -1043,19 +996,7 @@ async function init() {
 
   // 重新从后端同步下载状态（切页回来时恢复正在下载/已完成的进度）
   st.downloadingModels = {};
-  st.downloadingMmproj = {};
-  st.downloadingDiffusion = {};
-  st.downloadingVae = {};
   try { st.downloadingModels = await invoke()("get_downloading_models"); } catch (e) { console.error("获取正在下载的模型失败:", e); }
-
-  try {
-    const phases = await invoke()("get_downloading_phases");
-    for (const [modelId, phase] of Object.entries(phases)) {
-      if (phase === "mmproj") st.downloadingMmproj[modelId] = true;
-      else if (phase === "diffusion") st.downloadingDiffusion[modelId] = true;
-      else if (phase === "vae") st.downloadingVae[modelId] = true;
-    }
-  } catch (e) { console.error("获取下载阶段信息失败:", e); }
 
   try {
     const status = await invoke()("get_model_status");

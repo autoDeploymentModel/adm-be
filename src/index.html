@@ -351,9 +351,6 @@
       localModels: [],
       partFiles: {},
       downloadingModels: {},
-      downloadingMmproj: {},
-      downloadingDiffusion: {},
-      downloadingVae: {},
       modelList: [],
       modelTypes: [],
       currentTypeFilter: "all",
@@ -513,7 +510,6 @@
     // ===== 路由器 =====
     const routes = {
       "/list":     { load: () => import("./views/model_list.js"),     nav: "home-btn" },
-      "/image":    { load: () => import("./views/model_image.js"),    nav: "home-btn" },
       "/settings": { load: () => import("./views/settings.js"),       nav: "settings-btn" },
       "/benchmark": { load: () => import("./views/benchmark.js"),   nav: "benchmark-btn" },
     };
@@ -626,9 +622,6 @@
     var st = window.__adm_state;
     st.pullProgress = {};
     st.downloadingModels = st.downloadingModels || {};
-    st.downloadingMmproj = st.downloadingMmproj || {};
-    st.downloadingDiffusion = st.downloadingDiffusion || {};
-    st.downloadingVae = st.downloadingVae || {};
 
     if (typeof listen === "function") {
       var globalEvents = ["download-progress", "download-complete", "download-error", "model-pull-progress", "model-started", "model-stopped", "model-error", "image-push-progress", "model-sync-progress"];
@@ -638,37 +631,22 @@
           var mid = p.model_id;
           switch (ev) {
             case "download-progress": {
-              var dt = p.type || "model";
-              if (dt === "mmproj") st.downloadingMmproj[mid] = true;
-              else if (dt === "diffusion") st.downloadingDiffusion[mid] = p.progress;
-              else if (dt === "vae") st.downloadingVae[mid] = p.progress;
-              else st.downloadingModels[mid] = p.progress;
+              st.downloadingModels[mid] = p.progress;
               break;
             }
             case "download-complete": {
-              var ct = p.type || "model";
-              if (ct === "mmproj") { delete st.downloadingMmproj[mid]; delete st.downloadingModels[mid]; }
-              else if (ct === "diffusion") { delete st.downloadingDiffusion[mid]; }
-              else if (ct === "vae") { delete st.downloadingVae[mid]; }
-              else {
-                delete st.downloadingModels[mid];
-                if (p.all) {
-                  // 多文件目录模型全部完成
-                  var model = (st.modelList || []).find(function(m) { return m.model_id === mid; });
-                  var local = (st.localModels || []).find(function(m) { return m.model_id === mid; });
-                  if (model && model.model_download_files) {
-                    var names = model.model_download_files.map(function(u) { return u.split('/').pop(); }).filter(Boolean);
-                    if (local) names.forEach(function(n) { if (!local.files.includes(n)) local.files.push(n); });
-                    else st.localModels.push({ model_id: mid, files: names });
-                  }
-                } else {
-                  var model2 = (st.modelList || []).find(function(m) { return m.model_id === mid; });
-                  if (model2 && model2.model_type === "视觉多模态理解" && model2.model_mmproj) {
-                    st.downloadingMmproj[mid] = true;
-                  }
+              delete st.downloadingModels[mid];
+              if (p.all) {
+                // 多文件目录模型全部完成
+                var model = (st.modelList || []).find(function(m) { return m.model_id === mid; });
+                var local = (st.localModels || []).find(function(m) { return m.model_id === mid; });
+                if (model && model.model_download_files) {
+                  var names = model.model_download_files.map(function(u) { return u.split('/').pop(); }).filter(Boolean);
+                  if (local) names.forEach(function(n) { if (!local.files.includes(n)) local.files.push(n); });
+                  else st.localModels.push({ model_id: mid, files: names });
                 }
-                delete st.partFiles[mid];
               }
+              delete st.partFiles[mid];
               break;
             }
             case "download-error": {

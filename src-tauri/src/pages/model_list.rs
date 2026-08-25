@@ -208,10 +208,6 @@ pub async fn download_model(
     app: tauri::AppHandle,
     model_id: String,
     model_url: String,
-    model_mmproj: Option<String>,
-    model_diffusion: Option<String>,
-    model_vae: Option<String>,
-    model_type: String,
     model_files: Option<Vec<String>>,
     vllm_image: Option<String>,
 ) -> Result<(), AppError> {
@@ -398,35 +394,6 @@ pub async fn download_model(
         ).ok();
     }
 
-    // ===== 视觉多模态：mmproj 文件下载 =====
-    if model_type == "视觉多模态理解" {
-        if let Some(mmproj_url) = model_mmproj {
-            app.state::<AppState>().downloading_phase.lock().unwrap_or_else(|e| e.into_inner()).insert(model_id.clone(), "mmproj".to_string());
-            download_extra_file(
-                &app, &model_id, &model_dir, &mmproj_url,
-                &http, "mmproj"
-            ).await?;
-        }
-    }
-
-    // ===== 文生图：diffusion + vae 文件下载 =====
-    if model_type == "文本生成图片" {
-        if let Some(diffusion_url) = model_diffusion {
-            app.state::<AppState>().downloading_phase.lock().unwrap_or_else(|e| e.into_inner()).insert(model_id.clone(), "diffusion".to_string());
-            download_extra_file(
-                &app, &model_id, &model_dir, &diffusion_url,
-                &http, "diffusion"
-            ).await?;
-        }
-        if let Some(vae_url) = model_vae {
-            app.state::<AppState>().downloading_phase.lock().unwrap_or_else(|e| e.into_inner()).insert(model_id.clone(), "vae".to_string());
-            download_extra_file(
-                &app, &model_id, &model_dir, &vae_url,
-                &http, "vae"
-            ).await?;
-        }
-    }
-
     Ok(())
 }
 
@@ -465,67 +432,6 @@ async fn pull_image_if_configured(app: &tauri::AppHandle, model_id: &str, image:
             );
         }
     }
-}
-
-async fn download_extra_file(
-    app: &tauri::AppHandle,
-    model_id: &str,
-    model_dir: &std::path::Path,
-    file_url: &str,
-    http: &crate::common::utils::proxy::DownloadHttp,
-    file_type: &str,
-) -> Result<(), AppError> {
-    // 镜像策略见 download_with_resume 的 MirrorPolicy（代理开启时直接源链接）
-    let filename = file_url
-        .rsplit('/')
-        .next()
-        .unwrap_or(file_type)
-        .to_string();
-    let final_path = model_dir.join(&filename);
-    let part_path = model_dir.join(format!("{}.part", filename));
-
-    // 发送初始进度（0%）
-    app.emit(
-        "download-progress",
-        serde_json::json!({
-            "model_id": model_id,
-            "progress": 0u8,
-            "downloaded": 0u64,
-            "total": 0u64,
-            "type": file_type,
-        }),
-    )
-    .ok();
-
-    // 使用通用下载函数（带断点续传）
-    let app_clone = app.clone();
-    let mid = model_id.to_string();
-    let ft = file_type.to_string();
-    download_with_resume(
-        &http.client, &file_url, &final_path, &part_path, http.mirror_policy,
-        |progress, downloaded, total| {
-            app_clone.emit(
-                "download-progress",
-                serde_json::json!({
-                    "model_id": &mid,
-                    "progress": progress,
-                    "downloaded": downloaded,
-                    "total": total,
-                    "type": &ft,
-                }),
-            )
-            .ok();
-        },
-    )
-    .await?;
-
-    app.emit(
-        "download-complete",
-        serde_json::json!({ "model_id": model_id, "type": file_type }),
-    )
-    .ok();
-
-    Ok(())
 }
 
 /// Docker 环境预检：CLI 存在 → daemon 运行 → NVIDIA runtime 可用 → **镜像已存在**。
@@ -1785,7 +1691,7 @@ async fn start_multi_node(
         model_id, model_dir, &image, &shm_size, &mn, &node0_ip, local_iface.as_deref(), local_ib_iface.as_deref(), local_has_ib,
     );
 
-    dbg_log!("[DEBUG] vllm multi-node head container args (rank0): {:?}", args0);
+    dbg_log!("vllm multi-node head container args (rank0): {:?}", args0);
     let _ = app.emit("model-log", serde_json::json!({
         "model_id": model_id,
         "line": format!("[多机] 本机（rank 0）启动保活容器 {}（sleep infinity）", container0),
@@ -2359,7 +2265,7 @@ async fn start_vllm_docker(
         }
     }
 
-    dbg_log!("[DEBUG] vllm docker args: {:?}", args);
+    dbg_log!("vllm docker args: {:?}", args);
 
     app.emit(
         "model-log",
