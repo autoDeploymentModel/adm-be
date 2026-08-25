@@ -463,6 +463,34 @@ const template = `
       <div id="panel-multinode" class="panel">
         <div class="panel-title">${_t("DGX直连配置")}</div>
 
+        <div class="param-group" style="border:1px solid rgba(var(--c-accent-rgb),0.45);border-radius:10px;padding:16px;background:var(--c-panel-2);">
+          <div class="param-group-title" style="font-size:14px;">${_t("DGX-Spark 双机直连 · 一键从零部署")} <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--c-text-3);">(${_t("A 为控制机，B 为对等节点")})</span></div>
+          <div class="param-desc" style="line-height:1.9;margin-bottom:14px;font-size:12px;color:var(--c-text-3);">
+            <span style="color:#f44336;font-weight:600;">${_t("⚠ 准备提示")}</span>：${_t("直连线型号：200G QSFP56 DAC 直连铜缆（DGX-Spark 网口是 QSFP56（200G），不是 QSFP112（400G），不要买错，买 1 条就够——插 2 条受内存带宽限制提升不大，反而增加配置复杂度）。插好直连线后 A、B 必须插同一方向的口（如都插左边），插口方向不一致会自动检测到并报错。")}
+          </div>
+          <div class="param-row">
+            <div class="param-label">${_t("A 控制机（本机）")}<div class="param-key">sudo 密码</div></div>
+            <div class="param-input" style="max-width:460px;display:flex;align-items:center;gap:8px;">
+              <input id="zd-a-user" placeholder="${_t("用户名")}" style="flex:1;width:auto;min-width:0;">
+              <input id="zd-a-pass" type="text" placeholder="${_t("输入密码")}" autocomplete="off" style="flex:1;width:auto;min-width:0;">
+            </div>
+          </div>
+          <div class="param-row">
+            <div class="param-label">${_t("B 对等节点")}<div class="param-key">${_t("当前可达地址（管理网 IP）")}</div></div>
+            <div class="param-input" style="max-width:460px;display:flex;align-items:center;gap:8px;">
+              <input id="zd-b-addr" placeholder="${_t("IP 地址，例如 192.168.1.X")}" style="flex:1.6;width:auto;min-width:0;">
+              <input id="zd-b-user" placeholder="${_t("用户名")}" style="flex:1;width:auto;min-width:0;">
+              <input id="zd-b-pass" type="text" placeholder="${_t("输入密码")}" autocomplete="off" style="flex:1;width:auto;min-width:0;">
+            </div>
+          </div>
+          <div class="param-row" style="margin-top:14px;">
+            <button class="btn-save" id="zd-start-btn" style="margin-top:0;font-size:13px;padding:8px 22px;">${_t("开始一键部署")}</button>
+            <span id="zd-status" style="font-size:12px;color:var(--c-text-3);"></span>
+          </div>
+          <div id="zd-steps" style="display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 4px;"></div>
+          <pre id="zd-log" style="margin:8px 0 0;padding:10px 12px;background:var(--c-panel);border:1px solid var(--c-border);border-radius:6px;max-height:220px;overflow-y:auto;font-size:12px;font-family:monospace;color:var(--c-text-2);line-height:1.7;white-space:pre-wrap;word-break:break-all;">${_t("点击「开始一键部署」后在此显示运行日志")}</pre>
+        </div>
+
         <div class="param-group">
           <div class="param-group-title">${_t("总开关")}</div>
           <div class="param-row">
@@ -613,6 +641,152 @@ function showToast(message, isError) {
   toast.textContent = message;
   document.body.appendChild(toast);
   setTimeout(() => toast.remove(), 3000);
+}
+
+// ===== DGX-Spark 双机直连 · 一键从零部署 =====
+// 状态不落盘（密码仅内存）：切页回来时恢复步骤状态与日志展示
+const ZD_STEPS = ["免密 SSH 配置", "光口探测", "固定 IP 配置", "连通性检测", "Docker 检测安装", "Docker 组权限", "写回多机互联节点表"];
+let zdRunning = false;
+let zdStepStates = [];
+let zdLogText = "";
+
+function zdStepStatusHtml(i) {
+  const st = (zdStepStates[i] || {}).status || "idle";
+  const conf = {
+    idle: ["○", "var(--c-text-4)", ""],
+    active: ["●", "var(--c-accent)", "border-color:var(--c-accent);font-weight:600;"],
+    done: ["✓", "#4caf50", ""],
+    error: ["✗", "#f44336", "border-color:#f44336;color:#f44336;"]
+  }[st];
+  return '<span style="border:1px solid var(--c-border);border-radius:4px;padding:2px 8px;font-size:12px;color:' + conf[1] + ';' + conf[2] + '">' + conf[0] + " " + _t(ZD_STEPS[i]) + "</span>";
+}
+
+function renderZdSteps() {
+  const box = document.getElementById("zd-steps");
+  if (!box) return;
+  box.innerHTML = ZD_STEPS.map(function (_, i) { return zdStepStatusHtml(i); }).join("");
+}
+
+function zdLog(line) {
+  const el = document.getElementById("zd-log");
+  if (!el) return;
+  if (el.textContent === _t("点击「开始一键部署」后在此显示运行日志")) el.textContent = "";
+  zdLogText += line + "\n";
+  el.textContent = zdLogText;
+  el.scrollTop = el.scrollHeight;
+}
+
+function setZdRunning(run) {
+  zdRunning = run;
+  const btn = document.getElementById("zd-start-btn");
+  if (btn) {
+    btn.disabled = run;
+    btn.textContent = run ? _t("部署中...") : _t("开始一键部署");
+  }
+}
+
+async function startZdDeploy() {
+  if (zdRunning) return;
+  const val = function (id) {
+    const el = document.getElementById(id);
+    return el ? el.value.trim() : "";
+  };
+  const aUser = val("zd-a-user");
+  const aPass = document.getElementById("zd-a-pass") ? document.getElementById("zd-a-pass").value : "";
+  const bAddr = val("zd-b-addr");
+  const bUser = val("zd-b-user");
+  const bPass = document.getElementById("zd-b-pass") ? document.getElementById("zd-b-pass").value : "";
+  // B 对等节点固定 SSH 端口 22（默认，无需填写）
+  const bPort = 22;
+  if (!aUser || !aPass) { showToast(_t("请填写 A 控制机用户名和密码"), true); return; }
+  if (!bAddr || !bUser || !bPass) { showToast(_t("请填写 B 对等节点地址、用户名和密码"), true); return; }
+  setZdRunning(true);
+  const st = document.getElementById("zd-status");
+  if (st) st.textContent = "";
+  try {
+    await invoke()("dgx_deploy_run", {
+      bAddr: bAddr, bPort: bPort, bUser: bUser, bPass: bPass, aUser: aUser, aPass: aPass
+    });
+  } catch (e) {
+    // 失败细节已由 dgx-zero-deploy error 事件进入日志/步骤条；此处兜底弹提示
+    setZdRunning(false);
+    const msg = String((e && e.message) || e || "");
+    if (msg && msg.indexOf("DEPLOY_DONE") < 0) showToast(_t("部署失败：") + msg, true);
+  }
+}
+
+function zdInitForm() {
+  const aUserEl = document.getElementById("zd-a-user");
+  if (aUserEl && !aUserEl.value.trim()) {
+    invoke()("get_local_username").then(function (u) {
+      if (aUserEl && u && !aUserEl.value) aUserEl.value = String(u);
+    }).catch(function () {});
+  }
+  renderZdSteps();
+  const el = document.getElementById("zd-log");
+  if (el && zdLogText) { el.textContent = zdLogText; el.scrollTop = el.scrollHeight; }
+  if (zdRunning) setZdRunning(true);
+}
+
+function handleZdEvent(p) {
+  if (!p || typeof p.step !== "number") return;
+  const step = p.step;
+  const phase = p.phase;
+  const detail = String(p.detail || "");
+  if (step === 0) {
+    if (phase === "start") {
+      zdLogText = "";
+      zdStepStates = ZD_STEPS.map(function () { return { status: "idle" }; });
+      renderZdSteps();
+      const el = document.getElementById("zd-log");
+      if (el) el.textContent = "";
+      setZdRunning(true);
+      const st = document.getElementById("zd-status");
+      if (st) st.textContent = _t("部署中，请勿关闭窗口...");
+      zdLog(_t("==== 开始一键部署 ===="));
+    } else if (phase === "done") {
+      setZdRunning(false);
+      renderZdSteps();
+      const st = document.getElementById("zd-status");
+      if (st) st.textContent = _t("✔ 部署完成！多机互联节点表已就绪，可直接使用");
+      zdLog(_t("==== 全部完成 ===="));
+      refreshMnNodesFromSettings();
+    }
+    return;
+  }
+  if (step < 1 || step > 7) return;
+  const name = _t(ZD_STEPS[step - 1]);
+  if (phase === "start") {
+    zdStepStates[step - 1] = { status: "active" };
+    renderZdSteps();
+    zdLog("▶ " + name);
+  } else if (phase === "run") {
+    zdLog("  " + detail);
+  } else if (phase === "done") {
+    zdStepStates[step - 1] = { status: "done" };
+    renderZdSteps();
+    zdLog("✔ " + name + " 完成");
+  } else if (phase === "error") {
+    zdStepStates[step - 1] = { status: "error" };
+    renderZdSteps();
+    zdLog("✗ " + name + " 失败：" + detail);
+    zdLog("⤿ " + _t("已自动回滚，可修复问题后重新执行"));
+    setZdRunning(false);
+    const st = document.getElementById("zd-status");
+    if (st) st.textContent = _t("部署失败，已自动回滚（详见日志）");
+  } else if (phase === "rollback") {
+    zdLog("⤿ " + _t("回滚：") + detail);
+  } else if (phase === "rollback_done") {
+    zdLog("⤿ " + _t("回滚完成"));
+  }
+}
+
+async function refreshMnNodesFromSettings() {
+  // 部署成功后后端已写入 config.json（多机节点表），刷新上方节点表展示
+  try {
+    const settings = await invoke()("load_settings");
+    if (settings && settings.multi_node_args) await fillMultiNodeArgsForm(settings.multi_node_args);
+  } catch (_) {}
 }
 
 // ===== 多机互联（DGX Spark 集群）=====
@@ -824,6 +998,7 @@ function syncPhaseText(phase) {
 }
 
 function handleTauriEvent(type, payload) {
+  if (type === "dgx-zero-deploy") { handleZdEvent(payload); return; }
   if ((type !== "image-push-progress" && type !== "model-sync-progress") || !payload || payload.ip === undefined) return;
   const statusEl = type === "image-push-progress"
     ? document.getElementById("mn-push-img-status")
@@ -1400,6 +1575,10 @@ export default {
     if (mnSyncModelBtn) {
       mnSyncModelBtn.addEventListener("click", syncModelToRemote);
     }
+    // ===== DGX 双机直连一键部署：按钮 =====
+    var zdStartBtn = document.getElementById("zd-start-btn");
+    if (zdStartBtn) zdStartBtn.addEventListener("click", startZdDeploy);
+    zdInitForm();
     // 同步进行中切页回来：恢复按钮禁用与忙态文案
     if (mnImgSyncBusy) setMnBtnBusy(mnPushImgBtn, true, _t("镜像同步中..."));
     if (mnModelSyncBusy) setMnBtnBusy(mnSyncModelBtn, true, _t("模型同步中..."));

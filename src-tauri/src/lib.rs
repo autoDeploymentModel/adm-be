@@ -3,7 +3,7 @@ mod common;
 mod pages;
 
 use app_state::AppState;
-use pages::{index, model_list, settings, benchmark};
+use pages::{index, model_list, settings, benchmark, dgx_deploy};
 
 use tauri::Manager;
 use tauri::menu::{Menu, MenuItem};
@@ -186,6 +186,8 @@ pub fn run() {
             settings::sync_model_to_remote,
             settings::get_app_data_dir,
             settings::get_local_username,
+            // dgx_deploy.rs
+            dgx_deploy::dgx_deploy_run,
             // benchmark.rs
             benchmark::start_benchmark,
             benchmark::get_benchmark_status,

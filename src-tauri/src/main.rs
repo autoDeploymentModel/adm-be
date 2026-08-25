@@ -1,4 +1,5 @@
-#![windows_subsystem = "windows"]
+// test 构建保留控制台入口（否则 Windows 上 cargo test 链接失败：WinMain 未解析）
+#![cfg_attr(not(test), windows_subsystem = "windows")]
 
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
