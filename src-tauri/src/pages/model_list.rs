@@ -11,6 +11,45 @@ use std::collections::HashMap;
 use tauri::Emitter;
 use tauri::Manager;
 
+/// 下载实时速度跟踪器：0.5s 窗口内累计字节求平均，返回 bytes/s。
+/// 用 `Mutex<SpeedTracker>` 包装，可在 Fn 闭包内做可变状态且跨 await 保持 Send。
+#[derive(Clone, Copy)]
+struct SpeedTracker {
+    last_bytes: u64,
+    window_start: std::time::Instant,
+    window_bytes: u64,
+    speed: u64,
+}
+
+impl SpeedTracker {
+    /// `existing` = 续传前 .part 已有字节数，避免首窗把已有字节计入速度导致虚高
+    fn from_existing(existing: u64) -> Self {
+        Self {
+            last_bytes: existing,
+            window_start: std::time::Instant::now(),
+            window_bytes: 0,
+            speed: 0,
+        }
+    }
+    /// 每收到一次进度回调调用；窗口不满 0.5s 时返回上一次的 speed（避免单 chunk 抖动）
+    fn update(&mut self, downloaded: u64) -> u64 {
+        let now = std::time::Instant::now();
+        self.window_bytes += downloaded.saturating_sub(self.last_bytes);
+        self.last_bytes = downloaded;
+        let elapsed = now.duration_since(self.window_start).as_secs_f64();
+        if elapsed >= 0.5 {
+            self.speed = if elapsed > 0.0 {
+                (self.window_bytes as f64 / elapsed) as u64
+            } else {
+                0
+            };
+            self.window_start = now;
+            self.window_bytes = 0;
+        }
+        self.speed
+    }
+}
+
 // ===== Tauri Command =====
 
 #[tauri::command]
@@ -297,9 +336,16 @@ pub async fn download_model(
                 let fname = filename.clone();
                 let idx_f = idx;
                 let total_f = total;
+                // 实时下载速度（bytes/s），0.5s 窗口平滑
+                let part_existing = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
+                let speed_tracker = std::sync::Mutex::new(SpeedTracker::from_existing(part_existing));
                 download_with_resume(
                     &http.client, &url, &final_path, &part_path, http.mirror_policy,
-                    |progress, _downloaded, _total| {
+                    |progress, downloaded, _total| {
+                        let speed = {
+                            let mut st = speed_tracker.lock().unwrap_or_else(|e| e.into_inner());
+                            st.update(downloaded)
+                        };
                         // 总进度 = 已完成文件 + 当前文件进度折算
                         let overall = ((idx_f as f32 + progress as f32 / 100.0) * 100.0 / total_f as f32) as u8;
                         app_clone.emit(
@@ -307,6 +353,7 @@ pub async fn download_model(
                             serde_json::json!({
                                 "model_id": &mid,
                                 "progress": overall,
+                                "speed": speed,
                                 "file": &fname,
                                 "type": "model",
                             }),
@@ -370,14 +417,22 @@ pub async fn download_model(
     {
         let app_clone = app.clone();
         let mid = model_id.clone();
+        // 实时下载速度（bytes/s），0.5s 窗口平滑
+        let part_existing = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
+        let speed_tracker = std::sync::Mutex::new(SpeedTracker::from_existing(part_existing));
         download_with_resume(
             &http.client, &model_url, &final_path, &part_path, http.mirror_policy,
             |progress, downloaded, total| {
+                let speed = {
+                    let mut st = speed_tracker.lock().unwrap_or_else(|e| e.into_inner());
+                    st.update(downloaded)
+                };
                 app_clone.emit(
                     "download-progress",
                     serde_json::json!({
                         "model_id": &mid,
                         "progress": progress,
+                        "speed": speed,
                         "downloaded": downloaded,
                         "total": total,
                         "type": "model",

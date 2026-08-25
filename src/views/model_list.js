@@ -902,6 +902,18 @@ function updateProgressBar(modelId, progress) {
   if (bar) bar.style.width = progress + "%";
 }
 
+// 字节/秒 → 可读速度：>=1MB/s 显示 MB/s，否则显示 KB/s（如 100KB/s）
+function formatSpeed(bps) {
+  if (!bps || bps <= 0) return "";
+  const units = ["B/s", "KB/s", "MB/s", "GB/s"];
+  let v = bps;
+  let u = 0;
+  while (v >= 1024 && u < units.length - 1) { v /= 1024; u++; }
+  let s = v >= 100 ? v.toFixed(0) : v.toFixed(1);
+  if (s.endsWith(".0")) s = s.slice(0, -2);
+  return s + units[u];
+}
+
 function handleTauriEvent(type, payload) {
   // 状态已在 index.html 全局监听中更新，这里只做 DOM 更新
   const st = S();
@@ -911,7 +923,8 @@ function handleTauriEvent(type, payload) {
     case "download-progress": {
       const btn = document.querySelector('[data-model-id="' + model_id + '"]');
       if (btn) {
-        btn.textContent = progress + "%";
+        const speedText = payload && payload.speed ? " · " + formatSpeed(payload.speed) : "";
+        btn.textContent = progress + "%" + speedText;
       }
       updateProgressBar(model_id, progress);
       break;
