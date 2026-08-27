@@ -678,14 +678,17 @@ actionsHtml = '<button class="btn btn-view" id="view-' + safeModelId + '">' + _t
 
 function bindRowEvents() {
   const st = S();
-  const dlBtns = document.querySelectorAll('#model-grid .btn-download:not(.downloaded):not([disabled]):not(.btn-cancel-download)');
+  // 下载/继续下载/停止下载共用同一个按钮元素，按 class 分发：
+  // 非下载中 → handleDownload；下载中（含 handleDownload 内就地加的取消标记）→ handleCancelDownload
+  const dlBtns = document.querySelectorAll('#model-grid .btn-download:not(.downloaded):not([disabled])');
   dlBtns.forEach(function(btn) {
-    btn.addEventListener('click', function() { handleDownload(btn); });
-  });
-  // 下载中按钮 → 点击停止下载
-  const cancelBtns = document.querySelectorAll('#model-grid .btn-cancel-download');
-  cancelBtns.forEach(function(btn) {
-    btn.addEventListener('click', function() { handleCancelDownload(btn.dataset.cancelBtn); });
+    btn.addEventListener('click', function() {
+      if (btn.classList.contains("btn-cancel-download")) {
+        handleCancelDownload(btn.dataset.cancelBtn || btn.dataset.modelId);
+      } else {
+        handleDownload(btn);
+      }
+    });
   });
   const startBtns = document.querySelectorAll('#model-grid .btn-start[data-start-btn]');
   startBtns.forEach(function(btn) {
@@ -724,9 +727,8 @@ async function handleDownload(btn) {
     const hasPart = S().partFiles[modelId] && S().partFiles[modelId] > 0;
     btn.textContent = hasPart ? _t("继续下载中...") : "0%";
     btn.disabled = false;
+    // 标记为「可点击停止」：bindRowEvents 的委托处理器据此分发到 handleCancelDownload
     btn.classList.add("btn-cancel-download");
-    btn.dataset.cancelBtn = modelId;
-    btn.onclick = function() { handleCancelDownload(modelId); };
   }
 
   try {
@@ -735,13 +737,9 @@ async function handleDownload(btn) {
   } catch (e) {
     console.error("[model_list] 下载失败:", e);
     showToast(_t("下载失败: ") + e);
-    if (btn) {
-      btn.textContent = _t("下载");
-      btn.disabled = false;
-      btn.classList.remove("btn-cancel-download");
-      delete btn.dataset.cancelBtn;
-      btn.onclick = null;
-    }
+    // 后端失败时前端状态无事件重置：清下载中标记并整卡重渲染（按钮回到 下载/继续下载）
+    delete S().downloadingModels[modelId];
+    renderModelTable();
   }
 }
 
