@@ -2811,7 +2811,7 @@ pub async fn get_downloading_phases(state: tauri::State<'_, AppState>) -> Result
 }
 
 /// 停止指定模型的下载：置位取消标志后，下载循环感知到即停止（保留 .part 供续传）。
-/// 没有正在进行的下载时幂等返回（前端按钮只在下载中呈现，误点无害）。
+/// 没有正在进行的下载时返回错误（前端据此清除幽灵下载状态）。
 #[tauri::command]
 pub async fn cancel_download(app: tauri::AppHandle, model_id: String) -> Result<(), AppError> {
     let flag = app
@@ -2826,6 +2826,6 @@ pub async fn cancel_download(app: tauri::AppHandle, model_id: String) -> Result<
             flag.store(true, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         }
-        None => Ok(()),
+        None => Err(AppError::msg("没有正在进行的下载")),
     }
 }

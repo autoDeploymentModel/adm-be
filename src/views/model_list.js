@@ -736,21 +736,40 @@ async function handleDownload(btn) {
     console.log("[model_list] 下载模型 invoke 完成:", modelId);
   } catch (e) {
     console.error("[model_list] 下载失败:", e);
-    showToast(_t("下载失败: ") + e);
-    // 后端失败时前端状态无事件重置：清下载中标记并整卡重渲染（按钮回到 下载/继续下载）
-    delete S().downloadingModels[modelId];
-    renderModelTable();
+    var errMsg = String(e);
+    if (errMsg.indexOf("正在下载中") !== -1) {
+      // 双击竞态：后端仍在下载中，不能清状态（否则真实下载失去停止按钮）
+      showToast(errMsg);
+      renderModelTable();
+    } else {
+      showToast(_t("下载失败: ") + e);
+      delete S().downloadingModels[modelId];
+      renderModelTable();
+    }
   }
 }
 
 // 点击下载中按钮 → 停止下载（Rust 侧置取消标志，保留 .part 供续传；事件驱动 UI 刷新）
 async function handleCancelDownload(modelId) {
   console.log("[model_list] 停止下载模型:", modelId);
+  // 立即反馈：按钮变「停止中...」并禁点，避免重复触发
+  const btn = document.querySelector('#model-grid .btn-cancel-download[data-model-id="' + modelId + '"]');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = _t("停止中...");
+  }
   try {
     await invoke()("cancel_download", { modelId: modelId });
   } catch (e) {
     console.error("[model_list] 停止下载失败:", e);
-    showToast(_t("停止下载失败: ") + e);
+    // 后端无正在进行的下载 → 幽灵状态：清掉下载中标记并重渲染（按钮回到 下载/继续下载）
+    if (String(e).indexOf("没有正在进行的下载") !== -1) {
+      delete S().downloadingModels[modelId];
+      renderModelTable();
+    } else {
+      showToast(_t("停止下载失败: ") + e);
+      renderModelTable();
+    }
   }
 }
 

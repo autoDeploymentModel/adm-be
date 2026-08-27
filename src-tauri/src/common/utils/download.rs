@@ -177,13 +177,31 @@ async fn try_download_one(
     let mut downloaded: u64 = existing_size;
     let mut stream = response.bytes_stream();
 
-    while let Some(chunk_result) = stream.next().await {
-        // 用户取消了下载：立即停止（保留 .part 供续传）
-        if let Some(flag) = &cancel {
-            if flag.load(Ordering::Relaxed) {
-                return Err(cancelled_error());
+    // 取消轮询：网络停滞（长时间无数据块到达，reqwest 默认无读超时）时，
+    // 也能在 500ms 内感知取消标志并立即停止，避免点击后无响应。
+    let cancel_poll = async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if cancel.as_ref().map(|f| f.load(Ordering::Relaxed)).unwrap_or(false) {
+                break;
             }
         }
+    };
+    tokio::pin!(cancel_poll);
+    let has_cancel = cancel.is_some();
+
+    loop {
+        let next = if has_cancel {
+            tokio::select! {
+                n = stream.next() => n,
+                _ = &mut cancel_poll => {
+                    return Err(cancelled_error());
+                }
+            }
+        } else {
+            stream.next().await
+        };
+        let Some(chunk_result) = next else { break };
         let chunk = chunk_result.map_err(|e| AppError::msg(format!("下载数据读取失败: {}", e)))?;
         file.write_all(&chunk)
             .await
