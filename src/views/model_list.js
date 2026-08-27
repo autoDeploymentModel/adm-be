@@ -217,6 +217,15 @@ const template = `
     cursor: default;
   }
 
+  /* 下载中按钮可点击 = 停止下载 */
+  .btn-cancel-download {
+    background: #e53935;
+  }
+
+  .btn-cancel-download:hover:not(:disabled) {
+    background: #c62828;
+  }
+
   .btn-start {
     background: #1e88e5;
     color: #fff;
@@ -612,7 +621,7 @@ function renderModelTable() {
     if (downloaded) {
       downloadBtnHtml = '';
     } else if (downloadingProgress !== undefined) {
-      downloadBtnHtml = '<button class="btn btn-download" data-model-id="' + safeModelId + '" disabled>' + downloadingProgress + '%</button>';
+      downloadBtnHtml = '<button class="btn btn-download btn-cancel-download" data-model-id="' + safeModelId + '" data-cancel-btn="' + safeModelId + '" id="dl-' + safeModelId + '">' + _t("停止下载") + ' ' + downloadingProgress + '%</button>';
     } else if (partSize && partSize > 0) {
       downloadBtnHtml = '<button class="btn btn-download" data-model-id="' + safeModelId + '" data-model-url="' + escapeHtml(model.model_url) + '"' + modelFilesAttr + modelImageAttr + ' id="dl-' + safeModelId + '">' + _t("继续下载") + '</button>';
     } else if (available) {
@@ -669,9 +678,14 @@ actionsHtml = '<button class="btn btn-view" id="view-' + safeModelId + '">' + _t
 
 function bindRowEvents() {
   const st = S();
-  const dlBtns = document.querySelectorAll('#model-grid .btn-download:not(.downloaded):not([disabled])');
+  const dlBtns = document.querySelectorAll('#model-grid .btn-download:not(.downloaded):not([disabled]):not(.btn-cancel-download)');
   dlBtns.forEach(function(btn) {
     btn.addEventListener('click', function() { handleDownload(btn); });
+  });
+  // 下载中按钮 → 点击停止下载
+  const cancelBtns = document.querySelectorAll('#model-grid .btn-cancel-download');
+  cancelBtns.forEach(function(btn) {
+    btn.addEventListener('click', function() { handleCancelDownload(btn.dataset.cancelBtn); });
   });
   const startBtns = document.querySelectorAll('#model-grid .btn-start[data-start-btn]');
   startBtns.forEach(function(btn) {
@@ -722,6 +736,17 @@ async function handleDownload(btn) {
       btn.textContent = _t("下载");
       btn.disabled = false;
     }
+  }
+}
+
+// 点击下载中按钮 → 停止下载（Rust 侧置取消标志，保留 .part 供续传；事件驱动 UI 刷新）
+async function handleCancelDownload(modelId) {
+  console.log("[model_list] 停止下载模型:", modelId);
+  try {
+    await invoke()("cancel_download", { modelId: modelId });
+  } catch (e) {
+    console.error("[model_list] 停止下载失败:", e);
+    showToast(_t("停止下载失败: ") + e);
   }
 }
 
@@ -914,7 +939,7 @@ function formatSpeed(bps) {
   return s + units[u];
 }
 
-function handleTauriEvent(type, payload) {
+async function handleTauriEvent(type, payload) {
   // 状态已在 index.html 全局监听中更新，这里只做 DOM 更新
   const st = S();
   const { model_id, progress, error, port } = payload || {};
@@ -922,11 +947,22 @@ function handleTauriEvent(type, payload) {
   switch (type) {
     case "download-progress": {
       const btn = document.querySelector('[data-model-id="' + model_id + '"]');
-      if (btn) {
+      if (btn && btn.classList.contains("btn-cancel-download")) {
         const speedText = payload && payload.speed ? " · " + formatSpeed(payload.speed) : "";
-        btn.textContent = progress + "%" + speedText;
+        btn.textContent = _t("停止下载") + " " + progress + "%" + speedText;
       }
       updateProgressBar(model_id, progress);
+      break;
+    }
+    case "download-cancelled": {
+      // 重新扫描 .part 大小 → 按钮显示「继续下载」，保留断点
+      try {
+        const parts = await invoke()("scan_part_files");
+        st.partFiles = {};
+        for (const p of parts) st.partFiles[p.model_id] = p.existing_size;
+      } catch (_) {}
+      renderModelTable();
+      showToast(_t("已停止下载"));
       break;
     }
     case "download-complete": {

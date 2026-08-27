@@ -1,4 +1,6 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use futures_util::StreamExt;
 use crate::common::error::AppError;
@@ -18,6 +20,16 @@ pub enum MirrorPolicy {
     Direct,
 }
 
+/// 下载被用户取消时返回的错误（用于上层识别并做清理/提示）。
+pub fn cancelled_error() -> AppError {
+    AppError::Cancelled("下载已取消".to_string())
+}
+
+/// 判断错误是否为「用户主动取消下载」。
+pub fn is_cancelled(err: &AppError) -> bool {
+    matches!(err, AppError::Cancelled(_))
+}
+
 /// 带断点续传的通用文件下载函数。
 ///
 /// - 如果 `final_path` 已存在，跳过下载（文件已完成）。
@@ -28,17 +40,20 @@ pub enum MirrorPolicy {
 /// `hf-mirror.com`（国内加速），连接失败（DNS/连接/TLS）时回退到原始 `huggingface.co`；
 /// `MirrorPolicy::Direct`（设置页「代理」开启）时直接用源链接，不做镜像替换。
 /// 回退时若有未完成的 `.part` 会先删除（不同源字节布局不同，避免续传错位）。
-///
 /// `on_progress` 回调在下载过程中被调用，参数为 `(progress, downloaded, total_size)`：
 /// - `progress`: 0-99 的百分比
 /// - `downloaded`: 已下载字节数（含续传已有部分）
 /// - `total_size`: 文件总大小（未知时为 0）
+///
+/// `cancel`: 传入取消标志后，每个数据块写入前都会检查；置为 true 时立即停止
+/// 下载并返回 `cancelled_error()`（保留 `.part` 文件供下次续传）。
 pub async fn download_with_resume(
     client: &reqwest::Client,
     url: &str,
     final_path: &Path,
     part_path: &Path,
     policy: MirrorPolicy,
+    cancel: Option<Arc<AtomicBool>>,
     on_progress: impl Fn(u8, u64, u64),
 ) -> Result<(), AppError> {
     // 镜像优先（国内加速），回退到原 URL；Direct（开启代理）时只用源链接。
@@ -63,8 +78,9 @@ pub async fn download_with_resume(
         if idx > 0 && part_path.exists() {
             let _ = std::fs::remove_file(part_path);
         }
-        match try_download_one(client, candidate, final_path, part_path, &on_progress).await {
+        match try_download_one(client, candidate, final_path, part_path, cancel.clone(), &on_progress).await {
             Ok(()) => return Ok(()),
+            Err(e) if is_cancelled(&e) => return Err(e),
             Err(e) if is_network_error(&e) && idx + 1 < candidates.len() => {
                 crate::common::utils::logger::write_log(
                     "WARN",
@@ -86,6 +102,7 @@ async fn try_download_one(
     url: &str,
     final_path: &Path,
     part_path: &Path,
+    cancel: Option<Arc<AtomicBool>>,
     on_progress: &impl Fn(u8, u64, u64),
 ) -> Result<(), AppError> {
     // 文件已存在，跳过下载
@@ -161,6 +178,12 @@ async fn try_download_one(
     let mut stream = response.bytes_stream();
 
     while let Some(chunk_result) = stream.next().await {
+        // 用户取消了下载：立即停止（保留 .part 供续传）
+        if let Some(flag) = &cancel {
+            if flag.load(Ordering::Relaxed) {
+                return Err(cancelled_error());
+            }
+        }
         let chunk = chunk_result.map_err(|e| AppError::msg(format!("下载数据读取失败: {}", e)))?;
         file.write_all(&chunk)
             .await

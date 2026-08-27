@@ -258,6 +258,16 @@ pub async fn download_model(
         }
     }
 
+    // 取消标志：前端 cancel_download 置位后，下载循环感知到即停止（保留 .part 续传）
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    app.state::<AppState>()
+        .download_cancel
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(model_id.clone(), cancel_flag.clone());
+
     let data_dir = config::get_data_dir(Some(&app))?;
     let model_dir = data_dir.join("models").join(&model_id);
     std::fs::create_dir_all(&model_dir).map_err(|e| format!("创建模型目录失败: {}", e))?;
@@ -279,6 +289,9 @@ pub async fn download_model(
                         map.remove(&self.id);
                     }
                     if let Ok(mut map) = self.h.state::<AppState>().downloading_phase.lock() {
+                        map.remove(&self.id);
+                    }
+                    if let Ok(mut map) = self.h.state::<AppState>().download_cancel.lock() {
                         map.remove(&self.id);
                     }
                 }
@@ -339,8 +352,8 @@ pub async fn download_model(
                 // 实时下载速度（bytes/s），0.5s 窗口平滑
                 let part_existing = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
                 let speed_tracker = std::sync::Mutex::new(SpeedTracker::from_existing(part_existing));
-                download_with_resume(
-                    &http.client, &url, &final_path, &part_path, http.mirror_policy,
+                match download_with_resume(
+                    &http.client, &url, &final_path, &part_path, http.mirror_policy, Some(cancel_flag.clone()),
                     |progress, downloaded, _total| {
                         let speed = {
                             let mut st = speed_tracker.lock().unwrap_or_else(|e| e.into_inner());
@@ -362,7 +375,17 @@ pub async fn download_model(
                             map.insert(mid.clone(), overall);
                         }
                     },
-                ).await?;
+                ).await {
+                    Ok(()) => {}
+                    Err(e) if crate::common::utils::download::is_cancelled(&e) => {
+                        app.emit(
+                            "download-cancelled",
+                            serde_json::json!({ "model_id": &model_id, "type": "model" }),
+                        ).ok();
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e),
+                }
                 // 单个文件完成不单独发 download-complete（前端收到会清空 downloading
                 // 状态导致按钮闪变），进度折算继续由 download-progress 驱动，
                 // 全部完成时集中发一次带 all=true 的完成事件。
@@ -409,6 +432,9 @@ pub async fn download_model(
             if let Ok(mut map) = self.h.state::<AppState>().downloading_phase.lock() {
                 map.remove(&self.id);
             }
+            if let Ok(mut map) = self.h.state::<AppState>().download_cancel.lock() {
+                map.remove(&self.id);
+            }
         }
     }
     let _guard = CleanupGuard { h: app.clone(), id: model_id.clone() };
@@ -420,8 +446,8 @@ pub async fn download_model(
         // 实时下载速度（bytes/s），0.5s 窗口平滑
         let part_existing = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
         let speed_tracker = std::sync::Mutex::new(SpeedTracker::from_existing(part_existing));
-        download_with_resume(
-            &http.client, &model_url, &final_path, &part_path, http.mirror_policy,
+        match download_with_resume(
+            &http.client, &model_url, &final_path, &part_path, http.mirror_policy, Some(cancel_flag.clone()),
             |progress, downloaded, total| {
                 let speed = {
                     let mut st = speed_tracker.lock().unwrap_or_else(|e| e.into_inner());
@@ -442,7 +468,17 @@ pub async fn download_model(
                     map.insert(mid.clone(), progress);
                 }
             },
-        ).await?;
+        ).await {
+            Ok(()) => {}
+            Err(e) if crate::common::utils::download::is_cancelled(&e) => {
+                app.emit(
+                    "download-cancelled",
+                    serde_json::json!({ "model_id": &model_id, "type": "model" }),
+                ).ok();
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
         app.emit(
             "download-complete",
             serde_json::json!({ "model_id": &model_id, "type": "model" }),
@@ -2772,4 +2808,24 @@ pub async fn get_downloading_models(state: tauri::State<'_, AppState>) -> Result
 pub async fn get_downloading_phases(state: tauri::State<'_, AppState>) -> Result<HashMap<String, String>, AppError> {
     let map = state.downloading_phase.lock().map_err(|e| e.to_string())?;
     Ok(map.clone())
+}
+
+/// 停止指定模型的下载：置位取消标志后，下载循环感知到即停止（保留 .part 供续传）。
+/// 没有正在进行的下载时幂等返回（前端按钮只在下载中呈现，误点无害）。
+#[tauri::command]
+pub async fn cancel_download(app: tauri::AppHandle, model_id: String) -> Result<(), AppError> {
+    let flag = app
+        .state::<AppState>()
+        .download_cancel
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&model_id)
+        .cloned();
+    match flag {
+        Some(flag) => {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+        None => Ok(()),
+    }
 }

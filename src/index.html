@@ -624,7 +624,7 @@
     st.downloadingModels = st.downloadingModels || {};
 
     if (typeof listen === "function") {
-      var globalEvents = ["download-progress", "download-complete", "download-error", "model-pull-progress", "model-started", "model-stopped", "model-error", "image-push-progress", "model-sync-progress", "dgx-zero-deploy"];
+      var globalEvents = ["download-progress", "download-complete", "download-cancelled", "download-error", "model-pull-progress", "model-started", "model-stopped", "model-error", "image-push-progress", "model-sync-progress", "dgx-zero-deploy"];
       globalEvents.forEach(function(ev) {
         listen(ev, function(event) {
           var p = event.payload || {};
@@ -647,6 +647,10 @@
                 }
               }
               delete st.partFiles[mid];
+              break;
+            }
+            case "download-cancelled": {
+              delete st.downloadingModels[mid];
               break;
             }
             case "download-error": {

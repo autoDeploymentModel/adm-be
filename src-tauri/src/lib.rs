@@ -166,6 +166,7 @@ pub fn run() {
             model_list::delete_local_model,
             model_list::get_downloading_models,
             model_list::get_downloading_phases,
+            model_list::cancel_download,
             // settings.rs
             settings::save_settings,
             settings::load_settings,

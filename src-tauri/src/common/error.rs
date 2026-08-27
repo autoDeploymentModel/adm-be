@@ -21,6 +21,8 @@ pub enum AppError {
     InvalidInput(String),
     /// 其他未分类错误
     Other(String),
+    /// 下载被用户主动取消
+    Cancelled(String),
 }
 
 impl AppError {
@@ -40,6 +42,7 @@ impl std::fmt::Display for AppError {
             AppError::NotFound(msg) => write!(f, "未找到: {}", msg),
             AppError::InvalidInput(msg) => write!(f, "参数错误: {}", msg),
             AppError::Other(msg) => write!(f, "{}", msg),
+            AppError::Cancelled(msg) => write!(f, "{}", msg),
         }
     }
 }

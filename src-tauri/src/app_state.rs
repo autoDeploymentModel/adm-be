@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 use sysinfo::System;
 
 pub struct AppState {
@@ -10,6 +11,8 @@ pub struct AppState {
     pub running_container: Mutex<Option<String>>,
     pub downloading_progress: Mutex<HashMap<String, u8>>,
     pub downloading_phase: Mutex<HashMap<String, String>>,
+    /// 下载取消标志：model_id → AtomicBool（置 true 后当前下载立即停止，保留 .part 续传）
+    pub download_cancel: Mutex<HashMap<String, Arc<AtomicBool>>>,
     pub sys: Mutex<System>,
     /// config.json 读-改-写 互斥锁（防止前端操作并发写 config.json 互相覆盖）
     pub config_write_lock: std::sync::Mutex<()>,
@@ -29,6 +32,7 @@ impl AppState {
             running_container: Mutex::new(None),
             downloading_progress: Mutex::new(HashMap::new()),
             downloading_phase: Mutex::new(HashMap::new()),
+            download_cancel: Mutex::new(HashMap::new()),
             sys: Mutex::new(System::new_all()),
             config_write_lock: std::sync::Mutex::new(()),
             model_running: Mutex::new(false),
