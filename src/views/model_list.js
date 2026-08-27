@@ -723,7 +723,10 @@ async function handleDownload(btn) {
   if (btn) {
     const hasPart = S().partFiles[modelId] && S().partFiles[modelId] > 0;
     btn.textContent = hasPart ? _t("继续下载中...") : "0%";
-    btn.disabled = true;
+    btn.disabled = false;
+    btn.classList.add("btn-cancel-download");
+    btn.dataset.cancelBtn = modelId;
+    btn.onclick = function() { handleCancelDownload(modelId); };
   }
 
   try {
@@ -735,6 +738,9 @@ async function handleDownload(btn) {
     if (btn) {
       btn.textContent = _t("下载");
       btn.disabled = false;
+      btn.classList.remove("btn-cancel-download");
+      delete btn.dataset.cancelBtn;
+      btn.onclick = null;
     }
   }
 }
