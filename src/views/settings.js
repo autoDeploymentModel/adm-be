@@ -1,5 +1,14 @@
 // @ts-nocheck -- 历史视图暂未类型化（jsconfig checkJs 全局开启，新代码请勿加此标记）
 import { t as _t, setLanguage, getLanguage } from "../i18n.js";
+
+// 默认国内镜像加速器（无已有配置时填入，同时也作为输入框 placeholder 的单一来源）
+const DEFAULT_DOCKER_MIRRORS = [
+  "https://docker.nju.edu.cn",
+  "https://docker.m.daocloud.io",
+  "https://docker.1ms.run",
+  "https://docker.1panel.live",
+];
+
 const template = `
 <style>
   /* 样式隔离约定：选择器限定在本视图容器内（id/class 带 settings- 前缀），
@@ -415,7 +424,7 @@ const template = `
           <div class="param-row" style="align-items:flex-start;">
             <div class="param-label">${_t("加速器地址")}<div class="param-key">registry-mirrors</div></div>
             <div class="param-input" style="max-width:480px;">
-              <textarea id="mirror-list" rows="4" style="width:100%;resize:vertical;background:var(--c-panel-2);border:1px solid var(--c-border);border-radius:6px;color:var(--c-text);font-size:13px;padding:8px 12px;font-family:monospace;outline:none;" placeholder="https://docker.1ms.run&#10;https://docker.m.daocloud.io"></textarea>
+              <textarea id="mirror-list" rows="4" style="width:100%;resize:vertical;background:var(--c-panel-2);border:1px solid var(--c-border);border-radius:6px;color:var(--c-text);font-size:13px;padding:8px 12px;font-family:monospace;outline:none;" placeholder="${DEFAULT_DOCKER_MIRRORS.join("&#10;")}"></textarea>
               <div class="param-desc">${_t("每行一个加速器地址，留空表示直连 Docker Hub")}</div>
             </div>
           </div>
@@ -1360,7 +1369,7 @@ async function loadDockerMirrorConfig() {
     const pathEl = document.getElementById("mirror-daemon-path");
     if (pathEl) pathEl.textContent = cfg.daemonPath + (cfg.exists ? "" : _t("（不存在，保存时将新建）"));
     const ta = document.getElementById("mirror-list");
-    if (ta) ta.value = (cfg.mirrors || []).join("\n");
+    if (ta) ta.value = (cfg.mirrors && cfg.mirrors.length ? cfg.mirrors : DEFAULT_DOCKER_MIRRORS).join("\n");
     if (statusEl) statusEl.textContent = "";
   } catch (e) {
     if (statusEl) statusEl.textContent = _t("读取失败: ") + e;

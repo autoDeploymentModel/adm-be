@@ -1012,6 +1012,9 @@ async function handleTauriEvent(type, payload) {
         const prev = parseInt(startBtn.dataset.pullPct || "-1", 10);
         if (prev >= 0 && progress < prev) {
           startBtn.textContent = _t("切换镜像源重试中...");
+        } else if (progress >= 99 && progress < 100) {
+          // 最后一层下载完后的 digest 校验/解压阶段无进度输出，给出说明避免误认为卡死
+          startBtn.textContent = _t("拉取镜像 ") + progress + "%" + _t("（校验/解压中...）");
         } else {
           startBtn.textContent = _t("拉取镜像 ") + progress + "%";
         }

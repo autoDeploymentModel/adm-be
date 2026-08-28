@@ -406,6 +406,12 @@ pub async fn download_model(
                 "download-complete",
                 serde_json::json!({ "model_id": &model_id, "type": "model", "all": true }),
             ).ok();
+            // 镜像拉取阶段记入 downloading_phase（CleanupGuard2 函数返回时清理）：
+            // start_model 据此拒绝并发启动，避免「已下载后点击启动」与下载阶段的后台
+            // 拉镜并发执行 docker pull（同一镜像双 pull）。
+            if let Ok(mut map) = app.state::<AppState>().downloading_phase.lock() {
+                map.insert(model_id.clone(), "<pull-image>".to_string());
+            }
             // ===== 镜像策略：远程 model.json 的 vllm_image 字段唯一指定 =====
             // 镜像名必须由后端重新拉取远程清单解析（与启动流程一致），不能依赖前端
             // 卡片透传——远程配置更新后旧卡片透传值为空，会导致镜像被静默跳过，
@@ -481,7 +487,17 @@ async fn pull_image_if_configured(app: &tauri::AppHandle, model_id: &str, image:
         None => return,
     };
     match pull_docker_image(app, model_id, &image).await {
-        Ok(_) => {}
+        Ok(real_image) => {
+            crate::common::utils::logger::write_log("INFO", "DOCKER", &format!("[{}] 镜像拉取完成: {}", model_id, real_image));
+            let _ = app.emit(
+                "model-log",
+                serde_json::json!({
+                    "model_id": model_id,
+                    "line": format!("[Docker] 镜像 {} 拉取完成，已就绪", real_image),
+                    "source": "stdout",
+                }),
+            );
+        }
         Err(e) => {
             let msg = format!("镜像 {} 拉取失败（启动前需补拉）：{}", image, e);
             crate::common::utils::logger::write_log("ERROR", "DOCKER", &format!("[{}] {}", model_id, msg));
@@ -542,6 +558,14 @@ async fn pull_docker_image(
             }),
         )
         .ok();
+        return Ok(image.to_string());
+    }
+
+    // 镜像可能已拉取但以 <none>:<none>（untagged）落盘：先尝试直接修正 tag，
+    // 免去重复拉取（镜像加速器 digest 不一致场景下重新 pull 也仍会 untagged）。
+    // ensure_image_tag 内部带 RepoDigests 归属校验，只对与目标 repo 一致的
+    // untagged 镜像打 tag，不会误伤无关的历史 dangling 镜像。
+    if ensure_image_tag(app, model_id, image, None).await.is_ok() {
         return Ok(image.to_string());
     }
 
@@ -710,6 +734,9 @@ async fn pull_image(
     let layer_order: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
     // 已上报的最高进度：docker 并行下载层完成可能乱序，防止进度条回退
     let last_pct = Arc::new(AtomicU8::new(0));
+    // pull 输出的 manifest digest（`Digest: sha256:...` 行）：成功后用于把
+    // untagged 镜像精确 tag 回原名（比按创建时间找 dangling 更可靠）
+    let pull_digest: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     let emit_progress = |p: u8| {
         app.emit(
@@ -741,6 +768,7 @@ async fn pull_image(
         let order2 = layer_order.clone();
         let lp2 = last_pct.clone();
         let act = last_activity.clone();
+        let dig2 = pull_digest.clone();
         tokio::spawn(async move {
             while let Ok(Some(line)) = reader.next_line().await {
                 let trimmed = line.trim();
@@ -751,6 +779,14 @@ async fn pull_image(
                         .emit("model-log", serde_json::json!({
                             "model_id": &mid2, "line": format!("[docker pull] {}", trimmed), "source": "stdout",
                         })).ok();
+
+                    // 捕获 manifest digest（如 `Digest: sha256:abcd...`），供随后 tag 修正
+                    if let Some(d) = trimmed.strip_prefix("Digest:") {
+                        let d = d.trim().to_string();
+                        if d.starts_with("sha256:") && d.len() > "sha256:".len() {
+                            *dig2.lock().unwrap_or_else(|e| e.into_inner()) = Some(d);
+                        }
+                    }
 
                     // "<sha>: <状态>" 形式行；sha 为空（纯文本行）则跳过进度统计
                     let (sha, rest) = match trimmed.split_once(':') {
@@ -771,7 +807,7 @@ async fn pull_image(
                         let done = done2.fetch_add(1, Ordering::Relaxed) + 1;
                         let total = total2.load(Ordering::Relaxed);
                         if total > 0 {
-                            let pct = ((done as f64 / total as f64) * 99.0) as u8;
+                            let pct = ((done as f64 / total as f64) * 100.0) as u8;
                             let prev = lp2.fetch_max(pct, Ordering::Relaxed);
                             if pct > prev {
                                 app_c2.emit("model-pull-progress", serde_json::json!({
@@ -788,11 +824,11 @@ async fn pull_image(
                                 let total = total2.load(Ordering::Relaxed);
                                 let idx = order2.lock().unwrap_or_else(|e| e.into_inner()).get(&sha).copied().unwrap_or(0);
                                 if total > 0 && idx < total {
-                                    let pct = (((idx as f64) + (p as f64 / 100.0)) / (total as f64) * 99.0) as u8;
-                                    let prev = lp2.fetch_max(pct.min(99), Ordering::Relaxed);
+                                    let pct = (((idx as f64) + (p as f64 / 100.0)) / (total as f64) * 100.0) as u8;
+                                    let prev = lp2.fetch_max(pct.min(100), Ordering::Relaxed);
                                     if pct > prev {
                                         app_c2.emit("model-pull-progress", serde_json::json!({
-                                            "model_id": &mid2, "image": "", "progress": pct.min(99),
+                                            "model_id": &mid2, "image": "", "progress": pct.min(100),
                                         })).ok();
                                     }
                                 }
@@ -832,6 +868,14 @@ async fn pull_image(
             let status = status.map_err(|e| AppError::msg(format!("docker pull 等待失败: {}", e)))?;
             let ok = status.success();
             emit_progress(if ok { 100 } else { 0 });
+            if ok {
+                // 镜像加速源/registry 交互可能导致镜像以 <none>:<none>（untagged）
+                // 形式落盘——tag 丢失后 docker image inspect <image> 永远失败，
+                // 会造成每次启动都误判「镜像缺失」重新拉取。这里兜底把 tag 修正
+                // 为与 vllm_image 一致的名称，保证后续 inspect / docker run 可用。
+                let digest = pull_digest.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                ensure_image_tag(app, model_id, image, digest.as_deref()).await?;
+            }
             Ok(ok)
         }
         _ = async {
@@ -852,6 +896,139 @@ async fn pull_image(
                 timeout.as_secs() / 60
             )))
         }
+    }
+}
+
+/// pull 成功后校验镜像 tag：`docker image inspect <image>` 失败（镜像以
+/// `<none>:<none>` untagged 形式落盘）时依次尝试：
+/// 1. 用 pull 输出捕获的 manifest digest 精确 tag（`docker tag <repo>@sha256:<hex> <image>`）；
+/// 2. 从 dangling 镜像中按创建时间取最新、且 RepoDigests 归属与目标 repo 一致的
+///    重新 `docker tag`（校验归属，避免把无关历史 dangling 镜像误打 tag）；
+/// 修正后再 inspect 确认。
+async fn ensure_image_tag(
+    app: &tauri::AppHandle,
+    model_id: &str,
+    image: &str,
+    digest: Option<&str>,
+) -> Result<(), AppError> {
+    let log = |line: String| {
+        crate::common::utils::logger::write_log("INFO", "DOCKER", &line);
+        app.emit(
+            "model-log",
+            serde_json::json!({
+                "model_id": model_id,
+                "line": line,
+                "source": "stdout",
+            }),
+        )
+        .ok();
+    };
+
+    // 1. tag 已就位（正常场景）→ 直接返回
+    if docker_image_exists(app, model_id, image).await? {
+        return Ok(());
+    }
+
+    // 2. 精确修正：pull 输出的 manifest digest（剥离 tag 用 <repo>@sha256:<hex> 引用）
+    if let Some(d) = digest {
+        let repo = split_image_repo_tag(image).0;
+        let dig_ref = format!("{}@{}", repo, d);
+        let tag = crate::common::utils::platform::docker_cmd_tokio()
+            .args(["tag", &dig_ref, image])
+            .output()
+            .await;
+        if let Ok(out) = tag {
+            if out.status.success() {
+                if docker_image_exists(app, model_id, image).await? {
+                    log(format!("[Docker] 镜像 {} 拉取后为 untagged，已按 digest 修正 tag", image));
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // 3. 兜底：dangling（untagged）中创建时间最新、RepoDigests 归属匹配的镜像
+    let out = crate::common::utils::platform::docker_cmd_tokio()
+        .args(["images", "--filter", "dangling=true", "--format", "{{.CreatedAt}}|{{.ID}}"])
+        .output()
+        .await
+        .map_err(|e| AppError::msg(format!("docker images 执行失败: {}", e)))?;
+    if !out.status.success() {
+        return Err(AppError::msg(format!(
+            "镜像 {} 拉取完成但 tag 校验失败（docker images 查询失败: {}）",
+            image,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let mut best: Option<(String, String)> = None;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some((ts, id)) = line.split_once('|') {
+            let ts = ts.trim().to_string();
+            let id = id.trim().to_string();
+            if best.as_ref().map_or(true, |(t, _)| ts > *t) {
+                best = Some((ts, id));
+            }
+        }
+    }
+    let (_, id) = best.ok_or_else(|| {
+        AppError::msg(format!(
+            "镜像 {} 拉取后未在本地找到镜像（含 untagged 兜底），请手动执行 docker pull {}",
+            image, image
+        ))
+    })?;
+
+    // 归属校验：untagged 镜像的 RepoDigests 必须包含目标 repo（如 `ghcr.io/xxx/yyy@sha256:`），
+    // 否则是无关的历史 dangling 镜像，拒绝打 tag（宁缺毋滥）。
+    let repo = split_image_repo_tag(image).0;
+    let inspect = crate::common::utils::platform::docker_cmd_tokio()
+        .args(["image", "inspect", "--format", "{{.RepoDigests}}", &id])
+        .output()
+        .await
+        .map_err(|e| AppError::msg(format!("docker image inspect 执行失败: {}", e)))?;
+    if !inspect.status.success() {
+        return Err(AppError::msg(format!(
+            "镜像 {} 拉取后 tag 校验失败（无法检查 dangling 镜像 {} 归属）",
+            image, id
+        )));
+    }
+    let repo_digests = String::from_utf8_lossy(&inspect.stdout);
+    if !repo_digests.contains(&format!("{}@sha256:", repo)) {
+        return Err(AppError::msg(format!(
+            "镜像 {} 拉取后 tag 校验失败：本地最新 dangling 镜像 {} 不属于 {}（请手动 docker pull {} 或将 docker rmi 清理无关镜像后重试）",
+            image, id, repo, image
+        )));
+    }
+
+    let tag = crate::common::utils::platform::docker_cmd_tokio()
+        .args(["tag", &id, image])
+        .output()
+        .await
+        .map_err(|e| AppError::msg(format!("docker tag 执行失败: {}", e)))?;
+    if !tag.status.success() {
+        return Err(AppError::msg(format!(
+            "镜像 {} untagged 兜底失败（docker tag {} {}: {}）",
+            image,
+            id,
+            image,
+            String::from_utf8_lossy(&tag.stderr).trim()
+        )));
+    }
+    // 3. 最终确认
+    if docker_image_exists(app, model_id, image).await? {
+        log(format!("[Docker] 镜像 {} 拉取后为 untagged，已从 {} 修正 tag 为 {}", image, id, image));
+        return Ok(());
+    }
+    Err(AppError::msg(format!(
+        "镜像 {} 拉取后 tag 校验仍未通过，请手动执行 docker pull {}",
+        image, image
+    )))
+}
+
+/// 拆分镜像名：`<repo>` 与可选 `<tag>`（冒号右侧不含 `/` 才视为 tag，兼容带端口 registry）。
+fn split_image_repo_tag(image: &str) -> (&str, Option<&str>) {
+    match image.rsplit_once(':') {
+        Some((repo, tag)) if !tag.contains('/') => (repo, Some(tag)),
+        _ => (image, None),
     }
 }
 
@@ -2594,6 +2771,14 @@ async fn start_model_inner(
         let pid_lock = state.running_process.lock().map_err(|e| e.to_string())?;
         if pid_lock.is_some() {
             bail!("已有模型在运行中，请先停止当前模型");
+        }
+    }
+    // 下载/镜像拉取进行中禁止启动：下载阶段「已下载」后后台仍在拉镜像，
+    // 此时点击启动会与后台拉镜像并发执行 docker pull（同一镜像双 pull）。
+    {
+        let phases = state.downloading_phase.lock().map_err(|e| e.to_string())?;
+        if phases.contains_key(model_id) {
+            bail!("模型 {} 正在下载或拉取镜像，请稍候再试（完成后按钮自动可点）", model_id);
         }
     }
 

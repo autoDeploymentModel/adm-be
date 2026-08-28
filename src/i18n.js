@@ -270,6 +270,7 @@ const EN = {
   "适配机型": "Device",
   "全部机型": "All devices",
   "拉取镜像 ": "Pulling image ",
+  "（校验/解压中...）": " (verifying/extracting...)",
   "切换镜像源重试中...": "Retrying with next mirror...",
   "启动中": "Starting",
   "推理引擎": "Inference Engine",
