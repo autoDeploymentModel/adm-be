@@ -84,7 +84,8 @@ pub async fn scan_local_models(app: tauri::AppHandle) -> Result<Vec<LocalModel>,
                     }
                 }
                 if !files.is_empty() {
-                    models.push(LocalModel { model_id: dir_str, files });
+                    let has_done = path.join(".done").exists();
+                    models.push(LocalModel { model_id: dir_str, files, has_done });
                 }
             }
         } else if path.is_file() {
@@ -93,7 +94,7 @@ pub async fn scan_local_models(app: tauri::AppHandle) -> Result<Vec<LocalModel>,
                     if let Some(stem) = path.file_stem() {
                         let model_id = stem.to_string_lossy().to_string();
                         let filename = path.file_name().unwrap().to_string_lossy().to_string();
-                        models.push(LocalModel { model_id, files: vec![filename] });
+                        models.push(LocalModel { model_id, files: vec![filename], has_done: false });
                     }
                 }
             }

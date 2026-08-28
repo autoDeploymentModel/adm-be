@@ -508,6 +508,10 @@ function isModelDownloaded(modelId) {
   const model = S().modelList.find(m => m.model_id === modelId);
   // 新格式（多文件目录模型）：所有文件齐全才算下载完成
   if (model && model.model_download_files && model.model_download_files.length > 0) {
+    // 清单仅一条 "local"：手动放置并同步的本地模型，仅认 .done 标记
+    if (model.model_download_files.length === 1 && model.model_download_files[0] === "local") {
+      return local.has_done === true;
+    }
     return model.model_download_files.every(function(url) {
       const fname = getUrlFilename(url);
       return fname && local.files.includes(fname);
@@ -721,6 +725,11 @@ async function handleDownload(btn) {
   let modelFiles = null;
   if (btn.dataset.modelFiles) {
     try { modelFiles = JSON.parse(btn.dataset.modelFiles); } catch (_) { modelFiles = null; }
+  }
+  // 清单仅一条 "local"：本地模型需手动放置文件并写 .done 标记，不走下载流程
+  if (modelFiles && modelFiles.length === 1 && modelFiles[0] === "local") {
+    showToast(_t("本地模型请手动放置文件并写入 .done 标记后点击刷新，无需下载"));
+    return;
   }
   if (btn) {
     const hasPart = S().partFiles[modelId] && S().partFiles[modelId] > 0;

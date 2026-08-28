@@ -238,4 +238,5 @@ pub struct PartFileProgress {
 pub struct LocalModel {
     pub model_id: String,
     pub files: Vec<String>,
+    pub has_done: bool,
 }

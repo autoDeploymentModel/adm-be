@@ -34,6 +34,7 @@ const EN = {
   "下载失败: 缺少下载地址": "Download failed: missing download URL",
   "重试": "Retry",
   "下载失败: ": "Download failed: ",
+  "本地模型请手动放置文件并写入 .done 标记后点击刷新，无需下载": "For local models, place the files manually and create a .done marker, then refresh; no download needed",
   "正在下载... ": "Downloading... ",
   "正在解压安装...": "Extracting and installing...",
   "安装完成！": "Installation complete!",
