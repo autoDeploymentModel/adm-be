@@ -1469,6 +1469,9 @@ fn build_multi_node_head_args(
     // 容器必须 detached（本地回头要 `docker exec -d` 起 worker/head 的 vllm serve），`-d` 放 image 之前
     // 不再注入 RAY_ADDRESS：fork 镜像禁止 ray backend + nnodes>1，多机走 no-Ray(mp) 模式
     args.push("-d".to_string());
+    // 对齐 build_multi_node_worker_args：清空镜像自带 ENTRYPOINT（如 vllm/vllm-openai 系的
+    // ["vllm","serve"]），否则保活命令 `sleep infinity` 会被拼成 `vllm serve sleep infinity`（把 sleep 当模型名）
+    args.push("--entrypoint=".to_string());
     args.push(image.to_string());
     args.push("sleep".to_string());
     args.push("infinity".to_string());
@@ -1924,6 +1927,32 @@ async fn start_multi_node(
             "line": format!("[多机] 远端节点 {}（rank {}）容器已就绪", node.ip, i),
             "source": "stdout",
         }));
+        // worker 容器内 vllm 可用性预检：worker 侧 vllm 缺失时其 vllm serve 秒退，
+        // head 会一直阻塞等 rank join（前端只见超时）。提前探测并失败回滚。
+        {
+            let probe_cmd = format!(
+                "{} exec {} bash -c \"command -v vllm >/dev/null 2>&1 && echo VLLM_BIN_OK || echo VLLM_BIN_MISSING\"",
+                if use_sudo { "sudo -n docker" } else { "docker" },
+                crate::common::ssh::sh_quote(&container)
+            );
+            let (pok, pout, perr) = crate::common::ssh::ssh_run(
+                &node.ip, &node.ssh_user, node.ssh_port, key_ref, &probe_cmd,
+                std::time::Duration::from_secs(15),
+            ).await.unwrap_or((false, String::new(), String::new()));
+            if !pok || pout.contains("VLLM_BIN_MISSING") {
+                let _ = stop_remote_containers(app, &mn, key_ref, model_id, 1).await;
+                let detail = if pout.contains("VLLM_BIN_MISSING") {
+                    "容器内找不到 vllm 命令（镜像 PATH 缺失 vllm，镜像内容可能不完整或被镜像加速器替换）"
+                } else {
+                    "容器内 vllm 预检执行失败"
+                };
+                crate::common::utils::logger::write_log("ERROR", "MODEL", &format!("[{}] {}（节点 {}）: {}", model_id, detail, node.ip, perr));
+                bail!(
+                    "远端节点 {}（rank {}）{}：请在该节点执行 `docker rmi {}` 后重新拉取镜像（或在模型列表重新下载触发拉取），已回滚停止已启动节点",
+                    node.ip, i, detail, image
+                );
+            }
+        }
         // 记录 (rank, container, use_sudo, log_path) 供 Phase 5 ray join 复用（避免重复 sudo 探测）
         worker_runtime.push((i, container.clone(), use_sudo, log_path));
     }
@@ -2040,6 +2069,39 @@ async fn start_multi_node(
         "line": format!("[多机] 本机（rank 0）容器已就绪"),
         "source": "stdout",
     }));
+
+    // ===== Phase 2.5: head 容器内 vllm 可用性预检 =====
+    // 镜像 PATH 缺 vllm 时，Phase 4 的 `bash -c "vllm serve ..."` 只会留下
+    // `bash: line 1: vllm: command not found` 然后 head 阻塞等 rank join——提前探测，
+    // 失败即回滚并给出可操作的修复指引（重拉镜像）。
+    {
+        let probe = crate::common::utils::platform::docker_cmd()
+            .args(["exec", &container0, "bash", "-c",
+                   "command -v vllm >/dev/null 2>&1 && echo VLLM_BIN_OK || echo VLLM_BIN_MISSING"])
+            .output();
+        if matches!(&probe, Ok(o) if String::from_utf8_lossy(&o.stdout).contains("VLLM_BIN_MISSING")) {
+            let diag = crate::common::utils::platform::docker_cmd()
+                .args(["exec", &container0, "bash", "-c",
+                       "echo PATH=$PATH; ls /usr/local/bin /usr/bin 2>/dev/null | grep -i vllm | head -3"])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            let _ = app.emit("model-log", serde_json::json!({
+                "model_id": model_id,
+                "line": format!("[ERROR] 镜像 {} 容器内找不到 vllm 命令（{}）", image, if diag.is_empty() { "容器内无 vllm 相关文件".to_string() } else { diag }),
+                "source": "stderr",
+            }));
+            let _ = crate::common::utils::platform::docker_cmd()
+                .args(["rm", "-f", &container0])
+                .output();
+            stop_remote_containers(app, &mn, key_ref, model_id, 1).await;
+            return Err(AppError::msg(format!(
+                "镜像 {} 容器内找不到 vllm 命令（镜像内容可能不完整或被镜像加速器替换）：请执行 `docker rmi {}` 后在模型列表重新下载模型触发重新拉取，已回滚停止集群",
+                image, image
+            )));
+        }
+    }
 
     // ===== Phase 3: 派发远端 worker 的 `vllm serve --headless`（no-Ray 多机，对齐 fork exec_no_ray_cluster）=====
     // fork 镜像 pydantic 校验：nnodes > 1 只允许 mp / uni / external_launcher backend，
@@ -2416,6 +2478,28 @@ async fn start_vllm_docker(
     // 返回实际可用镜像名（可能是国内镜像源前缀版本），后续 docker run 必须用它
     let image = check_docker_env(app, model_id, &image).await?;
 
+    // 镜像内 vllm 可用性预检（--entrypoint bash 绕开镜像 ENTRYPOINT，无需 GPU）：
+    // vllm 不在镜像 PATH 时容器会以 `bash: line 1: vllm: command not found` 或
+    // OCI exec 错误秒退，提前探测给出可操作的修复指引（重拉镜像）。
+    {
+        let probe = crate::common::utils::platform::docker_cmd_tokio()
+            .args(["run", "--rm", "--entrypoint", "/bin/bash", &image, "-c",
+                   "command -v vllm >/dev/null 2>&1 && echo VLLM_BIN_OK || echo VLLM_BIN_MISSING"])
+            .output();
+        if let Ok(Ok(o)) = tokio::time::timeout(std::time::Duration::from_secs(60), probe).await {
+            if String::from_utf8_lossy(&o.stdout).contains("VLLM_BIN_MISSING") {
+                let msg = format!(
+                    "镜像 {} 内找不到 vllm 命令（镜像内容可能不完整或被镜像加速器替换）：请执行 `docker rmi {}` 后在模型列表重新下载模型触发重新拉取",
+                    image, image
+                );
+                app.emit("model-log", serde_json::json!({
+                    "model_id": model_id, "line": format!("[ERROR] {}", msg), "source": "stderr",
+                })).ok();
+                bail!("{}", msg);
+            }
+        }
+    }
+
     let port: u16 = params.port.unwrap_or(8000);
     // Docker 容器内必须监听 0.0.0.0 才能经 -p 端口映射对外服务；设置页 host 不适用容器内
     let host = "0.0.0.0".to_string();
@@ -2527,6 +2611,11 @@ async fn start_vllm_docker(
     ];
     // 注入额外环境变量（必须在 image 之前）
     args.extend(extra_env_args);
+    // 清空镜像自带 ENTRYPOINT（如 vllm/vllm-openai 系的 ["vllm","serve"]）：
+    // vllm_image 只是镜像名，启动命令完整自持（`vllm serve ...` 原样执行），
+    // 绝不与镜像 ENTRYPOINT 拼接（否则命令会被 ENTRYPOINT 吞掉：单机变
+    // `vllm serve vllm serve ...`，bash 型 ENTRYPOINT 报 `bash: line 1: vllm: command not found`）
+    args.push("--entrypoint=".to_string());
     args.push(image);
     args.push("vllm".to_string());
     args.push("serve".to_string());
