@@ -506,9 +506,9 @@ async fn pull_image_if_configured(app: &tauri::AppHandle, model_id: &str, image:
     }
 }
 
-/// Docker 环境预检：CLI 存在 → daemon 运行 → NVIDIA runtime 可用 → **镜像已存在**。
-/// **不拉取镜像**——镜像由下载流程（`download_model` → `pull_docker_image`）负责；启动时若镜像缺失直接报错，
-/// 引导用户重新触发下载。任一环节失败返回错误原因，前端以 toast / model-log 展示。
+/// Docker 环境预检：CLI 存在 → daemon 运行 → NVIDIA runtime 可用。
+/// **镜像缺失时当场拉取**（pull 进度经 model-pull-progress 事件驱动前端「拉取镜像 X%」），
+/// 拉取失败才报错返回。任一环节失败返回错误原因，前端以 toast / model-log 展示。
 async fn check_docker_env(
     app: &tauri::AppHandle,
     model_id: &str,
@@ -516,14 +516,9 @@ async fn check_docker_env(
 ) -> Result<String, AppError> {
     docker_preflight(app, model_id).await?;
 
-    // 镜像必须已存在（由下载流程提前拉取）；缺失时启动直接失败
-    if !docker_image_exists(app, model_id, image).await? {
-        return Err(AppError::msg(format!(
-            "镜像 {} 尚未下载（缺失或被清理），请回到模型列表重新点击「下载」触发拉取",
-            image
-        )));
-    }
-    Ok(image.to_string())
+    // 镜像存在 → 直接用；缺失 → 当场拉取（下载失败/目录拷入/配置晚更新等场景兜底），
+    // 避免「启动失败：镜像尚未下载，请回列表重新点击下载」的断链式引导
+    pull_docker_image(app, model_id, image).await
 }
 
 /// 拉取镜像（仅由 `download_model` 在模型文件下完后调用）：

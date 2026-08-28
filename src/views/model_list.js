@@ -733,8 +733,13 @@ async function handleDownload(btn) {
   try {
     await invoke()("download_model", { modelId: modelId, modelFiles: modelFiles, vllmImage: vllmImage });
     console.log("[model_list] 下载模型 invoke 完成:", modelId);
+    // 文件 + 镜像拉取全部完成：清理拉取中状态并重渲染（「启动」按钮恢复可点）
+    delete S().startingModelId;
+    if (S().pullProgress) delete S().pullProgress[modelId];
+    renderModelTable();
   } catch (e) {
     console.error("[model_list] 下载失败:", e);
+    delete S().startingModelId;
     var errMsg = String(e);
     if (errMsg.indexOf("正在下载中") !== -1) {
       // 双击竞态：后端仍在下载中，不能清状态（否则真实下载失去停止按钮）
@@ -1010,6 +1015,8 @@ async function handleTauriEvent(type, payload) {
         } else {
           startBtn.textContent = _t("拉取镜像 ") + progress + "%";
         }
+        // 拉取中禁点（覆盖「下载完成后自动拉镜」阶段：按钮还未被启动流程声明为拉取中）
+        startBtn.disabled = true;
         startBtn.dataset.pullPct = progress;
       }
       updateProgressBar(model_id, progress);
