@@ -577,10 +577,37 @@ async fn pull_docker_image(
             PULL_TIMEOUT.as_secs() / 60,
             image
         ))),
-        Err(e) => Err(AppError::msg(format!(
-            "镜像 {} 拉取中止: {}；请检查网络（可尝试设置页「代理」）或手动执行 docker pull {}",
-            image, e, image
-        ))),
+        Err(first_err) => {
+            // 闲置超时（连续无输出）常见于镜像源瞬时抽风 / 网络抖动 / 首次连接慢；
+            // 已下载层会复用，自动重试一次后再失败才报错，避免来回手动重试。
+            crate::common::utils::logger::write_log(
+                "WARN",
+                "DOCKER",
+                &format!("[{}] 镜像 {} 拉取中止（{}），等待 8 秒后自动重试（第 2/2 次）", model_id, image, first_err),
+            );
+            let _ = app.emit(
+                "model-log",
+                serde_json::json!({
+                    "model_id": model_id,
+                    "line": format!("[docker pull] 镜像 {} 拉取中止（{}），8 秒后自动重试（第 2/2 次）...", image, first_err),
+                    "source": "stderr",
+                }),
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            match pull_image(app, model_id, image, PULL_TIMEOUT).await {
+                Ok(true) => Ok(image.to_string()),
+                Ok(false) => Err(AppError::msg(format!(
+                    "镜像 {} 拉取失败（自动重试 1 次后仍无进度输出，累计耗时超 {} 分钟）；请检查网络或镜像地址：国内网络可改用镜像加速（设置页「Docker 镜像配置」）或设置页「代理」后重试；也可手动执行 docker pull {} 观察报错",
+                    image,
+                    (PULL_TIMEOUT.as_secs() * 2) / 60,
+                    image
+                ))),
+                Err(second_err) => Err(AppError::msg(format!(
+                    "镜像 {} 拉取中止（自动重试一次后仍失败）: {}；请检查网络（可尝试设置页「Docker 镜像配置」调整加速器或「代理」）或手动执行 docker pull {}",
+                    image, second_err, image
+                ))),
+            }
+        }
     }
 }
 
@@ -807,7 +834,9 @@ async fn pull_image(
                         let done = done2.fetch_add(1, Ordering::Relaxed) + 1;
                         let total = total2.load(Ordering::Relaxed);
                         if total > 0 {
-                            let pct = ((done as f64 / total as f64) * 100.0) as u8;
+                            // 层完成 ≠ pull 完成（进程还需 digest 校验/收尾），估算封顶 99%，
+                            // 仅当 pull 进程成功退出时才发 100%，避免「100% 实际仍在 pull」。
+                            let pct = ((done as f64 / total as f64) * 99.0) as u8;
                             let prev = lp2.fetch_max(pct, Ordering::Relaxed);
                             if pct > prev {
                                 app_c2.emit("model-pull-progress", serde_json::json!({
@@ -824,11 +853,11 @@ async fn pull_image(
                                 let total = total2.load(Ordering::Relaxed);
                                 let idx = order2.lock().unwrap_or_else(|e| e.into_inner()).get(&sha).copied().unwrap_or(0);
                                 if total > 0 && idx < total {
-                                    let pct = (((idx as f64) + (p as f64 / 100.0)) / (total as f64) * 100.0) as u8;
-                                    let prev = lp2.fetch_max(pct.min(100), Ordering::Relaxed);
+                                    let pct = (((idx as f64) + (p as f64 / 100.0)) / (total as f64) * 99.0) as u8;
+                                    let prev = lp2.fetch_max(pct.min(99), Ordering::Relaxed);
                                     if pct > prev {
                                         app_c2.emit("model-pull-progress", serde_json::json!({
-                                            "model_id": &mid2, "image": "", "progress": pct.min(100),
+                                            "model_id": &mid2, "image": "", "progress": pct.min(99),
                                         })).ok();
                                     }
                                 }
