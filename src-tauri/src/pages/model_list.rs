@@ -1929,9 +1929,10 @@ async fn start_multi_node(
         }));
         // worker 容器内 vllm 可用性预检：worker 侧 vllm 缺失时其 vllm serve 秒退，
         // head 会一直阻塞等 rank join（前端只见超时）。提前探测并失败回滚。
+        // 失败时同时回传容器内 PATH 与 vllm 常见安装位置（定位镜像是否为旧构建/venv 布局）。
         {
             let probe_cmd = format!(
-                "{} exec {} bash -c \"command -v vllm >/dev/null 2>&1 && echo VLLM_BIN_OK || echo VLLM_BIN_MISSING\"",
+                "{} exec {} bash -c 'if command -v vllm >/dev/null 2>&1; then echo VLLM_BIN_OK; else echo VLLM_BIN_MISSING; echo \"PATH=$PATH\"; command -v sglang >/dev/null 2>&1 && echo IMAGE_IS_SGLANG; ls /usr/local/bin /usr/bin /opt/venv/bin /opt/conda/bin 2>/dev/null | grep -i vllm | head -5; fi'",
                 if use_sudo { "sudo -n docker" } else { "docker" },
                 crate::common::ssh::sh_quote(&container)
             );
@@ -1941,14 +1942,24 @@ async fn start_multi_node(
             ).await.unwrap_or((false, String::new(), String::new()));
             if !pok || pout.contains("VLLM_BIN_MISSING") {
                 let _ = stop_remote_containers(app, &mn, key_ref, model_id, 1).await;
-                let detail = if pout.contains("VLLM_BIN_MISSING") {
-                    "容器内找不到 vllm 命令（镜像 PATH 缺失 vllm，镜像内容可能不完整或被镜像加速器替换）"
+                let diag: Vec<&str> = pout.lines()
+                    .filter(|l| l.contains("PATH=") || l.to_lowercase().contains("vllm") || l.contains("IMAGE_IS_SGLANG"))
+                    .collect();
+                let diag_str = if diag.is_empty() { String::new() } else { format!("（{}\n）", diag.join("\n")) };
+                let is_sglang = pout.contains("IMAGE_IS_SGLANG");
+                let sglang_hint = if is_sglang {
+                    "该镜像内是 sglang 而非 vllm（tag 实际被 SGLang 镜像占用/打错），请改用真正的 vLLM 镜像"
                 } else {
-                    "容器内 vllm 预检执行失败"
+                    "镜像可能为旧构建或经镜像加速器缓存（浮动 tag 内容不一致）"
+                };
+                let detail = if pout.contains("VLLM_BIN_MISSING") {
+                    format!("容器内找不到 vllm 命令。{}。{}", sglang_hint, diag_str)
+                } else {
+                    "容器内 vllm 预检执行失败".to_string()
                 };
                 crate::common::utils::logger::write_log("ERROR", "MODEL", &format!("[{}] {}（节点 {}）: {}", model_id, detail, node.ip, perr));
                 bail!(
-                    "远端节点 {}（rank {}）{}：请在该节点执行 `docker rmi {}` 后重新拉取镜像（或在模型列表重新下载触发拉取），已回滚停止已启动节点",
+                    "远端节点 {}（rank {}）{}。镜像可能为旧构建或经镜像加速器缓存（浮动 tag 内容不一致）：请在该节点执行 `docker rmi {}` 后，本机设置页「同步镜像到直连节点」重新推送（或远端 docker pull），已回滚停止已启动节点",
                     node.ip, i, detail, image
                 );
             }
@@ -2073,33 +2084,41 @@ async fn start_multi_node(
     // ===== Phase 2.5: head 容器内 vllm 可用性预检 =====
     // 镜像 PATH 缺 vllm 时，Phase 4 的 `bash -c "vllm serve ..."` 只会留下
     // `bash: line 1: vllm: command not found` 然后 head 阻塞等 rank join——提前探测，
-    // 失败即回滚并给出可操作的修复指引（重拉镜像）。
+    // 失败即回滚并给出可操作的修复指引（重拉镜像）。顺带检测 sglang 占 tag 场景。
     {
         let probe = crate::common::utils::platform::docker_cmd()
             .args(["exec", &container0, "bash", "-c",
-                   "command -v vllm >/dev/null 2>&1 && echo VLLM_BIN_OK || echo VLLM_BIN_MISSING"])
+                   "if command -v vllm >/dev/null 2>&1; then echo VLLM_BIN_OK; else echo VLLM_BIN_MISSING; command -v sglang >/dev/null 2>&1 && echo IMAGE_IS_SGLANG; fi"])
             .output();
-        if matches!(&probe, Ok(o) if String::from_utf8_lossy(&o.stdout).contains("VLLM_BIN_MISSING")) {
-            let diag = crate::common::utils::platform::docker_cmd()
-                .args(["exec", &container0, "bash", "-c",
-                       "echo PATH=$PATH; ls /usr/local/bin /usr/bin 2>/dev/null | grep -i vllm | head -3"])
-                .output()
-                .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .unwrap_or_default();
-            let _ = app.emit("model-log", serde_json::json!({
-                "model_id": model_id,
-                "line": format!("[ERROR] 镜像 {} 容器内找不到 vllm 命令（{}）", image, if diag.is_empty() { "容器内无 vllm 相关文件".to_string() } else { diag }),
-                "source": "stderr",
-            }));
-            let _ = crate::common::utils::platform::docker_cmd()
-                .args(["rm", "-f", &container0])
-                .output();
-            stop_remote_containers(app, &mn, key_ref, model_id, 1).await;
-            return Err(AppError::msg(format!(
-                "镜像 {} 容器内找不到 vllm 命令（镜像内容可能不完整或被镜像加速器替换）：请执行 `docker rmi {}` 后在模型列表重新下载模型触发重新拉取，已回滚停止集群",
-                image, image
-            )));
+        if let Ok(o) = &probe {
+            let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
+            if stdout.contains("VLLM_BIN_MISSING") {
+                let hint = if stdout.contains("IMAGE_IS_SGLANG") {
+                    "（该镜像内是 sglang 而非 vllm：此 tag 实际被 SGLang 镜像占用/打错，请改用真正的 vLLM 镜像，如 ghcr.io/spark-arena/dgx-vllm-eugr-nightly-b12x）"
+                } else {
+                    ""
+                };
+                let diag = crate::common::utils::platform::docker_cmd()
+                    .args(["exec", &container0, "bash", "-c",
+                           "echo PATH=$PATH; ls /usr/local/bin /usr/bin 2>/dev/null | grep -i vllm | head -3"])
+                    .output()
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_default();
+                let _ = app.emit("model-log", serde_json::json!({
+                    "model_id": model_id,
+                    "line": format!("[ERROR] 镜像 {} 容器内找不到 vllm 命令{}（{}）", image, hint, if diag.is_empty() { "容器内无 vllm 相关文件".to_string() } else { diag }),
+                    "source": "stderr",
+                }));
+                let _ = crate::common::utils::platform::docker_cmd()
+                    .args(["rm", "-f", &container0])
+                    .output();
+                stop_remote_containers(app, &mn, key_ref, model_id, 1).await;
+                return Err(AppError::msg(format!(
+                    "镜像 {} 容器内找不到 vllm 命令{}（镜像内容可能不完整或被镜像加速器替换）：请执行 `docker rmi {}` 后在模型列表重新下载模型触发重新拉取，已回滚停止集群",
+                    image, hint, image
+                )));
+            }
         }
     }
 
@@ -2481,16 +2500,23 @@ async fn start_vllm_docker(
     // 镜像内 vllm 可用性预检（--entrypoint bash 绕开镜像 ENTRYPOINT，无需 GPU）：
     // vllm 不在镜像 PATH 时容器会以 `bash: line 1: vllm: command not found` 或
     // OCI exec 错误秒退，提前探测给出可操作的修复指引（重拉镜像）。
+    // 同时顺带检测 sglang：tagname 可能被非 vLLM 镜像（如 SGLang）占用，报明避免误判镜像损坏。
     {
         let probe = crate::common::utils::platform::docker_cmd_tokio()
             .args(["run", "--rm", "--entrypoint", "/bin/bash", &image, "-c",
-                   "command -v vllm >/dev/null 2>&1 && echo VLLM_BIN_OK || echo VLLM_BIN_MISSING"])
+                   "if command -v vllm >/dev/null 2>&1; then echo VLLM_BIN_OK; else echo VLLM_BIN_MISSING; command -v sglang >/dev/null 2>&1 && echo IMAGE_IS_SGLANG; fi"])
             .output();
         if let Ok(Ok(o)) = tokio::time::timeout(std::time::Duration::from_secs(60), probe).await {
-            if String::from_utf8_lossy(&o.stdout).contains("VLLM_BIN_MISSING") {
+            let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
+            if stdout.contains("VLLM_BIN_MISSING") {
+                let hint = if stdout.contains("IMAGE_IS_SGLANG") {
+                    "（检测到该镜像内是 sglang 而非 vllm：此 tag 实际被 SGLang 镜像占用/打错，请改用真正的 vLLM 镜像，如本清单其他模型使用的 ghcr.io/spark-arena/dgx-vllm-eugr-nightly-b12x）"
+                } else {
+                    ""
+                };
                 let msg = format!(
-                    "镜像 {} 内找不到 vllm 命令（镜像内容可能不完整或被镜像加速器替换）：请执行 `docker rmi {}` 后在模型列表重新下载模型触发重新拉取",
-                    image, image
+                    "镜像 {} 内找不到 vllm 命令{}（镜像内容可能不完整或被镜像加速器替换）：请执行 `docker rmi {}` 后在模型列表重新下载模型触发重新拉取",
+                    image, hint, image
                 );
                 app.emit("model-log", serde_json::json!({
                     "model_id": model_id, "line": format!("[ERROR] {}", msg), "source": "stderr",
