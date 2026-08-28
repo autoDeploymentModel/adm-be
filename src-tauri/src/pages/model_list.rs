@@ -1199,6 +1199,61 @@ fn effective_remote_model_dir(model_dir: &str, user: &str, model_id: &str) -> St
     }
 }
 
+/// 解析模型清单 `vllm_extra_mounts`（附加挂载的 model_id 列表，如投机解码 drafter 权重）：
+/// 每条对应本地 `<models>/<id>` 目录，校验下载完成（.done 或 config.json+model.safetensors），
+/// 未完成直接报错提示先在模型列表下载。返回 (宿主机路径, 容器路径) 列表，
+/// 由调用方逐条转成 `-v <host>:<container>:ro`。空列表返回空——所有既有模型 docker 参数不变。
+fn resolve_extra_mounts(models_dir: &std::path::Path, extra_mounts: &[String]) -> Result<Vec<(String, String)>, AppError> {
+    let mut out = Vec::new();
+    for id in extra_mounts {
+        let id = id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        let dir = models_dir.join(id);
+        let complete = dir.join(".done").exists()
+            || (dir.join("config.json").exists() && dir.join("model.safetensors").exists());
+        if !complete {
+            bail!("附加模型 {} 未下载或下载未完成，请先在模型列表下载该模型", id);
+        }
+        out.push((dir.to_string_lossy().to_string(), format!("/models/{}", id)));
+    }
+    Ok(out)
+}
+
+/// 多机 worker 远端附加模型目录探活（vllm_extra_mounts）：与主模型同规则解析远端路径
+/// `<model_root>/<id>`，检查下载完成标记；缺失时报错提示先下载/同步到该节点。
+async fn probe_remote_extra_mounts(
+    node: &crate::common::types::NodeInfo,
+    key: Option<&str>,
+    extra_mounts: &[String],
+) -> Result<Vec<(String, String)>, AppError> {
+    let mut out = Vec::new();
+    for id in extra_mounts {
+        let id = id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        let dir = effective_remote_model_dir(&node.model_dir, &node.ssh_user, id);
+        let script = format!(
+            "d={dir_q}; if [ -f \"$d/.done\" ] || {{ [ -f \"$d/config.json\" ] && [ -f \"$d/model.safetensors\" ]; }}; then echo EXTRA_OK; else echo EXTRA_MISSING; fi",
+            dir_q = crate::common::ssh::quote_remote_path(&dir),
+        );
+        let ok = crate::common::ssh::ssh_run(
+            &node.ip, &node.ssh_user, node.ssh_port, key, &script,
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .map(|(_, o, _)| o.contains("EXTRA_OK"))
+        .unwrap_or(false);
+        if !ok {
+            bail!("远端节点 {} 缺少附加模型 {}（目录 {}），请先在该节点下载或使用设置页「同步模型到直连节点」", node.ip, id, dir);
+        }
+        out.push((dir, format!("/models/{}", id)));
+    }
+    Ok(out)
+}
+
 /// 本机通过 IP 反查网卡名：`ip -o -4 addr show to <IP>` 取接口名。
 /// 仅 Linux 多机模式调用；Windows 开发环境返回 None（不影响开发）。
 fn detect_local_iface(ip: &str) -> Option<String> {
@@ -1505,12 +1560,18 @@ fn build_multi_node_head_args(
     ib_iface: Option<&str>,
     has_infiniband: bool,
     model_env: &[String],
+    extra_mounts: &[(String, String)],
 ) -> Vec<String> {
     let container_name = format!("adm-vllm-{}-rank-0", model_id);
     let mount_dst = format!("/models/{}", model_id);
     let mut args = build_common_docker_prefix(&container_name, shm_size, node_ip, iface, ib_iface, has_infiniband, &mn.extra_env, model_env);
     args.push("-v".to_string());
     args.push(format!("{}:{}:ro", model_dir.to_string_lossy(), mount_dst));
+    // vllm_extra_mounts：附加模型目录（drafter 等），主挂载之后逐条追加，空列表零变化
+    for (host_path, container_path) in extra_mounts {
+        args.push("-v".to_string());
+        args.push(format!("{}:{}:ro", host_path, container_path));
+    }
     // 容器必须 detached（本地回头要 `docker exec -d` 起 worker/head 的 vllm serve），`-d` 放 image 之前
     // 不再注入 RAY_ADDRESS：fork 镜像禁止 ray backend + nnodes>1，多机走 no-Ray(mp) 模式
     args.push("-d".to_string());
@@ -1640,12 +1701,18 @@ fn build_multi_node_worker_args(
     ib_iface: Option<&str>,
     has_infiniband: bool,
     model_env: &[String],
+    extra_mounts: &[(String, String)],
 ) -> Vec<String> {
     let container_name = format!("adm-vllm-{}-rank-{}", model_id, rank);
     let mount_dst = format!("/models/{}", model_id);
     let mut args = build_common_docker_prefix(&container_name, shm_size, node_ip, iface, ib_iface, has_infiniband, &mn.extra_env, model_env);
     args.push("-v".to_string());
     args.push(format!("{}:{}:ro", model_dir.to_string_lossy(), mount_dst));
+    // vllm_extra_mounts：附加模型目录（drafter 等），主挂载之后逐条追加，空列表零变化
+    for (host_path, container_path) in extra_mounts {
+        args.push("-v".to_string());
+        args.push(format!("{}:{}:ro", host_path, container_path));
+    }
     // fork 默认 `--entrypoint=` 清空镜像 ENTRYPOINT（避免 nvidia_entrypoint.sh 触发），
     // 命令仅 `sleep infinity`，让容器保活等待后续 docker exec 启动 Ray worker
     args.push("--entrypoint=".to_string());
@@ -1710,6 +1777,7 @@ async fn start_multi_node(
     vllm_image: Option<String>,
     vllm_flags: Option<Vec<String>>,
     vllm_env: Option<Vec<String>>,
+    extra_mounts: Option<Vec<String>>,
 ) -> Result<(), AppError> {
     let (mn, mut vllm_args) = load_multi_node_config(app);
     // 多机路径：backend 由下方 build_head/worker_vllm_exec_args 末尾强制追加 mp，
@@ -1781,6 +1849,12 @@ async fn start_multi_node(
 
     // ===== 远端节点：预检 + 启动 + 快速就绪确认（任一失败回滚）=====
     let node0_ip = mn.nodes[0].ip.clone();
+    // vllm_extra_mounts：head（本机）附加模型目录提前解析 + 校验（空清单零开销）。
+    // 放在 worker 启动之前：缺失时快速失败，避免远端容器已拉起后才发现本地缺文件。
+    let head_extra_mounts = resolve_extra_mounts(
+        model_dir.parent().unwrap_or(model_dir),
+        extra_mounts.as_deref().unwrap_or(&[]),
+    )?;
     // 收集各 worker 的 (rank, container, use_sudo, log_path)，供 Phase 5 复用——
     // 避免再对每个节点重复 SSH 探测 sudo（SSH 抖动可能导致 sudo 判定与容器启动时不一致）
     let mut worker_runtime: Vec<(usize, String, bool, String)> = Vec::new();
@@ -1821,6 +1895,8 @@ async fn start_multi_node(
         if !model_ok {
             bail!("远端节点 {}（rank {}）模型目录不存在或未下载完成：{}（可先在设置页「同步模型到直连节点」自动同步）", node.ip, i, node_model_dir);
         }
+        // vllm_extra_mounts：附加模型目录（drafter 等）远端探活 + 解析挂载参数（空清单零开销）
+        let node_extra_mounts = probe_remote_extra_mounts(node, key_ref, extra_mounts.as_deref().unwrap_or(&[])).await?;
         let _ = app.emit("model-log", serde_json::json!({
             "model_id": model_id,
             "line": format!("[多机] 节点 {}（rank {}）环境正常：GPU={} Docker={} 镜像={}", node.ip, i, gpu, "OK", "OK"),
@@ -1876,6 +1952,7 @@ async fn start_multi_node(
             remote_ib_iface.as_deref(),
             remote_has_ib,
             vllm_env.as_deref().unwrap_or(&[]),
+            &node_extra_mounts,
         );
         let container = multi_container_name(model_id, i);
         let log_path = format!("/tmp/adm_vllm_{}_rank_{}.log", model_id, i);
@@ -2043,6 +2120,7 @@ async fn start_multi_node(
     let args0 = build_multi_node_head_args(
         model_id, model_dir, &image, &shm_size, &mn, &node0_ip, local_iface.as_deref(), local_ib_iface.as_deref(), local_has_ib,
         vllm_env.as_deref().unwrap_or(&[]),
+        &head_extra_mounts,
     );
 
     dbg_log!("vllm multi-node head container args (rank0): {:?}", args0);
@@ -2502,6 +2580,7 @@ async fn start_vllm_docker(
     vllm_image: Option<String>,
     vllm_flags: Option<Vec<String>>,
     vllm_env: Option<Vec<String>>,
+    extra_mounts: Option<Vec<String>>,
 ) -> Result<(), AppError> {
     const CONTAINER_PREFIX: &str = "adm-vllm-";
     let container_name = format!("{}{}", CONTAINER_PREFIX, model_id);
@@ -2593,6 +2672,11 @@ async fn start_vllm_docker(
 
     let mount_src = model_dir.to_string_lossy().to_string();
     let mount_dst = format!("/models/{}", model_id);
+    // vllm_extra_mounts：附加模型目录（drafter 等）挂载参数（空清单零开销，其他模型 docker 参数不变）
+    let extra_mounts = resolve_extra_mounts(
+        model_dir.parent().unwrap_or(model_dir),
+        extra_mounts.as_deref().unwrap_or(&[]),
+    )?;
 
     // ===== 设置页「额外环境变量」注入（与多机 build_common_docker_prefix 行为对齐）=====
     // 每行 KEY=VALUE → -e KEY=VALUE；extra_env 已显式设置 NCCL_DEBUG 时不覆盖，未设置时默认 INFO。
@@ -2680,6 +2764,11 @@ async fn start_vllm_docker(
         "-v".to_string(),
         format!("{}:{}:ro", mount_src, mount_dst),
     ];
+    // 附加挂载在主模型之后逐条追加（均在 image 之前）
+    for (host_path, container_path) in &extra_mounts {
+        args.push("-v".to_string());
+        args.push(format!("{}:{}:ro", host_path, container_path));
+    }
     // 注入额外环境变量（必须在 image 之前）
     args.extend(extra_env_args);
     // 清空镜像自带 ENTRYPOINT（如 vllm/vllm-openai 系的 ["vllm","serve"]）：
@@ -2908,9 +2997,10 @@ pub async fn start_model(
     vllm_image: Option<String>,
     vllm_flags: Option<Vec<String>>,
     vllm_env: Option<Vec<String>>,
+    extra_mounts: Option<Vec<String>>,
 ) -> Result<(), AppError> {
     // 统一捕获启动失败并写入本地日志
-    let result = start_model_inner(&app, &state, &model_id, params, device, vllm_image, vllm_flags, vllm_env).await;
+    let result = start_model_inner(&app, &state, &model_id, params, device, vllm_image, vllm_flags, vllm_env, extra_mounts).await;
     if let Err(ref e) = result {
         crate::common::utils::logger::write_log("ERROR", "MODEL", &format!("[{}] 启动失败: {}", model_id, e));
     }
@@ -2926,6 +3016,7 @@ async fn start_model_inner(
     vllm_image: Option<String>,
     vllm_flags: Option<Vec<String>>,
     vllm_env: Option<Vec<String>>,
+    extra_mounts: Option<Vec<String>>,
 ) -> Result<(), AppError> {
     {
         let pid_lock = state.running_process.lock().map_err(|e| e.to_string())?;
@@ -2953,9 +3044,9 @@ async fn start_model_inner(
         // 多机互联：设置页启用且节点数 >= 2 时走集群启动（单机路径不变）
         let (mn, _) = load_multi_node_config(app);
         if mn.enabled && mn.nodes.len() >= 2 {
-            return start_multi_node(app, state, model_id, &model_dir, params, vllm_image, vllm_flags, vllm_env).await;
+            return start_multi_node(app, state, model_id, &model_dir, params, vllm_image, vllm_flags, vllm_env, extra_mounts).await;
         }
-        return start_vllm_docker(app, state, model_id, &model_dir, params, device, vllm_image, vllm_flags, vllm_env).await;
+        return start_vllm_docker(app, state, model_id, &model_dir, params, device, vllm_image, vllm_flags, vllm_env, extra_mounts).await;
     }
 
     // 仅支持 vLLM Docker 部署（safetensors 目录模型）

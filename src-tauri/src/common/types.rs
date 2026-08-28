@@ -51,6 +51,11 @@ pub struct RemoteModel {
     /// vLLM 容器环境变量（如 ["VLLM_USE_AOT_COMPILE=1"]）；每条 `KEY=VALUE`，注入 docker `-e`，与 vllm_flags 同级（模型清单优先级最高）
     #[serde(default)]
     pub vllm_env: Vec<String>,
+    /// 附加挂载的模型目录 model_id 列表（如投机解码 drafter）；启动时逐条追加
+    /// `-v <models>/<id>:/models/<id>:ro`（多机 worker 为远端 `<model_root>/<id>`），
+    /// 目录不存在直接报「请先下载/同步」。缺省/空数组 = 不追加任何挂载，其他模型零影响。
+    #[serde(default)]
+    pub vllm_extra_mounts: Vec<String>,
     #[serde(default)]
     pub model_size: String,
     #[serde(default)]

@@ -890,11 +890,13 @@ async function handleStart(btn) {
     const vllmFlags = (model && model.vllm_flags) || null;
     // 模型配置的 vllm_env（官方推荐容器环境变量，KEY=VALUE）→ 注入 docker -e，优先级最高
     const vllmEnv = (model && model.vllm_env) || null;
+    // 模型配置的 vllm_extra_mounts（附加挂载的 model_id 列表，如投机解码 drafter 权重）→ 逐条 -v /models/<id>:ro
+    const extraMounts = (model && model.vllm_extra_mounts && model.vllm_extra_mounts.length) ? model.vllm_extra_mounts : null;
 
     S().startingModelId = modelId;
     renderModelTable();
 
-    await invoke()("start_model", { modelId: modelId, params: params, device: device, vllmImage: vllmImage, vllmFlags: vllmFlags, vllmEnv: vllmEnv });
+    await invoke()("start_model", { modelId: modelId, params: params, device: device, vllmImage: vllmImage, vllmFlags: vllmFlags, vllmEnv: vllmEnv, extraMounts: extraMounts });
     console.log("[model_list] 启动模型 invoke 完成:", modelId);
   } catch (e) {
     console.error("[model_list] 启动失败:", e);
