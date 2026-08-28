@@ -931,8 +931,9 @@ async fn pull_image(
 /// pull 成功后校验镜像 tag：`docker image inspect <image>` 失败（镜像以
 /// `<none>:<none>` untagged 形式落盘）时依次尝试：
 /// 1. 用 pull 输出捕获的 manifest digest 精确 tag（`docker tag <repo>@sha256:<hex> <image>`）；
-/// 2. 从 dangling 镜像中选择：优先 RepoDigests 归属与目标 repo 一致的（多个取创建时间
-///    最新）；无一匹配但本地仅有一个 dangling（无歧义，即刚拉的镜像）也直接修正；
+/// 2. 从 dangling 镜像中选择 RepoDigests 归属与目标 repo 一致的（多个取创建时间最新）
+///    重新 `docker tag`——严格要求归属匹配，不匹配即报错（曾因“唯一 dangling 直接
+///    tag”启发式把无关 sglang 旧镜像误打为 vllm 镜像名）；
 /// 修正后再 inspect 确认。
 async fn ensure_image_tag(
     app: &tauri::AppHandle,
@@ -977,9 +978,10 @@ async fn ensure_image_tag(
     }
 
     // 3. 兜底：dangling（untagged）镜像打 tag。
-    //    先按 RepoDigests 归属匹配目标 repo（多个候选时取创建时间最新）；
-    //    若无一匹配但本地**仅有一个** dangling（无歧义，即刚拉取的镜像——镜像加速器/
-    //    registry 交互常导致 RepoDigests 丢失），也直接修正，避免「永远 untagged」僵局。
+    //    仅当 RepoDigests 归属匹配目标 repo（如 `ghcr.io/xxx/yyy@sha256:`）时才修正，
+    //    多个候选取创建时间最新。**绝不**对“唯一 dangling”直接 tag——历史上该启发式
+    //    把无关 sglang 旧镜像误 tag 成目标镜像名（运行错误引擎）；pull 失败时本地
+    //    恰好有旧 dangling 的场景不少见，宁可报错提示手动处理。
     let out = crate::common::utils::platform::docker_cmd_tokio()
         .args(["images", "--filter", "dangling=true", "--format", "{{.CreatedAt}}|{{.ID}}"])
         .output()
@@ -1009,8 +1011,8 @@ async fn ensure_image_tag(
         )));
     }
 
-    // 归属校验：untagged 镜像的 RepoDigests 包含目标 repo（如 `ghcr.io/xxx/yyy@sha256:`）
-    // 才算归属本镜像；仅当本地只有一个 dangling 时才允许跳过校验（无歧义）。
+    // 归属校验：untagged 镜像的 RepoDigests 必须包含目标 repo（如 `ghcr.io/xxx/yyy@sha256:`），
+    // 否则是无关的历史 dangling 镜像（如其它引擎/旧版本残留），拒绝打 tag（宁缺毋滥）。
     let repo = split_image_repo_tag(image).0;
     let mut matched: Vec<(String, String)> = Vec::new();
     for (ts, id) in &dangling {
@@ -1031,14 +1033,12 @@ async fn ensure_image_tag(
     let id = if !matched.is_empty() {
         matched.sort_by(|a, b| b.0.cmp(&a.0));
         matched[0].1.clone()
-    } else if dangling.len() == 1 {
-        dangling[0].1.clone()
     } else {
         return Err(AppError::msg(format!(
-            "镜像 {} 拉取后 tag 校验失败：本地有 {} 个 untagged 镜像且均不属于 {}，无法安全修正（请手动 docker pull {} 或将 docker rmi 清理无关镜像后重试）",
+            "镜像 {} 拉取后 tag 校验失败：本地 untagged 镜像均不属于 {}（如 {}），拒绝自动修正以免误 tag；请手动执行 docker pull {}，并在确认镜像内容无误后手动 docker tag",
             image,
-            dangling.len(),
             repo,
+            dangling.iter().map(|(_, i)| i.as_str()).collect::<Vec<_>>().join(" / "),
             image
         )));
     };
