@@ -931,8 +931,8 @@ async fn pull_image(
 /// pull 成功后校验镜像 tag：`docker image inspect <image>` 失败（镜像以
 /// `<none>:<none>` untagged 形式落盘）时依次尝试：
 /// 1. 用 pull 输出捕获的 manifest digest 精确 tag（`docker tag <repo>@sha256:<hex> <image>`）；
-/// 2. 从 dangling 镜像中按创建时间取最新、且 RepoDigests 归属与目标 repo 一致的
-///    重新 `docker tag`（校验归属，避免把无关历史 dangling 镜像误打 tag）；
+/// 2. 从 dangling 镜像中选择：优先 RepoDigests 归属与目标 repo 一致的（多个取创建时间
+///    最新）；无一匹配但本地仅有一个 dangling（无歧义，即刚拉的镜像）也直接修正；
 /// 修正后再 inspect 确认。
 async fn ensure_image_tag(
     app: &tauri::AppHandle,
@@ -976,7 +976,10 @@ async fn ensure_image_tag(
         }
     }
 
-    // 3. 兜底：dangling（untagged）中创建时间最新、RepoDigests 归属匹配的镜像
+    // 3. 兜底：dangling（untagged）镜像打 tag。
+    //    先按 RepoDigests 归属匹配目标 repo（多个候选时取创建时间最新）；
+    //    若无一匹配但本地**仅有一个** dangling（无歧义，即刚拉取的镜像——镜像加速器/
+    //    registry 交互常导致 RepoDigests 丢失），也直接修正，避免「永远 untagged」僵局。
     let out = crate::common::utils::platform::docker_cmd_tokio()
         .args(["images", "--filter", "dangling=true", "--format", "{{.CreatedAt}}|{{.ID}}"])
         .output()
@@ -989,44 +992,56 @@ async fn ensure_image_tag(
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    let mut best: Option<(String, String)> = None;
+    let mut dangling: Vec<(String, String)> = Vec::new(); // (CreatedAt, ID)
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         if let Some((ts, id)) = line.split_once('|') {
             let ts = ts.trim().to_string();
             let id = id.trim().to_string();
-            if best.as_ref().map_or(true, |(t, _)| ts > *t) {
-                best = Some((ts, id));
+            if !ts.is_empty() && !id.is_empty() {
+                dangling.push((ts, id));
             }
         }
     }
-    let (_, id) = best.ok_or_else(|| {
-        AppError::msg(format!(
+    if dangling.is_empty() {
+        return Err(AppError::msg(format!(
             "镜像 {} 拉取后未在本地找到镜像（含 untagged 兜底），请手动执行 docker pull {}",
             image, image
-        ))
-    })?;
+        )));
+    }
 
-    // 归属校验：untagged 镜像的 RepoDigests 必须包含目标 repo（如 `ghcr.io/xxx/yyy@sha256:`），
-    // 否则是无关的历史 dangling 镜像，拒绝打 tag（宁缺毋滥）。
+    // 归属校验：untagged 镜像的 RepoDigests 包含目标 repo（如 `ghcr.io/xxx/yyy@sha256:`）
+    // 才算归属本镜像；仅当本地只有一个 dangling 时才允许跳过校验（无歧义）。
     let repo = split_image_repo_tag(image).0;
-    let inspect = crate::common::utils::platform::docker_cmd_tokio()
-        .args(["image", "inspect", "--format", "{{.RepoDigests}}", &id])
-        .output()
-        .await
-        .map_err(|e| AppError::msg(format!("docker image inspect 执行失败: {}", e)))?;
-    if !inspect.status.success() {
-        return Err(AppError::msg(format!(
-            "镜像 {} 拉取后 tag 校验失败（无法检查 dangling 镜像 {} 归属）",
-            image, id
-        )));
+    let mut matched: Vec<(String, String)> = Vec::new();
+    for (ts, id) in &dangling {
+        let inspect = crate::common::utils::platform::docker_cmd_tokio()
+            .args(["image", "inspect", "--format", "{{.RepoDigests}}", id])
+            .output()
+            .await;
+        match inspect {
+            Ok(o) if o.status.success() => {
+                let digests = String::from_utf8_lossy(&o.stdout);
+                if digests.contains(&format!("{}@sha256:", repo)) {
+                    matched.push((ts.clone(), id.clone()));
+                }
+            }
+            _ => {} // inspect 失败视为不匹配（继续遍历）
+        }
     }
-    let repo_digests = String::from_utf8_lossy(&inspect.stdout);
-    if !repo_digests.contains(&format!("{}@sha256:", repo)) {
+    let id = if !matched.is_empty() {
+        matched.sort_by(|a, b| b.0.cmp(&a.0));
+        matched[0].1.clone()
+    } else if dangling.len() == 1 {
+        dangling[0].1.clone()
+    } else {
         return Err(AppError::msg(format!(
-            "镜像 {} 拉取后 tag 校验失败：本地最新 dangling 镜像 {} 不属于 {}（请手动 docker pull {} 或将 docker rmi 清理无关镜像后重试）",
-            image, id, repo, image
+            "镜像 {} 拉取后 tag 校验失败：本地有 {} 个 untagged 镜像且均不属于 {}，无法安全修正（请手动 docker pull {} 或将 docker rmi 清理无关镜像后重试）",
+            image,
+            dangling.len(),
+            repo,
+            image
         )));
-    }
+    };
 
     let tag = crate::common::utils::platform::docker_cmd_tokio()
         .args(["tag", &id, image])
@@ -1042,7 +1057,7 @@ async fn ensure_image_tag(
             String::from_utf8_lossy(&tag.stderr).trim()
         )));
     }
-    // 3. 最终确认
+    // 4. 最终确认
     if docker_image_exists(app, model_id, image).await? {
         log(format!("[Docker] 镜像 {} 拉取后为 untagged，已从 {} 修正 tag 为 {}", image, id, image));
         return Ok(());
