@@ -120,43 +120,78 @@
         "support_images": false
     },
     {
-        "model_id": "Ornith-1.5-35B-A3B",
+        "model_id": "GLM-5.3-Flash",
         "model_download_files": [
-            "https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-FP8/resolve/main/model-00001-of-00016.safetensors",
-            "https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-FP8/resolve/main/chat_template.jinja",
-            "https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-FP8/resolve/main/config.json",
-            "https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-FP8/resolve/main/configuration.json",
-            "https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-FP8/resolve/main/generation_config.json",
-            "https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-FP8/resolve/main/model.safetensors.index.json",
-            "https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-FP8/resolve/main/tokenizer.json",
-            "https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-FP8/resolve/main/tokenizer_config.json",
-            "https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-FP8/resolve/main/video_preprocessor_config.json",
-            "https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-FP8/resolve/main/vocab.json",
-            "https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-FP8/resolve/main/processor_config.json"
+            "https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4/resolve/main/model-00001-of-00120.safetensors",
+            "https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4/resolve/main/chat_template.jinja",
+            "https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4/resolve/main/config.json",
+            "https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4/resolve/main/generation_config.json",
+            "https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4/resolve/main/model.safetensors.index.json",
+            "https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4/resolve/main/tokenizer.json",
+            "https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4/resolve/main/tokenizer_config.json",
+            "https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4/resolve/main/processor_config.json"
         ],
         "model_support_devices": ["dgx-spark-128G"],
-        "vllm_image": "ghcr.io/spark-arena/dgx-vllm-eugr-nightly-b12x:2026082301",
+        "vllm_image": "vllm/vllm-openai:glm53-flash-arm64-cu130",
         "vllm_flags": [
-            "--max-model-len 262144",
-            "--max-num-batched-tokens 16384",
-            "--gpu-memory-utilization 0.8",
+            "--tool-call-parser glm47",
+            "--reasoning-parser glm45",
             "--enable-auto-tool-choice",
-            "--tool-call-parser qwen3_xml",
-            "--reasoning-parser qwen3",
-            "--kv-cache-dtype fp8",
-            "--load-format fastsafetensors",
-            "--attention-backend flashinfer",
-            "--enable-prefix-caching",
-            "--max-num-seqs 10"
+            "--speculative-config {\"method\":\"mtp\",\"num_speculative_tokens\":5}",
+            "--default-chat-template-kwargs.thinking true",
+            "--max-model-len 128000",
+            "--max-num-seqs 8",
+            "--max-num-batched-tokens 8192",
+            "--gpu-memory-utilization 0.8",
+            "--load-format safetensors",
+            "--safetensors-load-strategy lazy",
+            "--max-parallel-loading-workers 2",
+            "--kv-cache-dtype bfloat16"
         ],
         "vllm_env": [
-            "VLLM_MARLIN_USE_ATOMIC_ADD=1"
+            "CUTE_DSL_ARCH=sm_121a",
+            "VLLM_MEMORY_PROFILE_INCLUDE_ATTN=1"
         ],
-        "model_size": "39.4 GB",
+        "model_size": "195 GB",
         "model_type": "多模态",
-        "model_description": "Ornith-1.5-35B-A3B-FP8 ，支持对话/推理/工具调用",
+        "model_description": "NVFP4量化 + 多模态",
         "support_tools": true,
         "support_reasoning": true,
         "support_images": true
+    },
+    {
+        "model_id": "Qwen3.8-Flash-Next",
+        "model_download_files": [
+            "1"
+        ],
+        "model_support_devices": ["dgx-spark-128G"],
+        "vllm_image": "vllm-qwen38-fn-ple:20260828",
+        "vllm_flags": [
+            "--enable-expert-parallel",
+            "--all2all-backend allgather_reducescatter",
+            "--load-format safetensors",
+            "--safetensors-load-strategy lazy",
+            "--max-model-len 262144",
+            "--max-num-seqs 8",
+            "--max-num-batched-tokens 8192",
+            "--gpu-memory-utilization 0.80",
+            "--enable-chunked-prefill",
+            "--speculative-config {\"method\":\"mtp\",\"num_speculative_tokens\":3}",
+            "--compilation-config {\"mode\":0,\"cudagraph_mode\":\"FULL_DECODE_ONLY\"}",
+            "--reasoning-parser qwen3",
+            "--enable-auto-tool-choice",
+            "--tool-call-parser qwen3_coder"
+        ],
+        "vllm_env": [
+            "PLE_FORCE_FP8=1",
+            "HF_HUB_OFFLINE=1",
+            "TRANSFORMERS_OFFLINE=1"
+        ],
+        "model_size": "126 GB",
+        "model_type": "纯文本",
+        "model_description": "Qwen3.8-Flash-Next NVFP4量化 + MTP3投机解码，支持对话/推理/工具调用",
+        "support_tools": true,
+        "support_reasoning": true,
+        "support_images": false
     }
 ]
