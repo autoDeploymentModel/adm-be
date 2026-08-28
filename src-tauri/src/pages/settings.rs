@@ -888,7 +888,8 @@ pub async fn push_image_to_remote(
     let mut synced = 0usize;
     let mut skipped = 0usize;
     for image in &images {
-        // 远端已存在该镜像则跳过
+        // 远端已存在该镜像则跳过——但必须比对 Image ID：同名 tag 内容可能不同
+        //（本机重拉修正后远端仍是旧内容，如 sglang 占 tag 事故），不一致必须强制重推。
         let chk_remote = format!(
             "(sudo -n docker image inspect {} >/dev/null 2>&1 || docker image inspect {} >/dev/null 2>&1) && echo IMAGE_OK || echo IMAGE_MISSING",
             crate::common::ssh::sh_quote(image),
@@ -898,8 +899,27 @@ pub async fn push_image_to_remote(
             &ip, &user, ssh_port, key_ref, &chk_remote, std::time::Duration::from_secs(15),
         ).await?;
         if iok && iout.contains("IMAGE_OK") {
-            skipped += 1;
-            continue;
+            let mut local_id = String::new();
+            let id_cmd = format!("{} image inspect --format '{{{{.Id}}}}' {}", dk, crate::common::ssh::sh_quote(image));
+            if let Ok(out) = tokio::process::Command::new("sh").arg("-c").arg(&id_cmd).output().await {
+                if out.status.success() {
+                    local_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                }
+            }
+            let rid_cmd = format!("{} image inspect --format '{{{{.Id}}}}' {}", rdk, crate::common::ssh::sh_quote(image));
+            let (ridok, ridout, _) = crate::common::ssh::ssh_run(
+                &ip, &user, ssh_port, key_ref, &rid_cmd, std::time::Duration::from_secs(15),
+            ).await?;
+            if !local_id.is_empty() && ridok && ridout.trim() == local_id {
+                skipped += 1;
+                continue;
+            }
+            // 同名但内容不一致（或无法校验）：继续走推送，远端 docker load 会覆盖同名 tag
+            crate::common::utils::logger::write_log(
+                "WARN",
+                "SYNC",
+                &format!("[{}] 远端已存在镜像 {} 但内容与本机不一致（远端 {} / 本机 {}），强制重新同步覆盖", ip, image, ridout.trim(), local_id),
+            );
         }
 
         // 本机镜像总大小（供 pv -s 显示总进度）
