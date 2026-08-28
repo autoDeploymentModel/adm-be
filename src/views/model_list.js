@@ -623,9 +623,9 @@ function renderModelTable() {
     } else if (downloadingProgress !== undefined) {
       downloadBtnHtml = '<button class="btn btn-download btn-cancel-download" data-model-id="' + safeModelId + '" data-cancel-btn="' + safeModelId + '" id="dl-' + safeModelId + '">' + _t("停止下载") + ' ' + downloadingProgress + '%</button>';
     } else if (partSize && partSize > 0) {
-      downloadBtnHtml = '<button class="btn btn-download" data-model-id="' + safeModelId + '" data-model-url="' + escapeHtml(model.model_url) + '"' + modelFilesAttr + modelImageAttr + ' id="dl-' + safeModelId + '">' + _t("继续下载") + '</button>';
+      downloadBtnHtml = '<button class="btn btn-download" data-model-id="' + safeModelId + '"' + modelFilesAttr + modelImageAttr + ' id="dl-' + safeModelId + '">' + _t("继续下载") + '</button>';
     } else if (available) {
-      downloadBtnHtml = '<button class="btn btn-download" data-model-id="' + safeModelId + '" data-model-url="' + escapeHtml(model.model_url) + '"' + modelFilesAttr + modelImageAttr + ' id="dl-' + safeModelId + '">' + _t("下载") + '</button>';
+      downloadBtnHtml = '<button class="btn btn-download" data-model-id="' + safeModelId + '"' + modelFilesAttr + modelImageAttr + ' id="dl-' + safeModelId + '">' + _t("下载") + '</button>';
     } else {
       downloadBtnHtml = '<button class="btn btn-download" disabled>' + _t("下载") + '</button>';
     }
@@ -716,8 +716,7 @@ function bindRowEvents() {
 
 async function handleDownload(btn) {
   const modelId = btn.dataset.modelId;
-  const modelUrl = btn.dataset.modelUrl;
-  console.log("[model_list] 开始下载模型:", modelId, "URL:", modelUrl);
+  console.log("[model_list] 开始下载模型:", modelId);
   const vllmImage = btn.dataset.modelImage || null;
   let modelFiles = null;
   if (btn.dataset.modelFiles) {
@@ -732,7 +731,7 @@ async function handleDownload(btn) {
   }
 
   try {
-    await invoke()("download_model", { modelId: modelId, modelUrl: modelUrl, modelFiles: modelFiles, vllmImage: vllmImage });
+    await invoke()("download_model", { modelId: modelId, modelFiles: modelFiles, vllmImage: vllmImage });
     console.log("[model_list] 下载模型 invoke 完成:", modelId);
   } catch (e) {
     console.error("[model_list] 下载失败:", e);
@@ -990,7 +989,9 @@ async function handleTauriEvent(type, payload) {
     }
     case "download-complete": {
       if (payload && payload.type === "image-pull-failed") {
-        showToast(_t("镜像拉取失败：") + (payload.image || "") + _t("；请检查网络或手动 docker pull，启动前需先补拉镜像"), true);
+        // error 优先（含缺配置/解析失败等具体原因），无 error 时回退镜像名
+        const reason = payload.error || payload.image || "";
+        showToast(_t("镜像拉取失败：") + reason + _t("；请检查网络或手动 docker pull，启动前需先补拉镜像"), true);
       }
       renderModelTable();
       break;

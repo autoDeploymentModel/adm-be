@@ -246,7 +246,6 @@ pub async fn fetch_model_list() -> Result<Vec<RemoteModel>, AppError> {
 pub async fn download_model(
     app: tauri::AppHandle,
     model_id: String,
-    model_url: String,
     model_files: Option<Vec<String>>,
     vllm_image: Option<String>,
 ) -> Result<(), AppError> {
@@ -256,6 +255,15 @@ pub async fn download_model(
         if map.contains_key(&model_id) {
             bail!("该模型正在下载中，请勿重复点击");
         }
+    }
+
+    // 下载清单校验提前到取消标志插入之前：清单缺失直接失败，
+    // 不在 download_cancel 表中留下无下载对应的死条目
+    if model_files.as_ref().map(|f| f.is_empty()).unwrap_or(true) {
+        bail!(
+            "模型 {} 缺少下载文件清单（model_download_files 必填），请检查远程 model.json 配置",
+            model_id
+        );
     }
 
     // 取消标志：前端 cancel_download 置位后，下载循环感知到即停止（保留 .part 续传）
@@ -272,9 +280,9 @@ pub async fn download_model(
     let model_dir = data_dir.join("models").join(&model_id);
     std::fs::create_dir_all(&model_dir).map_err(|e| format!("创建模型目录失败: {}", e))?;
 
-    // ===== 新格式：HF 仓库多文件目录下载（safetensors 模型） =====
+    // ===== HF 仓库多文件目录下载（safetensors 模型，唯一支持的格式） =====
     if let Some(files) = model_files {
-        if !files.is_empty() {
+        {
             // 分片 URL 已在 fetch_model_list 中展开，此处直接使用
             let total = files.len();
             app.state::<AppState>().downloading_progress.lock().unwrap_or_else(|e| e.into_inner()).insert(model_id.clone(), 0u8);
@@ -394,98 +402,71 @@ pub async fn download_model(
             // 全部文件下载完成：写 .done 标记（scan_local_models 排除）
             std::fs::write(model_dir.join(".done"), "").ok();
             // 模型文件下完 → 立刻发完成事件（前端立即显示「已下载」+ 启动按钮可点）。
-            // 镜像拉取后做（见下），启动时若镜像缺失由后端 `check_docker_env` 明确报错。
-            // 顺序倒过来会让用户在镜像拉取期间（5-30 min）一直看到 100% 卡住的下载按钮。
             app.emit(
                 "download-complete",
                 serde_json::json!({ "model_id": &model_id, "type": "model", "all": true }),
             ).ok();
-            // 后台拉取对应 vLLM 镜像：失败保留 .done，前端 toast 提示但不阻止后续手动 docker pull。
-            pull_image_if_configured(&app, &model_id, vllm_image.as_deref()).await;
+            // ===== 镜像策略：远程 model.json 的 vllm_image 字段唯一指定 =====
+            // 镜像名必须由后端重新拉取远程清单解析（与启动流程一致），不能依赖前端
+            // 卡片透传——远程配置更新后旧卡片透传值为空，会导致镜像被静默跳过，
+            // 最终启动时才报「镜像尚未下载」。下载前先 docker 检查，缺失才拉。
+            let resolved_image = resolve_vllm_image(&model_id, vllm_image.as_deref()).await;
+            if let Some(image) = resolved_image {
+                pull_image_if_configured(&app, &model_id, Some(&image)).await;
+            } else {
+                // 无法解析镜像名（远程清单拉取失败且无前端兜底，或清单缺 vllm_image 字段）：明确报错，不静默
+                let msg = format!(
+                    "[ERROR] 模型 {} 无法解析 vllm_image 配置（远程 model.json 必填字段，或远程清单拉取失败），镜像未拉取；请检查网络后重新点击「下载」触发",
+                    model_id
+                );
+                crate::common::utils::logger::write_log("ERROR", "DOWNLOAD", &msg);
+                app.emit(
+                    "model-log",
+                    serde_json::json!({
+                        "model_id": &model_id,
+                        "line": msg,
+                        "source": "stderr",
+                    }),
+                ).ok();
+                app.emit(
+                    "download-complete",
+                    serde_json::json!({
+                        "model_id": &model_id,
+                        "type": "image-pull-failed",
+                        "image": "",
+                        "error": "无法解析 vllm_image 配置（远程 model.json 必填字段，或远程清单拉取失败）",
+                    }),
+                ).ok();
+            }
             return Ok(());
         }
     }
 
-    // 镜像策略见 download_with_resume 的 MirrorPolicy（代理开启时直接源链接）
-    let model_filename = model_url
-        .rsplit('/')
-        .next()
-        .unwrap_or(&model_id)
-        .to_string();
-    let final_path = model_dir.join(&model_filename);
-    let part_path = model_dir.join(format!("{}.part", model_filename));
+    // model_url 旧格式单文件下载已废弃：新格式模型必须带 model_download_files
+    bail!(
+        "模型 {} 缺少下载文件清单（model_download_files 必填），请检查远程 model.json 配置",
+        model_id
+    );
+}
 
-    // 下载客户端：开启代理 → 挂代理 + Direct（源链接直下）；否则 hf-mirror 优先
-    let http = crate::common::utils::proxy::build_download_http(&app, None).await?;
-
-    app.state::<AppState>().downloading_progress.lock().unwrap_or_else(|e| e.into_inner()).insert(model_id.clone(), 0u8);
-
-    struct CleanupGuard {
-        h: tauri::AppHandle,
-        id: String,
+/// 从远程 model.json 解析指定模型的权威 `vllm_image`（与启动流程一致，镜像由远程唯一指定）。
+/// 远程拉取失败时回退到前端透传的 fallback；两者都没有返回 None。
+async fn resolve_vllm_image(model_id: &str, fallback: Option<&str>) -> Option<String> {
+    let from_fallback = || {
+        fallback
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    };
+    match fetch_model_list().await {
+        Ok(list) => list
+            .iter()
+            .find(|m| m.model_id == model_id)
+            .map(|m| m.vllm_image.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(from_fallback),
+        Err(_) => from_fallback(),
     }
-    impl Drop for CleanupGuard {
-        fn drop(&mut self) {
-            if let Ok(mut map) = self.h.state::<AppState>().downloading_progress.lock() {
-                map.remove(&self.id);
-            }
-            if let Ok(mut map) = self.h.state::<AppState>().downloading_phase.lock() {
-                map.remove(&self.id);
-            }
-            if let Ok(mut map) = self.h.state::<AppState>().download_cancel.lock() {
-                map.remove(&self.id);
-            }
-        }
-    }
-    let _guard = CleanupGuard { h: app.clone(), id: model_id.clone() };
-
-    // ===== 主模型文件下载 =====
-    {
-        let app_clone = app.clone();
-        let mid = model_id.clone();
-        // 实时下载速度（bytes/s），0.5s 窗口平滑
-        let part_existing = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
-        let speed_tracker = std::sync::Mutex::new(SpeedTracker::from_existing(part_existing));
-        match download_with_resume(
-            &http.client, &model_url, &final_path, &part_path, http.mirror_policy, Some(cancel_flag.clone()),
-            |progress, downloaded, total| {
-                let speed = {
-                    let mut st = speed_tracker.lock().unwrap_or_else(|e| e.into_inner());
-                    st.update(downloaded)
-                };
-                app_clone.emit(
-                    "download-progress",
-                    serde_json::json!({
-                        "model_id": &mid,
-                        "progress": progress,
-                        "speed": speed,
-                        "downloaded": downloaded,
-                        "total": total,
-                        "type": "model",
-                    }),
-                ).ok();
-                if let Ok(mut map) = app_clone.state::<AppState>().downloading_progress.lock() {
-                    map.insert(mid.clone(), progress);
-                }
-            },
-        ).await {
-            Ok(()) => {}
-            Err(e) if crate::common::utils::download::is_cancelled(&e) => {
-                app.emit(
-                    "download-cancelled",
-                    serde_json::json!({ "model_id": &model_id, "type": "model" }),
-                ).ok();
-                return Ok(());
-            }
-            Err(e) => return Err(e),
-        }
-        app.emit(
-            "download-complete",
-            serde_json::json!({ "model_id": &model_id, "type": "model" }),
-        ).ok();
-    }
-
-    Ok(())
 }
 
 /// 模型下载完成后拉取 vLLM 镜像（如果模型清单指定了 vllm_image）：
