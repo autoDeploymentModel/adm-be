@@ -413,10 +413,17 @@ async fn step2_iface(c: &Ctx) -> Result<(String, String), AppError> {
 
 // ===== Step3 固定 IP =====
 
+/// 生成 netplan yaml。addr 接受纯 IP（IP_A/IP_B 常量，如 192.168.177.11）或
+/// 已带 /prefixlength 的写法（容错：避免误传已带 prefix 的地址产生 //24）。
 fn netplan_yaml(iface: &str, addr: &str) -> String {
+    let addr_with_prefix = if addr.contains('/') {
+        addr.to_string()
+    } else {
+        format!("{}/24", addr)
+    };
     format!(
         "network:\n  version: 2\n  renderer: networkd\n  ethernets:\n    {}:\n      dhcp4: no\n      addresses: [{}]\n",
-        iface, addr
+        iface, addr_with_prefix
     )
 }
 
@@ -915,10 +922,20 @@ mod tests {
 
     #[test]
     fn netplan_yaml_shape() {
-        let y = netplan_yaml("enp1s0f1np1", "192.168.177.11/24");
+        // 传入纯 IP（与 IP_A/IP_B 常量一致），生成必须带 /24 prefix
+        let y = netplan_yaml("enp1s0f1np1", "192.168.177.11");
         assert!(y.contains("    enp1s0f1np1:"));
         assert!(y.contains("addresses: [192.168.177.11/24]"));
+        assert!(y.contains("dhcp4: no"));
         assert!(!y.contains("apply"));
+    }
+
+    #[test]
+    fn netplan_yaml_idempotent_on_already_prefixed() {
+        // 已带 prefix 不应产生 //24
+        let y = netplan_yaml("enp1s0f1np1", "192.168.177.11/24");
+        assert!(y.contains("addresses: [192.168.177.11/24]"));
+        assert!(!y.contains("//24"));
     }
 
     #[test]
