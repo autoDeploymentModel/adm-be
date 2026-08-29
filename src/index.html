@@ -193,6 +193,29 @@
       font-weight: 600;
     }
 
+    /* 全局提示 toast（壳层组件，如启动权限修复结果） */
+    #adm-global-toast {
+      position: fixed;
+      top: 24px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 10000;
+      background: var(--c-panel);
+      color: var(--c-text);
+      border: 1px solid var(--c-border-hi);
+      border-radius: 8px;
+      padding: 10px 18px;
+      font-size: 13px;
+      line-height: 1.5;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+      opacity: 0;
+      transition: opacity 0.3s;
+      pointer-events: none;
+      max-width: 80vw;
+      text-align: center;
+    }
+    #adm-global-toast.show { opacity: 1; }
+
     /* 更新弹窗样式 */
     #update-overlay {
       display: none;
@@ -617,6 +640,21 @@
       console.log("[index] init() 完成");
     }
 
+    // ===== 全局 toast：壳层通用提示（如启动权限修复结果） =====
+    let globalToastTimer = null;
+    function showGlobalToast(message) {
+      let el = document.getElementById("adm-global-toast");
+      if (!el) {
+        el = document.createElement("div");
+        el.id = "adm-global-toast";
+        document.body.appendChild(el);
+      }
+      el.textContent = message;
+      el.classList.add("show");
+      clearTimeout(globalToastTimer);
+      globalToastTimer = setTimeout(function() { el.classList.remove("show"); }, 6000);
+    }
+
     // ===== 全局事件监听（不随视图切换释放，保证切页后状态不丢） =====
     // 所有事件只更新 __adm_state，视图模块的 handleTauriEvent 只做 DOM 更新
     var st = window.__adm_state;
@@ -624,7 +662,7 @@
     st.downloadingModels = st.downloadingModels || {};
 
     if (typeof listen === "function") {
-      var globalEvents = ["download-progress", "download-complete", "download-cancelled", "download-error", "model-pull-progress", "model-started", "model-stopped", "model-error", "image-push-progress", "model-sync-progress", "dgx-zero-deploy"];
+      var globalEvents = ["download-progress", "download-complete", "download-cancelled", "download-error", "model-pull-progress", "model-started", "model-stopped", "model-error", "image-push-progress", "model-sync-progress", "dgx-zero-deploy", "sudo-permission-fixed"];
       globalEvents.forEach(function(ev) {
         listen(ev, function(event) {
           var p = event.payload || {};
@@ -675,6 +713,10 @@
             }
             case "model-error": {
               st.startingModelId = null;
+              break;
+            }
+            case "sudo-permission-fixed": {
+              showGlobalToast(t("已加入 docker 组，注销重新登录后重启 ADM-BE 即可免 sudo 执行 docker"));
               break;
             }
           }

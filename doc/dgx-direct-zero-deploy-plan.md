@@ -19,7 +19,7 @@
 | 0. 准备提示 | 展示直连线选购与插线规范（静态文案，非自动步骤） |
 | 1. 免密 SSH | A 生成 ed25519 密钥 → 用密码控制 B 生成密钥 → 互相拷贝公钥 |
 | 2. 光口探测 | `ibdev2netdev` 分别探测 A/B，确认插口方向一致，得到 Up 网卡名 |
-| 3. 固定 IP | 写 `/etc/netplan/40-cx7.yaml`（A=192.168.177.11/24，B=192.168.177.12/24）+ `nmcli managed no` + systemd-networkd 重启（**禁用 netplan apply**） |
+| 3. 固定 IP | 写 `/etc/netplan/40-cx7.yaml`（A=192.168.177.11/24，B=192.168.177.12/24，写入后 chmod 600）+ `nmcli managed no` + systemd-networkd 重启（**禁用 netplan apply**） |
 | 4. 连通检测 | 双向 ping + 双向免密 ssh（走光口 IP），失败弹错误提示 |
 | 5. Docker | 检测 A/B 是否安装；未装执行官方一键脚本 |
 | 6. 权限 | 当前用户加入 docker 组（免 sudo 执行 docker） |
@@ -162,8 +162,7 @@ A 本机：
               addresses: [192.168.177.1X/24]        # A=11, B=12
 
 每台设备依次执行（A 本机 sudo -S 喂 A 密码；B 经 ssh_pw_run + 远端 sudo -S 喂 B 密码）：
-  1. [ -f /etc/netplan/40-cx7.yaml ] && sudo cp /etc/netplan/40-cx7.yaml /etc/netplan/40-cx7.yaml.adm-bak-<ts>
-  2. 写新文件（sudo tee 覆盖；内容先本地生成再整体传输，避免逐行转义出错）
+  1. 写新文件（内容 base64 → /tmp → sudo cp 覆盖，不做备份——40-cx7.yaml 通常不存在或由本流程唯一管理；避开管道与 sudo stdin 冲突）+ sudo chmod 600（netplan / NVIDIA DGX Spark 要求 0600；cp 覆盖已存在文件会保留目标旧权限，首次部署则由 umask 决定——必须显式固化）
   3. sudo nmcli device set <iface> managed no
   4. sudo systemctl restart NetworkManager
   5. sudo systemctl daemon-reload
@@ -172,7 +171,7 @@ A 本机：
   8. 校验: ip -4 addr show <iface> | grep 192.168.177.1X/24 → 未出现则失败回滚
 ```
 - **特别说明（写进日志文案与文档）**：绝不执行 `netplan apply`（DGX-Spark 已知坑，报错）。配置生效靠**写入后先 `netplan generate`（仅生成 systemd-networkd 配置，不 apply、不接管接口）+ 重启 systemd-networkd**——只写 yaml 重启不生效（networkd 只读 `/run/systemd/network/` 生成文件）；回滚同样先 generate 再重启服务。
-- 回滚：`sudo cp 40-cx7.yaml.adm-bak-<ts> 40-cx7.yaml`（无备份则删文件）+ `sudo nmcli device set <iface> managed yes` + `sudo systemctl restart NetworkManager` + 重启 systemd-networkd。B 侧回滚同样经 ssh 执行（B 的 SSH 走管理网地址，不受光口配置影响，回滚必然可达）。
+- 回滚：`sudo rm -f 40-cx7.yaml`（无备份即删除，覆盖写回滚 = 清除本流程注入的配置）+ `sudo nmcli device set <iface> managed yes` + `sudo systemctl restart NetworkManager` + 重启 systemd-networkd（均先 `netplan generate`）。B 侧回滚同样经 ssh 执行（B 的 SSH 走管理网地址，不受光口配置影响，回滚必然可达）。
 
 ### Step 4 连通检测（走光口）
 ```

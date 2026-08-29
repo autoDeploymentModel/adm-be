@@ -96,6 +96,17 @@ pub fn run() {
         .setup(|app| {
             crate::common::utils::logger::init();
 
+            // ===== 启动权限预检（Linux）：免密 sudo / docker 组缺失时自动弹 pkexec 修复 =====
+            #[cfg(not(target_os = "windows"))]
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    // 延迟 3 秒：等待桌面会话与 polkit 认证代理就绪（与更新检查一致）
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    crate::common::utils::platform::startup_ensure_docker_permission(handle).await;
+                });
+            }
+
             // ===== 系统托盘 =====
             let show_item = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "退出 ADM-BE", true, None::<&str>)?;

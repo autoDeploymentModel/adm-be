@@ -1,6 +1,6 @@
 // ===== DGX-Spark 双机直连 · 一键从零部署（A 控制机 / B 对等节点）=====
 //
-// 流程（7 步，每步幂等：先检测 → 已满足跳过；先备份 → 失败自动回滚）：
+// 流程（7 步，每步幂等：先检测 → 已满足跳过；失败自动回滚）：
 //   1. 免密 SSH：A 本机生成 ed25519 → 密码控制 B 生成 ed25519 → 公钥互拷 → 验证 A→B 免密
 //   2. 光口探测：A/B 各自 ibdev2netdev，确认两侧插口方向一致，得到 Up 网卡
 //   3. 固定 IP：/etc/netplan/40-cx7.yaml（A=192.168.177.11/24，B=192.168.177.12/24）
@@ -421,34 +421,25 @@ fn netplan_yaml(iface: &str, addr: &str) -> String {
 }
 
 /// 单台设备应用 netplan（is_a=true 走本机 sudo，false 走 B 远端 sudo）。
-/// 内部任一步失败 → 立即恢复这台设备原始网络状态并返回 Err。
+/// 内部任一步失败 → 立即回滚这台设备（删除配置 + 恢复网络服务）并返回 Err。
 async fn apply_netplan(c: &Ctx, is_a: bool, iface: &str, addr: &str) -> Result<(), AppError> {
     let who = if is_a { "A" } else { "B" };
     let pass = if is_a { &c.a_pass } else { &c.b_pass };
 
-    // 1) 备份现有配置
-    c.emit(3, "run", &format!("{}：备份现有 {}（如有）", who, NETPLAN_FILE));
-    let backup = format!(
-        "[ -f {} ] && echo '{}' | sudo -S -p '' cp -a {} {}.adm-bak-$(date +%s) || true",
-        NETPLAN_FILE,
-        sh_quote(pass),
-        NETPLAN_FILE,
-        NETPLAN_FILE
-    );
-    let (ok, _, err) = if is_a {
-        local_run(&backup, Duration::from_secs(30)).await?
-    } else {
-        remote_run(c, &backup, Duration::from_secs(30)).await?
-    };
-    if !ok {
-        return Err(AppError::msg(format!("{} 备份 netplan 失败: {}", who, err)));
-    }
-
-    // 2) 写入新配置（base64 传输 → /tmp → sudo cp，避开管道与 sudo stdin 冲突）
+    // 1) 直接写入新配置（不做备份：40-cx7.yaml 通常不存在或由本流程唯一管理，
+    //    回滚 = 删除文件 / 重新生成），base64 传输 → /tmp → sudo cp，
+    //    避开管道与 sudo stdin 冲突
+    //    显式 chmod 600：netplan / NVIDIA DGX Spark 均要求 0600；cp 覆盖已存在文件时
+    //    会保留目标旧权限（首次部署则由 umask 决定），必须手动固化
     c.emit(3, "run", &format!("{}：写入固定 IP {}（{}）", who, addr, iface));
     let write = format!(
-        "echo {} | base64 -d > /tmp/adm-netplan-40.yaml; echo '{}' | sudo -S -p '' cp /tmp/adm-netplan-40.yaml {}",
+        "echo {} | base64 -d > /tmp/adm-netplan-40.yaml && \
+         echo '{}' | sudo -S -p '' cp /tmp/adm-netplan-40.yaml {} && \
+         echo '{}' | sudo -S -p '' chmod 600 {} && \
+         rm -f /tmp/adm-netplan-40.yaml",
         sh_quote(&base64_of(&netplan_yaml(iface, addr))),
+        sh_quote(pass),
+        NETPLAN_FILE,
         sh_quote(pass),
         NETPLAN_FILE
     );
@@ -536,11 +527,11 @@ async fn apply_netplan(c: &Ctx, is_a: bool, iface: &str, addr: &str) -> Result<(
     Ok(())
 }
 
-/// 单台设备恢复网络配置（恢复备份/删除 + nmcli managed yes + 重启 NM/networkd）
+/// 单台设备回滚网络配置（删除本流程写入的 netplan 文件 + nmcli managed yes + 重启 NM/networkd）
 async fn restore_one(c: &Ctx, is_a: bool, iface: &str) {
     let pass = if is_a { &c.a_pass } else { &c.b_pass };
     let script = format!(
-        "if ls {f}.adm-bak-* >/dev/null 2>&1; then echo '{p}' | sudo -S -p '' cp -a $(ls -t {f}.adm-bak-* | head -1) {f}; else echo '{p}' | sudo -S -p '' rm -f {f}; fi; \
+        "echo '{p}' | sudo -S -p '' rm -f {f}; \
          echo '{p}' | sudo -S -p '' netplan generate || true; \
          echo '{p}' | sudo -S -p '' nmcli device set {ifc} managed yes || true; \
          echo '{p}' | sudo -S -p '' systemctl restart NetworkManager || true; \
@@ -585,7 +576,7 @@ async fn step3_netplan(c: &Ctx) -> Result<(), AppError> {
         true => c.emit(3, "run", &format!("A：{} 已包含 {}，跳过", NETPLAN_FILE, IP_A)),
         false => {
             if let Err(e) = apply_netplan(c, true, &c.iface_a, IP_A).await {
-                c.emit(3, "rollback", "A 配置失败，已恢复 A 原网络配置");
+                c.emit(3, "rollback", "A 固定 IP 配置失败，已回滚（删除 40-cx7.yaml 并恢复网络服务）");
                 return Err(e);
             }
             c.applied_a.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -595,7 +586,7 @@ async fn step3_netplan(c: &Ctx) -> Result<(), AppError> {
         true => c.emit(3, "run", &format!("B：{} 已包含 {}，跳过", NETPLAN_FILE, IP_B)),
         false => {
             if let Err(e) = apply_netplan(c, false, &c.iface_b, IP_B).await {
-                c.emit(3, "rollback", "B 配置失败，已恢复 B；同步恢复 A 原网络配置");
+                c.emit(3, "rollback", "B 固定 IP 配置失败，已回滚 B；同步回滚 A 固定 IP 配置");
                 // 仅恢复本部署应用过的 A（跳过=用户原有配置，不动）
                 if c.applied_a.load(std::sync::atomic::Ordering::Relaxed) {
                     restore_one(c, true, &c.iface_a).await;
@@ -660,7 +651,7 @@ async fn step4_ping(c: &Ctx) -> Result<(), AppError> {
 }
 
 async fn rollback_both(c: &Ctx) {
-    c.emit(4, "rollback", "直连校验失败，回滚 A/B 网络配置（恢复原状）");
+    c.emit(4, "rollback", "直连校验失败，回滚 A/B 固定 IP 配置（删除配置文件并恢复网络服务）");
     // 仅回滚本部署应用过的设备（跳过=用户原有配置，回滚会破坏原状）
     if c.applied_a.load(std::sync::atomic::Ordering::Relaxed) {
         restore_one(c, true, &c.iface_a).await;

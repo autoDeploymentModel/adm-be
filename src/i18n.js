@@ -41,6 +41,7 @@ const EN = {
   "该功能即将开放，敬请期待": "This feature is coming soon",
   "当前仅支持 Apple Silicon (M 系列) Mac": "Currently only supported on Apple Silicon (M-series) Macs",
   "未安装": "Not installed",
+  "已加入 docker 组，注销重新登录后重启 ADM-BE 即可免 sudo 执行 docker": "Added to the docker group; after logging out and back in, restart ADM-BE to use docker without sudo",
 
   // ===== settings.js =====
   "返回": "Back",

@@ -218,3 +218,91 @@ pub fn get_gpu_info() -> (u64, u64, bool) {
 
     (total_vram, used_vram, has_gpu)
 }
+
+/// Linux 启动权限预检 + 自动修复（幂等，由 lib.rs setup() 延迟 3 秒调用）：
+/// 1. 免密 sudo（sudo -n true）可用 → docker_cmd 自动加 sudo -n 前缀，无需处理
+/// 2. docker CLI 不存在 → 无修复意义（Docker 安装属于 DGX 直连部署流程）
+/// 3. docker info 可访问（用户已在 docker 组）→ 无需处理
+/// 4. docker info 因 socket 权限拒绝 → 弹 pkexec 系统密码框将当前用户加入 docker 组。
+///    成功后 emit "sudo-permission-fixed"（前端 toast 提示重新登录后免 sudo），不注销会话；
+///    用户取消/拒绝（pkexec 退出码 126/127）静默，60 秒超时防 polkitd/agent 异常挂起，
+///    其余失败仅记日志，设置页「权限修复」按钮仍可手动重试。
+#[cfg(not(target_os = "windows"))]
+pub async fn startup_ensure_docker_permission(app: tauri::AppHandle) {
+    use tauri::Emitter;
+
+    // 1) 免密 sudo 可用：后续 docker 命令自动走 sudo -n，无需干预
+    if sudo_available() {
+        return;
+    }
+
+    // 2) docker CLI 不存在：弹 usermod 加组无意义（Docker 安装属于 DGX 直连部署流程）
+    let cli_ok = std::process::Command::new("sh")
+        .args(["-c", "command -v docker >/dev/null 2>&1"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !cli_ok {
+        crate::dbg_log!("startup permission check: docker CLI not found, skip pkexec fix");
+        return;
+    }
+
+    // 3) 已在 docker 组可正常访问 daemon；仅 socket 权限拒绝时才需要加组
+    //    （daemon 未启动/未安装属另一类问题，弹加组框无意义）
+    match std::process::Command::new("docker").arg("info").output() {
+        Ok(o) if o.status.success() => return,
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr).to_lowercase();
+            if !err.contains("permission denied") {
+                crate::dbg_log!(
+                    "startup permission check: docker info failed without permission error: {}",
+                    err.trim()
+                );
+                return;
+            }
+        }
+        Err(e) => {
+            crate::dbg_log!("startup permission check: docker info spawn failed: {}", e);
+            return;
+        }
+    }
+
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_default();
+    if user.is_empty() {
+        crate::dbg_log!("startup permission check: USER/LOGNAME env unset, skip pkexec fix");
+        return;
+    }
+
+    // 4) pkexec 弹系统原生密码框执行修复（与设置页 fix_docker_permission 同一命令，幂等）。
+    //    pkexec 退出码语义：126 = 用户取消（Request dismissed），127 = 未授权（用户拒绝），
+    //    二者均属正常用户交互分支，静默；其余（polkitd 通信失败、无 agent 等）写日志便于排查。
+    //    kill_on_drop：超时后杀掉挂起的 pkexec，避免孤儿进程。
+    let pkexec = tokio::process::Command::new("pkexec")
+        .args(["usermod", "-aG", "docker", &user])
+        .kill_on_drop(true)
+        .output();
+    match tokio::time::timeout(std::time::Duration::from_secs(60), pkexec).await {
+        Ok(Ok(o)) if o.status.success() => {
+            let _ = app.emit("sudo-permission-fixed", serde_json::json!({ "user": user }));
+        }
+        Ok(Ok(o)) => {
+            let code = o.status.code().unwrap_or(-1);
+            let err_raw = String::from_utf8_lossy(&o.stderr);
+            let err = err_raw.to_lowercase();
+            let user_action = code == 126
+                || (code == 127
+                    && (err.contains("not authorized") || err.contains("incident has been reported")));
+            if !user_action {
+                crate::dbg_log!("startup pkexec usermod failed (exit {}): {}", code, err_raw.trim());
+            }
+        }
+        Ok(Err(e)) => {
+            crate::dbg_log!("pkexec unavailable: {}", e);
+        }
+        Err(_) => {
+            crate::dbg_log!("startup pkexec usermod timed out after 60s, process killed");
+        }
+    }
+}
