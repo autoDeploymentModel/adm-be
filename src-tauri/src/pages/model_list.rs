@@ -520,6 +520,7 @@ async fn hfd_download_repo(
 
     let _guard = DownloadCleanupGuard { h: app.clone(), id: model_id.to_string() };
     let script = ensure_hfd_script(app, model_id).await?;
+    ensure_aria2c(app, model_id).await?;
     let data_dir = config::get_data_dir(Some(app))?;
     let model_dir = data_dir.join("models").join(model_id);
 
@@ -600,16 +601,27 @@ async fn hfd_download_repo(
         tokio::spawn(async move {
             let mut lines = tokio::io::BufReader::new(stream).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                if line.is_empty() || line.contains('\r') {
-                    continue;
+                // wget/aria2 进度条以 \r 刷新同一行：按 \r 切段，丢弃含 % 的进度段，
+                // 保留普通消息/报错段（报错常嵌在 \r 流里，不能整行丢弃）
+                for seg in line.split('\r') {
+                    let seg = seg.trim();
+                    if seg.is_empty() || seg.contains('%') {
+                        continue;
+                    }
+                    let truncated: String = seg.chars().take(400).collect();
+                    // 后端直接落盘（不依赖前端事件转发），保证日志文件始终有 hfd 输出
+                    crate::common::utils::logger::write_log(
+                        if is_err { "WARN" } else { "INFO" },
+                        "DOWNLOAD",
+                        &format!("[{}] [hfd] {}", mid, truncated),
+                    );
+                    app_c
+                        .emit(
+                            "model-log",
+                            serde_json::json!({ "model_id": mid, "line": truncated, "source": source }),
+                        )
+                        .ok();
                 }
-                let truncated: String = line.chars().take(400).collect();
-                app_c
-                    .emit(
-                        "model-log",
-                        serde_json::json!({ "model_id": mid, "line": truncated, "source": source }),
-                    )
-                    .ok();
             }
         });
     }
@@ -685,6 +697,91 @@ async fn hfd_download_repo(
         ))),
         Err(e) => Err(AppError::msg(format!("hfd.sh 执行失败: {}", e))),
     }
+}
+
+/// 确保 aria2c 可用（hfd.sh 优先走 aria2c 多连接断点续传）。未安装时自动安装：
+/// 免密 `sudo -n` → 失败则 `pkexec` 弹系统密码框提权（对齐 settings.rs 镜像配置链路）。
+/// 两种方式都失败：本机有 wget → 警告后降级 wget 模式继续（hfd 自动回退）；
+/// wget 也缺 → 报错并附手动安装命令。
+async fn ensure_aria2c(app: &tauri::AppHandle, model_id: &str) -> Result<(), AppError> {
+    let log = |line: &str, source: &str| {
+        crate::common::utils::logger::write_log(
+            if source == "stderr" { "WARN" } else { "INFO" },
+            "DOWNLOAD",
+            &format!("[{}] [hfd] {}", model_id, line),
+        );
+        app.emit(
+            "model-log",
+            serde_json::json!({ "model_id": model_id, "line": line, "source": source }),
+        )
+        .ok();
+    };
+    let have = |cmd: &str| {
+        let cmd = cmd.to_string();
+        async move {
+            tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("command -v {} >/dev/null 2>&1", cmd))
+                .status()
+                .await
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+    };
+
+    if have("aria2c").await {
+        return Ok(());
+    }
+    log("检测到 aria2c 未安装，正在自动安装（需要系统密码）...", "stdout");
+
+    // 1) 免密 sudo；apt 索引缺失时先 update 再装
+    let install_cmd = "apt-get install -y aria2 || (apt-get update -y && apt-get install -y aria2)";
+    let sudo_ok = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "sudo -n sh -c {} 2>&1",
+            crate::common::ssh::sh_quote(install_cmd)
+        ))
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    // 2) 免密失败 → pkexec 弹窗提权（用户取消/未授权则视为失败）
+    if !sudo_ok {
+        log("免密 sudo 不可用，尝试通过系统授权窗口安装...", "stdout");
+        let out = tokio::process::Command::new("pkexec")
+            .args(["sh", "-c", install_cmd])
+            .output()
+            .await;
+        match out {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+                if stderr.contains("Not authorized")
+                    || stderr.contains("dismissed")
+                    || stderr.contains("cancel")
+                {
+                    log("系统授权窗口已取消，aria2c 未安装", "stderr");
+                } else {
+                    log(format!("aria2c 自动安装失败: {}", stderr.trim()).as_str(), "stderr");
+                }
+            }
+            Err(e) => log(format!("启动 pkexec 失败: {}", e).as_str(), "stderr"),
+        }
+    }
+
+    if have("aria2c").await {
+        log("aria2c 安装完成", "stdout");
+        return Ok(());
+    }
+    if have("wget").await {
+        log("无法安装 aria2c，将使用 wget 模式下载（不支持多连接，速度较慢）", "stderr");
+        return Ok(());
+    }
+    bail!(
+        "aria2c 与 wget 均未安装且自动安装失败；请手动执行：sudo apt-get update && sudo apt-get install -y aria2，然后重新点击下载"
+    );
 }
 
 /// hfd.sh 工具下载地址（hf-mirror 官方分发）
