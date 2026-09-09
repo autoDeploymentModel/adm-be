@@ -76,7 +76,8 @@ pub async fn scan_local_models(app: tauri::AppHandle) -> Result<Vec<LocalModel>,
                         if fp.is_file() {
                             if let Some(name) = fp.file_name() {
                                 let name_str = name.to_string_lossy().to_string();
-                                if !name_str.ends_with(".part") && name_str != ".done" {
+                                // 跳过 hfd.sh 残留控件（.aria2）与点开头元数据（.done / .gitattributes 等）
+                                if !name_str.starts_with('.') && !name_str.ends_with(".part") && !name_str.ends_with(".aria2") {
                                     files.push(name_str);
                                 }
                             }
@@ -201,6 +202,41 @@ fn expand_shard_urls(url: &str) -> Vec<String> {
         .collect()
 }
 
+/// 下载退出清理：移除 downloading_progress / downloading_phase / download_cancel 状态
+/// （URL 清单与 hfd.sh 仓库下载两条路径共用，函数返回时统一触发）
+struct DownloadCleanupGuard {
+    h: tauri::AppHandle,
+    id: String,
+}
+
+impl Drop for DownloadCleanupGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.h.state::<AppState>().downloading_progress.lock() {
+            map.remove(&self.id);
+        }
+        if let Ok(mut map) = self.h.state::<AppState>().downloading_phase.lock() {
+            map.remove(&self.id);
+        }
+        if let Ok(mut map) = self.h.state::<AppState>().download_cancel.lock() {
+            map.remove(&self.id);
+        }
+    }
+}
+
+/// `model_download_files` 条目是否为 HF 仓库 ID（形如 `org/name`，非 URL）：
+/// hfd.sh 整仓下载格式，与完整文件 URL 清单格式互斥。
+fn is_hf_repo_id(entry: &str) -> bool {
+    if entry.starts_with("http://") || entry.starts_with("https://") {
+        return false;
+    }
+    match entry.split_once('/') {
+        Some((org, name)) => {
+            !org.is_empty() && !name.is_empty() && !org.contains('/') && !name.contains('/')
+        }
+        None => false,
+    }
+}
+
 #[tauri::command]
 pub async fn fetch_model_list() -> Result<Vec<RemoteModel>, AppError> {
     let client = reqwest::Client::builder()
@@ -232,7 +268,11 @@ pub async fn fetch_model_list() -> Result<Vec<RemoteModel>, AppError> {
         if m.model_download_files.is_empty() {
             continue;
         }
-        let expanded: Vec<String> = m.model_download_files.iter().flat_map(|u| expand_shard_urls(u)).collect();
+        let expanded: Vec<String> = m
+            .model_download_files
+            .iter()
+            .flat_map(|u| if is_hf_repo_id(u) { vec![u.clone()] } else { expand_shard_urls(u) })
+            .collect();
         let mut seen = std::collections::HashSet::new();
         m.model_download_files = expanded
             .into_iter()
@@ -283,29 +323,22 @@ pub async fn download_model(
 
     // ===== HF 仓库多文件目录下载（safetensors 模型，唯一支持的格式） =====
     if let Some(files) = model_files {
+        // 清单为 HF 仓库 ID（org/name）→ hfd.sh 整仓下载
+        if files.iter().all(|f| is_hf_repo_id(f)) {
+            return hfd_download_repo(&app, &model_id, files, vllm_image, cancel_flag).await;
+        }
+        if files.iter().any(|f| is_hf_repo_id(f)) {
+            bail!(
+                "模型 {} 的 model_download_files 混用了仓库 ID 与文件 URL 格式，请检查远程 model.json 配置",
+                model_id
+            );
+        }
         {
             // 分片 URL 已在 fetch_model_list 中展开，此处直接使用
             let total = files.len();
             app.state::<AppState>().downloading_progress.lock().unwrap_or_else(|e| e.into_inner()).insert(model_id.clone(), 0u8);
 
-            struct CleanupGuard2 {
-                h: tauri::AppHandle,
-                id: String,
-            }
-            impl Drop for CleanupGuard2 {
-                fn drop(&mut self) {
-                    if let Ok(mut map) = self.h.state::<AppState>().downloading_progress.lock() {
-                        map.remove(&self.id);
-                    }
-                    if let Ok(mut map) = self.h.state::<AppState>().downloading_phase.lock() {
-                        map.remove(&self.id);
-                    }
-                    if let Ok(mut map) = self.h.state::<AppState>().download_cancel.lock() {
-                        map.remove(&self.id);
-                    }
-                }
-            }
-            let _guard = CleanupGuard2 { h: app.clone(), id: model_id.clone() };
+            let _guard = DownloadCleanupGuard { h: app.clone(), id: model_id.clone() };
 
             // 下载客户端：开启代理 → 挂代理 + Direct（源链接直下）；否则 hf-mirror 优先
             let http = crate::common::utils::proxy::build_download_http(&app, None).await?;
@@ -400,51 +433,8 @@ pub async fn download_model(
                 // 全部完成时集中发一次带 all=true 的完成事件。
             }
 
-            // 全部文件下载完成：写 .done 标记（scan_local_models 排除）
-            std::fs::write(model_dir.join(".done"), "").ok();
-            // 模型文件下完 → 立刻发完成事件（前端立即显示「已下载」+ 启动按钮可点）。
-            app.emit(
-                "download-complete",
-                serde_json::json!({ "model_id": &model_id, "type": "model", "all": true }),
-            ).ok();
-            // 镜像拉取阶段记入 downloading_phase（CleanupGuard2 函数返回时清理）：
-            // start_model 据此拒绝并发启动，避免「已下载后点击启动」与下载阶段的后台
-            // 拉镜并发执行 docker pull（同一镜像双 pull）。
-            if let Ok(mut map) = app.state::<AppState>().downloading_phase.lock() {
-                map.insert(model_id.clone(), "<pull-image>".to_string());
-            }
-            // ===== 镜像策略：远程 model.json 的 vllm_image 字段唯一指定 =====
-            // 镜像名必须由后端重新拉取远程清单解析（与启动流程一致），不能依赖前端
-            // 卡片透传——远程配置更新后旧卡片透传值为空，会导致镜像被静默跳过，
-            // 最终启动时才报「镜像尚未下载」。下载前先 docker 检查，缺失才拉。
-            let resolved_image = resolve_vllm_image(&model_id, vllm_image.as_deref()).await;
-            if let Some(image) = resolved_image {
-                pull_image_if_configured(&app, &model_id, Some(&image)).await;
-            } else {
-                // 无法解析镜像名（远程清单拉取失败且无前端兜底，或清单缺 vllm_image 字段）：明确报错，不静默
-                let msg = format!(
-                    "[ERROR] 模型 {} 无法解析 vllm_image 配置（远程 model.json 必填字段，或远程清单拉取失败），镜像未拉取；请检查网络后重新点击「下载」触发",
-                    model_id
-                );
-                crate::common::utils::logger::write_log("ERROR", "DOWNLOAD", &msg);
-                app.emit(
-                    "model-log",
-                    serde_json::json!({
-                        "model_id": &model_id,
-                        "line": msg,
-                        "source": "stderr",
-                    }),
-                ).ok();
-                app.emit(
-                    "download-complete",
-                    serde_json::json!({
-                        "model_id": &model_id,
-                        "type": "image-pull-failed",
-                        "image": "",
-                        "error": "无法解析 vllm_image 配置（远程 model.json 必填字段，或远程清单拉取失败）",
-                    }),
-                ).ok();
-            }
+            // 全部文件下载完成：写 .done + 发完成事件 + 拉取 vLLM 镜像（与 hfd.sh 路径共用）
+            finish_model_download(&app, &model_id, &model_dir, vllm_image).await;
             return Ok(());
         }
     }
@@ -454,6 +444,408 @@ pub async fn download_model(
         "模型 {} 缺少下载文件清单（model_download_files 必填），请检查远程 model.json 配置",
         model_id
     );
+}
+
+/// 下载成功收尾（URL 清单与 hfd.sh 仓库下载两条路径共用）：
+/// 写 .done 标记（scan_local_models 排除）→ 立刻发 download-complete(all)
+/// （前端立即显示「已下载」+ 启动按钮可点）→ 进入镜像拉取阶段（downloading_phase 记
+/// `<pull-image>`，start_model 据此拒绝并发启动，避免与后台拉镜并发 docker pull）
+/// 并拉取 vLLM 镜像（镜像策略：远程 model.json 的 vllm_image 字段唯一指定）。
+async fn finish_model_download(
+    app: &tauri::AppHandle,
+    model_id: &str,
+    model_dir: &std::path::Path,
+    vllm_image: Option<String>,
+) {
+    std::fs::write(model_dir.join(".done"), "").ok();
+    app.emit(
+        "download-complete",
+        serde_json::json!({ "model_id": model_id, "type": "model", "all": true }),
+    )
+    .ok();
+    if let Ok(mut map) = app.state::<AppState>().downloading_phase.lock() {
+        map.insert(model_id.to_string(), "<pull-image>".to_string());
+    }
+    // 镜像名必须由后端重新拉取远程清单解析（与启动流程一致），不能依赖前端卡片透传——
+    // 远程配置更新后旧卡片透传值为空，会导致镜像被静默跳过，最终启动时才报「镜像尚未下载」。
+    let resolved_image = resolve_vllm_image(model_id, vllm_image.as_deref()).await;
+    if let Some(image) = resolved_image {
+        pull_image_if_configured(app, model_id, Some(&image)).await;
+    } else {
+        // 无法解析镜像名（远程清单拉取失败且无前端兜底，或清单缺 vllm_image 字段）：明确报错，不静默
+        let msg = format!(
+            "[ERROR] 模型 {} 无法解析 vllm_image 配置（远程 model.json 必填字段，或远程清单拉取失败），镜像未拉取；请检查网络后重新点击「下载」触发",
+            model_id
+        );
+        crate::common::utils::logger::write_log("ERROR", "DOWNLOAD", &msg);
+        app.emit(
+            "model-log",
+            serde_json::json!({
+                "model_id": model_id,
+                "line": msg,
+                "source": "stderr",
+            }),
+        )
+        .ok();
+        app.emit(
+            "download-complete",
+            serde_json::json!({
+                "model_id": model_id,
+                "type": "image-pull-failed",
+                "image": "",
+                "error": "无法解析 vllm_image 配置（远程 model.json 必填字段，或远程清单拉取失败）",
+            }),
+        )
+        .ok();
+    }
+}
+
+/// HF 仓库 ID 清单（如 `local-inference-lab/GLM-5.3-Flash-NVFP4-Spark`）→ hfd.sh 整仓下载：
+/// 1. 确保 `<data>/hfd.sh` 工具就绪（首次从 hf-mirror 下载，chmod 755，全局复用）；
+/// 2. 端点策略与 URL 清单一致：未配代理 → `HF_ENDPOINT=https://hf-mirror.com`；
+///    配了代理 → hfd 默认源（huggingface.co）+ 注入代理 env；
+/// 3. `bash hfd.sh <repo> --local-dir <models>/<id>`，stdout/stderr 常规行转发 model-log
+///    （wget/aria2 进度条行内含 `\r`，跳过避免刷屏）；
+/// 4. 每 2s 轮询模型目录 + HF API 文件清单折算进度/速度；
+/// 5. 取消：cancel_flag 置位 → 杀整个进程组（bash + aria2c/wget），发 download-cancelled；
+/// 6. 成功：finish_model_download 写 .done + 发完成事件 + 拉取 vLLM 镜像。
+async fn hfd_download_repo(
+    app: &tauri::AppHandle,
+    model_id: &str,
+    repos: Vec<String>,
+    vllm_image: Option<String>,
+    cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), AppError> {
+    use tokio::io::AsyncBufReadExt;
+
+    let _guard = DownloadCleanupGuard { h: app.clone(), id: model_id.to_string() };
+    let script = ensure_hfd_script(app, model_id).await?;
+    let data_dir = config::get_data_dir(Some(app))?;
+    let model_dir = data_dir.join("models").join(model_id);
+
+    app.state::<AppState>()
+        .downloading_progress
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(model_id.to_string(), 0u8);
+    if let Ok(mut map) = app.state::<AppState>().downloading_phase.lock() {
+        map.insert(model_id.to_string(), repos[0].clone());
+    }
+    app.emit(
+        "download-progress",
+        serde_json::json!({ "model_id": model_id, "progress": 0u8, "file": &repos[0], "type": "model" }),
+    )
+    .ok();
+
+    // 端点策略与 URL 清单一致：未配代理 → hf-mirror；配代理 → hfd 默认源 + 代理 env
+    let proxy = crate::common::utils::proxy::proxy_url(app).await;
+    let endpoint = if proxy.is_empty() {
+        "https://hf-mirror.com".to_string()
+    } else {
+        String::new()
+    };
+
+    // 进度基准：仓库文件清单（含大小）；拉取失败则退化为纯日志跟随（进度停在 0%）
+    let http = crate::common::utils::proxy::build_download_http(
+        app,
+        Some(std::time::Duration::from_secs(60)),
+    )
+    .await?;
+    let repo_files = if repos.len() == 1 {
+        fetch_repo_files(
+            &http.client,
+            if endpoint.is_empty() { "https://huggingface.co" } else { &endpoint },
+            &repos[0],
+        )
+        .await
+    } else {
+        None
+    };
+
+    let mut cmd = tokio::process::Command::new("bash");
+    cmd.arg(&script);
+    for r in &repos {
+        cmd.arg(r);
+    }
+    cmd.arg("--local-dir").arg(&model_dir);
+    if !endpoint.is_empty() {
+        cmd.env("HF_ENDPOINT", &endpoint);
+    }
+    if !proxy.is_empty() {
+        cmd.env("http_proxy", &proxy).env("https_proxy", &proxy).env("all_proxy", &proxy);
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // 早退（如等待异常）时杀掉子进程，防孤儿 hfd.sh 继续写文件
+    cmd.kill_on_drop(true);
+    // 进程组隔离：pgid == bash pid，取消时 kill -<pgid> 可连带终止 aria2c/wget 子进程
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| AppError::msg(format!("启动 hfd.sh 失败: {}", e)))?;
+    let pid = child.id().unwrap_or(0);
+
+    for is_err in [false, true] {
+        let stream = if is_err {
+            child.stderr.take().map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>)
+        } else {
+            child.stdout.take().map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>)
+        };
+        let Some(stream) = stream else { continue };
+        let app_c = app.clone();
+        let mid = model_id.to_string();
+        let source = if is_err { "stderr" } else { "stdout" };
+        tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(stream).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.is_empty() || line.contains('\r') {
+                    continue;
+                }
+                let truncated: String = line.chars().take(400).collect();
+                app_c
+                    .emit(
+                        "model-log",
+                        serde_json::json!({ "model_id": mid, "line": truncated, "source": source }),
+                    )
+                    .ok();
+            }
+        });
+    }
+
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _ = tx.send(child.wait().await);
+    });
+
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+    ticker.tick().await;
+
+    let mut tracker = SpeedTracker::from_existing(0);
+    let mut last_progress = 0u8;
+    let mut last_speed = 0u64;
+    let status = loop {
+        tokio::select! {
+            st = &mut rx => {
+                break st.map_err(|e| AppError::msg(format!("等待 hfd.sh 退出失败: {}", e)))?;
+            }
+            _ = ticker.tick() => {
+                if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    kill_hfd_process_group(pid, false);
+                    // TERM 后留宽限期再 KILL：确保 aria2c/wget 不残留（防孤儿进程与重下双写竞争）
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    kill_hfd_process_group(pid, true);
+                    app.emit(
+                        "download-cancelled",
+                        serde_json::json!({ "model_id": model_id, "type": "model" }),
+                    )
+                    .ok();
+                    return Ok(());
+                }
+                if let Some(files) = &repo_files {
+                    let (overall, bytes, cur_file) = hfd_poll_progress(&model_dir, files);
+                    let speed = tracker.update(bytes);
+                    if let Some(f) = &cur_file {
+                        if let Ok(mut map) = app.state::<AppState>().downloading_phase.lock() {
+                            map.insert(model_id.to_string(), f.clone());
+                        }
+                    }
+                    if overall != last_progress || speed != last_speed {
+                        last_progress = overall;
+                        last_speed = speed;
+                        if let Ok(mut map) = app.state::<AppState>().downloading_progress.lock() {
+                            map.insert(model_id.to_string(), overall);
+                        }
+                        app.emit(
+                            "download-progress",
+                            serde_json::json!({
+                                "model_id": model_id,
+                                "progress": overall,
+                                "speed": speed,
+                                "file": cur_file.unwrap_or_default(),
+                                "type": "model",
+                            }),
+                        )
+                        .ok();
+                    }
+                }
+            }
+        }
+    };
+
+    match status {
+        Ok(st) if st.success() => {
+            finish_model_download(app, model_id, &model_dir, vllm_image).await;
+            Ok(())
+        }
+        Ok(st) => Err(AppError::msg(format!(
+            "hfd.sh 下载失败（退出码 {:?}），详见模型日志",
+            st.code()
+        ))),
+        Err(e) => Err(AppError::msg(format!("hfd.sh 执行失败: {}", e))),
+    }
+}
+
+/// hfd.sh 工具下载地址（hf-mirror 官方分发）
+const HFD_SCRIPT_URL: &str = "https://hf-mirror.com/hfd/hfd.sh";
+
+/// 确保 hfd.sh 工具就绪：`<data>/hfd.sh` 不存在时从 hf-mirror 下载（代理感知）并 chmod 755。
+/// 工具全局复用，所有模型的整仓下载共用同一份脚本。
+async fn ensure_hfd_script(app: &tauri::AppHandle, model_id: &str) -> Result<std::path::PathBuf, AppError> {
+    let data_dir = config::get_data_dir(Some(app))?;
+    let script = data_dir.join("hfd.sh");
+    if script.exists() {
+        return Ok(script);
+    }
+    let http = crate::common::utils::proxy::build_download_http(
+        app,
+        Some(std::time::Duration::from_secs(60)),
+    )
+    .await?;
+    app.emit(
+        "model-log",
+        serde_json::json!({
+            "model_id": model_id,
+            "line": "[hfd] 首次使用，正在下载 hfd.sh 工具...",
+            "source": "stdout",
+        }),
+    )
+    .ok();
+    let resp = http
+        .client
+        .get(HFD_SCRIPT_URL)
+        .send()
+        .await
+        .map_err(|e| AppError::msg(format!("下载 hfd.sh 失败: {}", e)))?;
+    if !resp.status().is_success() {
+        bail!("下载 hfd.sh 失败: 服务器返回 {}", resp.status());
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| AppError::msg(format!("读取 hfd.sh 内容失败: {}", e)))?;
+    std::fs::write(&script, &bytes).map_err(|e| AppError::msg(format!("写入 hfd.sh 失败: {}", e)))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
+    }
+    Ok(script)
+}
+
+/// 拉取 HF 仓库文件清单（`/api/models/<repo>?blobs=true`，含文件大小）作为进度基准。
+/// 点开头元数据（.gitattributes 等）不计入。失败返回 None（进度退化为不更新，仅日志跟随）。
+async fn fetch_repo_files(
+    client: &reqwest::Client,
+    endpoint: &str,
+    repo: &str,
+) -> Option<Vec<(String, u64)>> {
+    let url = format!("{}/api/models/{}?blobs=true", endpoint.trim_end_matches('/'), repo);
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: serde_json::Value = resp.json().await.ok()?;
+    let siblings = v.get("siblings")?.as_array()?;
+    Some(
+        siblings
+            .iter()
+            .filter_map(|s| {
+                let name = s.get("rfilename")?.as_str()?.to_string();
+                if name.starts_with('.') {
+                    return None;
+                }
+                let size = s.get("size").and_then(|x| x.as_u64()).unwrap_or(0);
+                Some((name, size))
+            })
+            .collect(),
+    )
+}
+
+/// 轮询模型目录折算下载进度（递归扫 depth ≤ 3 子目录，仓库含文件夹时进度仍可折算）：
+/// 已完成 = 文件在且无对应 `.aria2` 控件且（大小未知或已到齐）——aria2 预分配会导致
+/// 未完成文件长度等于全量，必须以 `.aria2` 控件存在性为准；wget 模式无控件，按
+/// 长度 < 预期大小判断未完成并折算小数进度。返回 (总进度百分比, 已落盘字节, 进行中文件名)。
+fn hfd_poll_progress(model_dir: &std::path::Path, files: &[(String, u64)]) -> (u8, u64, Option<String>) {
+    let mut present: Vec<(String, u64)> = Vec::new();
+    hfd_scan_dir(model_dir, "", 3, &mut present);
+    let lens: std::collections::HashMap<&str, u64> =
+        present.iter().map(|(n, l)| (n.as_str(), *l)).collect();
+    let mut done = 0usize;
+    let mut bytes = 0u64;
+    let mut frac = 0f32;
+    let mut cur: Option<(String, u64)> = None;
+    for (name, size) in files {
+        let len = lens.get(name.as_str()).copied();
+        let aria2 = model_dir.join(format!("{}.aria2", name)).exists();
+        match len {
+            Some(l) if !aria2 && (*size == 0 || l >= *size) => {
+                done += 1;
+                bytes += l;
+            }
+            Some(l) => {
+                // aria2 预分配使文件长度不代表真实进度，不计入速度累计
+                if !aria2 {
+                    bytes += l;
+                    if *size > 0 {
+                        frac += (l as f32 / *size as f32).min(1.0);
+                    }
+                }
+                if cur.as_ref().map(|(_, cl)| l > *cl).unwrap_or(true) {
+                    cur = Some((name.clone(), l));
+                }
+            }
+            None => {}
+        }
+    }
+    let total = files.len().max(1);
+    let overall = (((done as f32 + frac) * 100.0 / total as f32).min(99.0)) as u8;
+    (overall, bytes, cur.map(|c| c.0))
+}
+
+/// 递归收集 dir 下相对路径文件（跳过点开头/`.aria2` 控件外的中间产物已由调用方过滤）
+fn hfd_scan_dir(dir: &std::path::Path, prefix: &str, depth: usize, out: &mut Vec<(String, u64)>) {
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let rel = if prefix.is_empty() { name } else { format!("{}/{}", prefix, name) };
+        let p = e.path();
+        if p.is_dir() {
+            hfd_scan_dir(&p, &rel, depth - 1, out);
+        } else if let Ok(m) = e.metadata() {
+            out.push((rel, m.len()));
+        }
+    }
+}
+
+/// 终止 hfd.sh 进程组（process_group(0) → pgid == bash pid，aria2c/wget 同组一并终止）。
+/// force=false 发 TERM，true 发 KILL；pid==0 时不动（kill -0 会命中调用方进程组，绝对禁止）。
+fn kill_hfd_process_group(pid: u32, force: bool) {
+    if pid == 0 {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        let sig = if force { "-KILL" } else { "-TERM" };
+        let _ = std::process::Command::new("kill")
+            .arg(sig)
+            .arg(format!("-{}", pid))
+            .status();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = force;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status();
+    }
 }
 
 /// 从远程 model.json 解析指定模型的权威 `vllm_image`（与启动流程一致，镜像由远程唯一指定）。

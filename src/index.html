@@ -679,9 +679,18 @@
                 var model = (st.modelList || []).find(function(m) { return m.model_id === mid; });
                 var local = (st.localModels || []).find(function(m) { return m.model_id === mid; });
                 if (model && model.model_download_files) {
-                  var names = model.model_download_files.map(function(u) { return u.split('/').pop(); }).filter(Boolean);
-                  if (local) names.forEach(function(n) { if (!local.files.includes(n)) local.files.push(n); });
-                  else st.localModels.push({ model_id: mid, files: names });
+                  // HF 仓库 ID 格式（hfd.sh 整仓下载）：文件名不可预知，直接置 .done 标记
+                  if (model.model_download_files.every(function(e) {
+                    var parts = String(e).split('/');
+                    return !/^https?:/i.test(e) && parts.length === 2 && parts[0] && parts[1];
+                  })) {
+                    if (local) local.has_done = true;
+                    else st.localModels.push({ model_id: mid, files: [], has_done: true });
+                  } else {
+                    var names = model.model_download_files.map(function(u) { return u.split('/').pop(); }).filter(Boolean);
+                    if (local) names.forEach(function(n) { if (!local.files.includes(n)) local.files.push(n); });
+                    else st.localModels.push({ model_id: mid, files: names });
+                  }
                 }
               }
               delete st.partFiles[mid];

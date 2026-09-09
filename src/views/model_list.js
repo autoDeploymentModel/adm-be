@@ -502,6 +502,13 @@ function isModelAvailable(model) {
   return devices.length === 0 || devices.includes(dev);
 }
 
+// HF 仓库 ID 格式（如 local-inference-lab/GLM-5.3-Flash-NVFP4-Spark，hfd.sh 整仓下载）
+function isHfRepoId(entry) {
+  if (/^https?:/i.test(entry)) return false;
+  const parts = entry.split("/");
+  return parts.length === 2 && parts[0] && parts[1];
+}
+
 function isModelDownloaded(modelId) {
   const local = S().localModels.find(m => m.model_id === modelId);
   if (!local) return false;
@@ -510,6 +517,10 @@ function isModelDownloaded(modelId) {
   if (model && model.model_download_files && model.model_download_files.length > 0) {
     // 清单仅一条 "local"：手动放置并同步的本地模型，仅认 .done 标记
     if (model.model_download_files.length === 1 && model.model_download_files[0] === "local") {
+      return local.has_done === true;
+    }
+    // HF 仓库 ID 格式（hfd.sh 整仓下载）：本地文件名不可预知，以 .done 标记为准
+    if (model.model_download_files.every(isHfRepoId)) {
       return local.has_done === true;
     }
     return model.model_download_files.every(function(url) {

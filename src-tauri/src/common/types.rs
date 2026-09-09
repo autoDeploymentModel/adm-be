@@ -36,7 +36,7 @@ pub struct RemoteModel {
     /// 旧格式：单文件下载地址（GGUF），新格式模型为空
     #[serde(default)]
     pub model_url: String,
-    /// 新格式：HF 仓库多文件下载清单（safetensors 目录模型）
+    /// 下载清单：完整文件 URL（逐文件 `.part` 续传）或 HF 仓库 ID（形如 `org/name`，hfd.sh 整仓下载）
     #[serde(default)]
     pub model_download_files: Vec<String>,
     /// 适配机型列表（如 "dgx-spark-128G"）；空数组 = 所有机型可用
