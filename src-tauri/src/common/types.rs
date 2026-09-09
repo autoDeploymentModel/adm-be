@@ -211,17 +211,13 @@ fn default_true() -> bool {
 pub struct PlatformUpdate {
     #[serde(rename = "appUrl")]
     pub app_url: String,
-    pub content: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct UpdateInfo {
     pub version: String,
-    pub windows: Option<PlatformUpdate>,
-    #[serde(rename = "mac")]
-    pub mac_os: Option<PlatformUpdate>,
-    #[serde(rename = "linux")]
-    pub linux: Option<PlatformUpdate>,
+    #[serde(rename = "linux-arm64")]
+    pub linux_arm64: Option<PlatformUpdate>,
 }
 
 #[derive(Serialize, Clone)]

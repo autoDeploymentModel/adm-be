@@ -90,28 +90,29 @@ pub async fn check_update(app: tauri::AppHandle) -> Result<UpdateCheckResult, Ap
 
     let update_info = fetch_update_info().await?;
 
-    // Linux 无官方安装包更新通道（.deb 手动分发），一律不弹"发现新版本"，
+    // 目前仅提供 linux-arm64（.deb 手动分发）更新通道；
+    // 其他平台（Windows / macOS / Linux x64）一律不弹"发现新版本"，
     // 避免前端 openUrl('null') 打开无效下载链接。
-    #[cfg(target_os = "linux")]
-    let has_update = false;
-
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     let has_update =
         compare_versions(&current_version, &update_info.version) == std::cmp::Ordering::Less;
+
+    #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+    let has_update = false;
 
     let download_url;
     let changelog_url;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     {
-        download_url = None;
+        download_url = update_info.linux_arm64.as_ref().map(|p| p.app_url.clone());
         changelog_url = None;
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
     {
-        download_url = update_info.windows.as_ref().map(|p| p.app_url.clone());
-        changelog_url = update_info.windows.as_ref().map(|p| p.content.clone());
+        download_url = None;
+        changelog_url = None;
     }
 
     Ok(UpdateCheckResult {
