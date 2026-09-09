@@ -39,16 +39,13 @@ pub async fn load_settings(app: tauri::AppHandle) -> Result<Settings, AppError> 
     let data_dir = config::get_data_dir(Some(&app))?;
     let config_path = data_dir.join("config.json");
 
-    dbg_log!("load_settings: reading from {:?}", config_path);
     if !config_path.exists() {
         dbg_log!("load_settings: config.json not found, returning defaults");
         return Ok(Settings::default());
     }
 
     let json = std::fs::read_to_string(&config_path).map_err(|e| AppError::msg(format!("读取配置文件失败: {}", e)))?;
-    dbg_log!("load_settings raw json: {}", json);
     let settings: Settings = serde_json::from_str(&json).map_err(|e| AppError::msg(format!("解析配置文件失败: {}", e)))?;
-    dbg_log!("load_settings parsed: {:?}", settings);
 
     Ok(settings)
 }

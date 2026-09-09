@@ -2,12 +2,7 @@
     {
         "model_id": "DeepSeek-V4-Flash-0731",
         "model_download_files": [
-            "https://huggingface.co/MJPansa/DeepSeek-V4-Flash-0731-NVFP4/resolve/main/model-00001-of-00048.safetensors",
-            "https://huggingface.co/MJPansa/DeepSeek-V4-Flash-0731-NVFP4/resolve/main/config.json",
-            "https://huggingface.co/MJPansa/DeepSeek-V4-Flash-0731-NVFP4/resolve/main/generation_config.json",
-            "https://huggingface.co/MJPansa/DeepSeek-V4-Flash-0731-NVFP4/resolve/main/model.safetensors.index.json",
-            "https://huggingface.co/MJPansa/DeepSeek-V4-Flash-0731-NVFP4/resolve/main/tokenizer.json",
-            "https://huggingface.co/MJPansa/DeepSeek-V4-Flash-0731-NVFP4/resolve/main/tokenizer_config.json"
+            "MJPansa/DeepSeek-V4-Flash-0731-NVFP4"
         ],
         "model_support_devices": [
             "dgx-spark-128G"
@@ -25,13 +20,13 @@
             "--max-model-len 256000",
             "--max-num-seqs 8",
             "--max-num-batched-tokens 8192",
-            "--gpu-memory-utilization 0.85",
+            "--gpu-memory-utilization 0.81",
             "--enable-prefix-caching",
             "--moe-backend flashinfer_cutlass",
             "--linear-backend b12x",
             "--attention-backend B12X_MLA_SPARSE",
             "--max-cudagraph-capture-size 64",
-            "--speculative-config {\"method\":\"dspark\",\"num_speculative_tokens\":7,\"draft_sample_method\":\"probabilistic\",\"attention_backend\":\"B12X_MLA_SPARSE\"}",
+            "--speculative-config {\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_sample_method\":\"probabilistic\",\"attention_backend\":\"B12X_MLA_SPARSE\"}",
             "--hf-overrides {\"dspark_noise_token_id\":128799}",
             "--default-chat-template-kwargs.thinking true",
             "--default-chat-template-kwargs.reasoning_effort high",
@@ -63,12 +58,7 @@
     {
         "model_id": "DeepSeek-V4-Flash-0731-CRACK",
         "model_download_files": [
-            "https://huggingface.co/MJPansa/DeepSeek-V4-Flash-0731-NVFP4/resolve/main/model-00001-of-00048.safetensors",
-            "https://huggingface.co/MJPansa/DeepSeek-V4-Flash-0731-NVFP4/resolve/main/config.json",
-            "https://huggingface.co/MJPansa/DeepSeek-V4-Flash-0731-NVFP4/resolve/main/generation_config.json",
-            "https://huggingface.co/MJPansa/DeepSeek-V4-Flash-0731-NVFP4/resolve/main/model.safetensors.index.json",
-            "https://huggingface.co/MJPansa/DeepSeek-V4-Flash-0731-NVFP4/resolve/main/tokenizer.json",
-            "https://huggingface.co/MJPansa/DeepSeek-V4-Flash-0731-NVFP4/resolve/main/tokenizer_config.json"
+            "dealignai/DeepSeek-V4-Flash-0731-CRACK-NVFP4"
         ],
         "model_support_devices": [
             "dgx-spark-128G"
@@ -124,7 +114,14 @@
     {
         "model_id": "GLM-5.3-Flash",
         "model_download_files": [
-            "local-inference-lab/GLM-5.3-Flash-NVFP4-Spark"
+            "https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4/resolve/main/model-00001-of-00120.safetensors",
+            "https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4/resolve/main/chat_template.jinja",
+            "https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4/resolve/main/config.json",
+            "https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4/resolve/main/generation_config.json",
+            "https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4/resolve/main/model.safetensors.index.json",
+            "https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4/resolve/main/tokenizer.json",
+            "https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4/resolve/main/tokenizer_config.json",
+            "https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4/resolve/main/processor_config.json"
         ],
         "model_support_devices": [
             "dgx-spark-128G"
@@ -175,20 +172,7 @@
     {
         "model_id": "Qwen3.8-Flash-Next",
         "model_download_files": [
-            "https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4/resolve/main/chat_template.jinja",
-            "https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4/resolve/main/config.json",
-            "https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4/resolve/main/generation_config.json",
-            "https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4/resolve/main/hf_quant_config.json",
-            "https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4/resolve/main/merges.txt",
-            "https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4/resolve/main/model-00001-of-00010.safetensors",
-            "https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4/resolve/main/model-fp8-mtp-ple.safetensors",
-            "https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4/resolve/main/model.safetensors.index.json",
-            "https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4/resolve/main/preprocessor_config.json",
-            "https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4/resolve/main/processor_config.json",
-            "https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4/resolve/main/tokenizer.json",
-            "https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4/resolve/main/tokenizer_config.json",
-            "https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4/resolve/main/video_preprocessor_config.json",
-            "https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4/resolve/main/vocab.json"
+            "RadixArk/Qwen3.8-Flash-Next-NVFP4"
         ],
         "model_support_devices": [
             "dgx-spark-128G"
