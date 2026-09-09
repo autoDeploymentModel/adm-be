@@ -114,19 +114,12 @@
     {
         "model_id": "GLM-5.3-Flash",
         "model_download_files": [
-            "https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4/resolve/main/model-00001-of-00120.safetensors",
-            "https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4/resolve/main/chat_template.jinja",
-            "https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4/resolve/main/config.json",
-            "https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4/resolve/main/generation_config.json",
-            "https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4/resolve/main/model.safetensors.index.json",
-            "https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4/resolve/main/tokenizer.json",
-            "https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4/resolve/main/tokenizer_config.json",
-            "https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4/resolve/main/processor_config.json"
+            "LibertAIDAI/GLM-5.3-Flash-NVFP4"
         ],
         "model_support_devices": [
             "dgx-spark-128G"
         ],
-        "vllm_image": "ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v8",
+        "vllm_image": "eugr/spark-vllm-b12x:nightly-20260908",
         "vllm_flags": [
             "--trust-remote-code",
             "--speculative-config {\"method\":\"mtp\",\"num_speculative_tokens\":4}",
