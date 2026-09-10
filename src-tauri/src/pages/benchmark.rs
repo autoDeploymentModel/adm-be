@@ -56,6 +56,7 @@ pub async fn start_benchmark(
 ) -> Result<(), AppError> {
     let container = state.running_container.lock().map_err(|e| e.to_string())?.clone();
     let port = state.running_port.lock().map_err(|e| e.to_string())?.unwrap_or(8000);
+    let engine = state.running_engine.lock().map_err(|e| e.to_string())?.clone().unwrap_or_else(|| "vllm".to_string());
 
     let container_name = container.ok_or("没有正在运行的模型容器")?;
 
@@ -76,27 +77,91 @@ pub async fn start_benchmark(
     let app_clone = app.clone();
 
     std::thread::spawn(move || {
-        // 先探测 backend（fork 镜像有 `vllm-scan`，upstream 只有 `vllm`）
-        let backend = detect_bench_backend(&container_name);
-        let _ = app_clone.emit(
-            "benchmark-log",
-            serde_json::json!({"line": format!("[INFO] 使用 benchmark backend: {}", backend)}),
-        );
+        let mut run_args: Vec<String> = vec!["exec".to_string()];
+        if engine == "sglang" {
+            // SGLang 镜像：先探测 sglang.bench_serving 可用性（精简镜像可能不含压测模块）
+            let supported = {
+                let mut probe = crate::common::utils::platform::docker_cmd();
+                probe.args(["exec", &container_name, "python3", "-m", "sglang.bench_serving", "--help"]);
+                match probe.output() {
+                    Ok(o) => {
+                        let text = format!(
+                            "{}{}",
+                            String::from_utf8_lossy(&o.stdout),
+                            String::from_utf8_lossy(&o.stderr)
+                        );
+                        text.contains("--backend")
+                    }
+                    Err(_) => false,
+                }
+            };
+            if !supported {
+                let msg = "当前 SGLang 镜像不含 sglang.bench_serving，暂不支持内置压测";
+                let _ = app_clone.emit("benchmark-log", serde_json::json!({"line": format!("[ERROR] {}", msg)}));
+                let _ = app_clone.emit("benchmark-complete", serde_json::json!({"success": false, "output": msg}));
+                let state = app_clone.state::<AppState>();
+                if let Ok(mut r) = state.benchmark_running.lock() { *r = false; }
+                return;
+            }
+            let _ = app_clone.emit(
+                "benchmark-log",
+                serde_json::json!({"line": "[INFO] 使用 SGLang bench_serving 后端"}),
+            );
+            // `--dataset-name random` 自带随机 prompt 生成，无需额外 dataset-path 文件。
+            run_args.extend([
+                container_name.clone(),
+                "python3".to_string(),
+                "-m".to_string(),
+                "sglang.bench_serving".to_string(),
+                "--backend".to_string(),
+                "sglang".to_string(),
+                "--host".to_string(),
+                "127.0.0.1".to_string(),
+                "--port".to_string(),
+                port.to_string(),
+                "--dataset-name".to_string(),
+                "random".to_string(),
+                "--random-input-len".to_string(),
+                input_len.to_string(),
+                "--random-output-len".to_string(),
+                output_len.to_string(),
+                "--num-prompts".to_string(),
+                num_prompts.to_string(),
+            ]);
+        } else {
+            // 先探测 backend（fork 镜像有 `vllm-scan`，upstream 只有 `vllm`）
+            let backend = detect_bench_backend(&container_name);
+            let _ = app_clone.emit(
+                "benchmark-log",
+                serde_json::json!({"line": format!("[INFO] 使用 benchmark backend: {}", backend)}),
+            );
+            // vLLM `--dataset-name random` 自带随机 prompt 生成，无需额外 dataset-path 文件。
+            run_args.extend([
+                "-e".to_string(),
+                "HF_HUB_OFFLINE=1".to_string(),
+                container_name.clone(),
+                "vllm".to_string(),
+                "bench".to_string(),
+                "serve".to_string(),
+                "--backend".to_string(),
+                backend,
+                "--base-url".to_string(),
+                base_url,
+                // 不传 --model，让 bench 从服务 /v1/models 自动取首个登记的 model 名。
+                // 写死 'default' 大概率与服务侧 served-model-name 不匹配，API 会 404。
+                "--dataset-name".to_string(),
+                "random".to_string(),
+                "--random-input-len".to_string(),
+                input_len.to_string(),
+                "--random-output-len".to_string(),
+                output_len.to_string(),
+                "--num-prompts".to_string(),
+                num_prompts.to_string(),
+            ]);
+        }
 
-        // vLLM `--dataset-name random` 自带随机 prompt 生成，无需额外 dataset-path 文件。
         let mut cmd = crate::common::utils::platform::docker_cmd();
-        cmd.args([
-            "exec", "-e", "HF_HUB_OFFLINE=1", &container_name,
-            "vllm", "bench", "serve",
-            "--backend", &backend,
-            "--base-url", &base_url,
-            // 不传 --model，让 bench 从服务 /v1/models 自动取首个登记的 model 名。
-            // 写死 'default' 大概率与服务侧 served-model-name 不匹配，API 会 404。
-            "--dataset-name", "random",
-            "--random-input-len", &input_len.to_string(),
-            "--random-output-len", &output_len.to_string(),
-            "--num-prompts", &num_prompts.to_string(),
-        ]);
+        cmd.args(&run_args);
 
         let mut child = match cmd
             .stdout(std::process::Stdio::piped())

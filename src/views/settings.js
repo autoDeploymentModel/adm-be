@@ -846,12 +846,12 @@ async function probeNode(rank) {
   // 模型目录留空不提前拦截：后端按默认 /home/<SSH用户>/models 根目录探测
   mnProbeState[rank] = { probing: true };
   renderMultiNodeTable();
-  // 镜像从当前运行中模型的 remote vllm_image 取（未运行或字段缺失时不传，后端跳过镜像检查）
+  // 镜像从当前运行中模型的 remote engine_image / vllm_image 取（未运行或字段缺失时不传，后端跳过镜像检查）
   const image = (() => {
     const state = window.__ADM_STATE || {};
     const runningId = state.runningModelId;
     const model = (state.modelList || []).find(function (m) { return m.model_id === runningId; });
-    return model && model.vllm_image ? model.vllm_image : null;
+    return (model && (model.engine_image || model.vllm_image)) || null;
   })();
   try {
     const res = await invoke()("multi_node_probe", {

@@ -222,18 +222,17 @@ pub fn start_container_script(container_name: &str, docker_args: &[String], log_
     )
 }
 
-/// 远端 `docker exec -d <container> bash -c "ray start --block --address=…"` 脚本：
-/// 在已起来的 sleep infinity 容器内 fork vLLM worker 进程（fork no-Ray 多机模式）。
-/// 严格对齐 eugr/spark-vllm-docker fork `launch-cluster.sh` 的 `exec_no_ray_cluster`：
-/// 每个 worker 上完整起一个 `vllm serve --headless ...`（不 serve API，仅参与分布式初始化），
-/// 通过 `docker exec -d` 派到容器后台，docker exec 自身立即返回（不阻塞启动）。
+/// 远端 `docker exec -d <container> bash -c "..."` 脚本：在已起来的 sleep infinity 容器内
+/// fork 引擎 worker 进程（vLLM no-Ray 多机 / SGLang 多机共用）。
+/// 每个 worker 上完整起一个引擎服务进程（vLLM 带 `--headless`，仅参与分布式初始化；
+/// SGLang 靠 `--node-rank` 区分），通过 `docker exec -d` 派到容器后台，docker exec 自身立即返回。
 /// `use_sudo=true` 时 docker 命令加 `sudo -n` 前缀（远端非 docker 组环境）。
 ///
 /// 输出 `2>&1 | tee /proc/1/fd/1`：写容器 PID 1 stdout → 远端 `docker logs <container>` 可查。
 /// 注意不要重定向到 log_path——那是写完 nohup 的宿主机路径，而本脚本在容器内执行，
 /// 写容器 /tmp 会让宿主机 tail 不到，排障误入歧途（head 端同样用 tee 容器 stdout）。
-/// `cmd_tokens` 为 vllm serve 的完整参数 token 列表（已含 --headless）。
-pub fn start_vllm_worker_script(
+/// `cmd_tokens` 为引擎命令的完整参数 token 列表。
+pub fn start_worker_script(
     container_name: &str,
     cmd_tokens: &[String],
     use_sudo: bool,
@@ -245,7 +244,7 @@ pub fn start_vllm_worker_script(
         .join(" ");
     let inner = format!("{} 2>&1 | tee /proc/1/fd/1", inner_cmd);
     format!(
-        "{dk} exec -d {c} bash -c {inner_q} && echo VLLM_WORKER_STARTED",
+        "{dk} exec -d {c} bash -c {inner_q} && echo WORKER_STARTED",
         dk = dk,
         c = sh_quote(container_name),
         inner_q = sh_quote(&inner)

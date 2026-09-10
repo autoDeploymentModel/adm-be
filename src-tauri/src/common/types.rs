@@ -56,6 +56,12 @@ pub struct RemoteModel {
     /// 目录不存在直接报「请先下载/同步」。缺省/空数组 = 不追加任何挂载，其他模型零影响。
     #[serde(default)]
     pub vllm_extra_mounts: Vec<String>,
+    /// 推理引擎类型：空/"vllm" = vLLM（缺省），"sglang" = SGLang
+    #[serde(default)]
+    pub engine: String,
+    /// 引擎镜像（当前引擎专用）；为空回退 vllm_image（旧配置零改动）
+    #[serde(default)]
+    pub engine_image: String,
     #[serde(default)]
     pub model_size: String,
     #[serde(default)]

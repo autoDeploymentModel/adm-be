@@ -9,6 +9,8 @@ pub struct AppState {
     pub running_port: Mutex<Option<u16>>,
     /// 当前运行的 vLLM Docker 容器名（仅 docker 部署方式使用）
     pub running_container: Mutex<Option<String>>,
+    /// 当前运行的推理引擎（"vllm" / "sglang"；None = 未运行）
+    pub running_engine: Mutex<Option<String>>,
     pub downloading_progress: Mutex<HashMap<String, u8>>,
     pub downloading_phase: Mutex<HashMap<String, String>>,
     /// 下载取消标志：model_id → AtomicBool（置 true 后当前下载立即停止，保留 .part 续传）
@@ -30,6 +32,7 @@ impl AppState {
             running_model_id: Mutex::new(None),
             running_port: Mutex::new(None),
             running_container: Mutex::new(None),
+            running_engine: Mutex::new(None),
             downloading_progress: Mutex::new(HashMap::new()),
             downloading_phase: Mutex::new(HashMap::new()),
             download_cancel: Mutex::new(HashMap::new()),
@@ -57,6 +60,7 @@ impl AppState {
         *self.running_model_id.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.running_port.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.running_container.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.running_engine.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.model_running.lock().unwrap_or_else(|e| e.into_inner()) = false;
     }
 

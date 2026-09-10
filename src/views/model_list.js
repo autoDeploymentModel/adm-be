@@ -629,8 +629,9 @@ function renderModelTable() {
     const modelFilesAttr = model.model_download_files && model.model_download_files.length > 0
       ? ' data-model-files="' + escapeHtml(JSON.stringify(model.model_download_files)) + '"'
       : '';
-    const modelImageAttr = model.vllm_image
-      ? ' data-model-image="' + escapeHtml(model.vllm_image) + '"'
+    const engineImage = (model.engine_image || model.vllm_image) || null;
+    const modelImageAttr = engineImage
+      ? ' data-model-image="' + escapeHtml(engineImage) + '"'
       : '';
     let downloadBtnHtml = "";
     if (downloaded) {
@@ -676,9 +677,10 @@ actionsHtml = '<button class="btn btn-view" id="view-' + safeModelId + '">' + _t
     const progressVisible = downloadingProgress !== undefined;
     const progressValue = downloadingProgress !== undefined ? downloadingProgress : 0;
 
+    const engineLabel = String(model.engine || "").toLowerCase() === "sglang" ? ' · SGLang' : '';
     card.innerHTML =
       '<div class="card-header"><span class="model-name" title="' + safeModelId + '">' + escapeHtml(model.model_id) + '</span>' + statusHtml + '</div>' +
-      '<div class="card-meta">' + escapeHtml(model.model_type || '-') + ' · ' + escapeHtml(model.model_size) + '</div>' +
+      '<div class="card-meta">' + escapeHtml(model.model_type || '-') + ' · ' + escapeHtml(model.model_size) + engineLabel + '</div>' +
       featuresHtml +
       '<div class="card-actions">' + downloadBtnHtml + actionsHtml + '</div>' +
       '<div class="card-progress" data-progress-wrap="' + safeModelId + '" style="display:' + (progressVisible ? 'block' : 'none') + ';">' +
@@ -732,7 +734,8 @@ function bindRowEvents() {
 async function handleDownload(btn) {
   const modelId = btn.dataset.modelId;
   console.log("[model_list] 开始下载模型:", modelId);
-  const vllmImage = btn.dataset.modelImage || null;
+  // data-model-image 由卡片写入 engine_image（优先）或 vllm_image（回退）
+  const engineImage = btn.dataset.modelImage || null;
   let modelFiles = null;
   if (btn.dataset.modelFiles) {
     try { modelFiles = JSON.parse(btn.dataset.modelFiles); } catch (_) { modelFiles = null; }
@@ -751,7 +754,7 @@ async function handleDownload(btn) {
   }
 
   try {
-    await invoke()("download_model", { modelId: modelId, modelFiles: modelFiles, vllmImage: vllmImage });
+    await invoke()("download_model", { modelId: modelId, modelFiles: modelFiles, vllmImage: engineImage });
     console.log("[model_list] 下载模型 invoke 完成:", modelId);
     // 文件 + 镜像拉取全部完成：清理拉取中状态并重渲染（「启动」按钮恢复可点）
     delete S().startingModelId;
@@ -894,8 +897,10 @@ async function handleStart(btn) {
       console.warn("[model_list] 启动前刷新模型清单失败，沿用内存列表:", e);
     }
 
-    // 模型配置的 vllm_image（完整镜像名）→ 指定该模型使用的镜像
+    // 模型配置的 vllm_image（完整镜像名，旧字段）与 engine/engine_image → 区分 vLLM / SGLang 启动路径
     const model = (S().modelList || []).find(m => m.model_id === modelId);
+    const engine = (model && model.engine) || null;
+    const engineImage = (model && (model.engine_image || model.vllm_image)) || null;
     const vllmImage = (model && model.vllm_image) || null;
     // 模型配置的 vllm_flags（官方推荐启动参数）→ 优先级最高
     const vllmFlags = (model && model.vllm_flags) || null;
@@ -907,7 +912,7 @@ async function handleStart(btn) {
     S().startingModelId = modelId;
     renderModelTable();
 
-    await invoke()("start_model", { modelId: modelId, params: params, device: device, vllmImage: vllmImage, vllmFlags: vllmFlags, vllmEnv: vllmEnv, extraMounts: extraMounts });
+    await invoke()("start_model", { modelId: modelId, params: params, device: device, vllmImage: vllmImage, vllmFlags: vllmFlags, vllmEnv: vllmEnv, extraMounts: extraMounts, engine: engine, engineImage: engineImage });
     console.log("[model_list] 启动模型 invoke 完成:", modelId);
   } catch (e) {
     console.error("[model_list] 启动失败:", e);

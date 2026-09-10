@@ -468,13 +468,13 @@ async fn finish_model_download(
     }
     // 镜像名必须由后端重新拉取远程清单解析（与启动流程一致），不能依赖前端卡片透传——
     // 远程配置更新后旧卡片透传值为空，会导致镜像被静默跳过，最终启动时才报「镜像尚未下载」。
-    let resolved_image = resolve_vllm_image(model_id, vllm_image.as_deref()).await;
+    let resolved_image = resolve_engine_image(model_id, vllm_image.as_deref()).await;
     if let Some(image) = resolved_image {
         pull_image_if_configured(app, model_id, Some(&image)).await;
     } else {
-        // 无法解析镜像名（远程清单拉取失败且无前端兜底，或清单缺 vllm_image 字段）：明确报错，不静默
+        // 无法解析镜像名（远程清单拉取失败且无前端兜底，或清单缺 image 字段）：明确报错，不静默
         let msg = format!(
-            "[ERROR] 模型 {} 无法解析 vllm_image 配置（远程 model.json 必填字段，或远程清单拉取失败），镜像未拉取；请检查网络后重新点击「下载」触发",
+            "[ERROR] 模型 {} 无法解析镜像配置（远程 model.json 的 engine_image / vllm_image 必填，或远程清单拉取失败），镜像未拉取；请检查网络后重新点击「下载」触发",
             model_id
         );
         crate::common::utils::logger::write_log("ERROR", "DOWNLOAD", &msg);
@@ -493,7 +493,7 @@ async fn finish_model_download(
                 "model_id": model_id,
                 "type": "image-pull-failed",
                 "image": "",
-                "error": "无法解析 vllm_image 配置（远程 model.json 必填字段，或远程清单拉取失败）",
+                "error": "无法解析镜像配置（远程 model.json 的 engine_image / vllm_image 必填，或远程清单拉取失败）",
             }),
         )
         .ok();
@@ -945,9 +945,10 @@ fn kill_hfd_process_group(pid: u32, force: bool) {
     }
 }
 
-/// 从远程 model.json 解析指定模型的权威 `vllm_image`（与启动流程一致，镜像由远程唯一指定）。
+/// 从远程 model.json 解析指定模型的权威镜像（与启动流程一致，镜像由远程唯一指定）：
+/// 优先 `engine_image`（当前引擎专用），为空回退旧字段 `vllm_image`。
 /// 远程拉取失败时回退到前端透传的 fallback；两者都没有返回 None。
-async fn resolve_vllm_image(model_id: &str, fallback: Option<&str>) -> Option<String> {
+async fn resolve_engine_image(model_id: &str, fallback: Option<&str>) -> Option<String> {
     let from_fallback = || {
         fallback
             .map(str::trim)
@@ -958,8 +959,17 @@ async fn resolve_vllm_image(model_id: &str, fallback: Option<&str>) -> Option<St
         Ok(list) => list
             .iter()
             .find(|m| m.model_id == model_id)
-            .map(|m| m.vllm_image.trim().to_string())
-            .filter(|s| !s.is_empty())
+            .and_then(|m| {
+                let engine_image = m.engine_image.trim();
+                let vllm_image = m.vllm_image.trim();
+                if !engine_image.is_empty() {
+                    Some(engine_image.to_string())
+                } else if !vllm_image.is_empty() {
+                    Some(vllm_image.to_string())
+                } else {
+                    None
+                }
+            })
             .or_else(from_fallback),
         Err(_) => from_fallback(),
     }
@@ -1650,7 +1660,7 @@ fn validate_multi_node(mn: &MultiNodeArgs, port: u16) -> Result<(), AppError> {
         bail!("本机（rank 0）IP 不能为空（其他节点需通过该地址互联）");
     }
     if mn.dist_init_port == 0 {
-        bail!("多机 master 端口（--master-port）不能为 0");
+        bail!("多机 master 端口不能为 0");
     }
     if mn.dist_init_port == port {
         bail!("多机 master 端口 {} 与模型服务端口冲突，请在设置页修改 master 端口", port);
@@ -1779,6 +1789,73 @@ async fn detect_remote_iface(
     if !ok { return None; }
     let name = stdout.trim().to_string();
     if name.is_empty() { None } else { Some(name) }
+}
+
+/// 拼装容器 `-e KEY=VALUE` 参数：设置页 extra_env → 模型清单 vllm_env（同名键后者生效，
+/// 模型清单优先级最高）→ NCCL_DEBUG=INFO 默认值（两者均未显式设置时）。
+/// KEY 全大写+数字+下划线且长度 > 1 才视为合法（避免空行/残行注入），非法键静默跳过。
+/// vLLM / SGLang 单机启动共用。
+fn build_container_env_args(
+    app: &tauri::AppHandle,
+    model_id: &str,
+    settings_extra_env: &str,
+    model_env: &[String],
+) -> Vec<String> {
+    let mut extra_env_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut extra_env_args: Vec<String> = Vec::new();
+    for line in settings_extra_env.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            let k = k.trim();
+            let v = v.trim();
+            if !k.is_empty() && !v.is_empty() && k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') && k.len() > 1 {
+                extra_env_keys.insert(k.to_string());
+                extra_env_args.push("-e".to_string());
+                extra_env_args.push(format!("{}={}", k, v));
+            }
+        }
+    }
+    let mut applied = Vec::new();
+    for raw in model_env {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = raw.split_once('=') {
+            let k = k.trim();
+            let v = v.trim();
+            let valid_key = !k.is_empty()
+                && !v.is_empty()
+                && k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                && k.len() > 1;
+            if valid_key {
+                extra_env_keys.insert(k.to_string());
+                extra_env_args.push("-e".to_string());
+                extra_env_args.push(format!("{}={}", k, v));
+                applied.push(format!("{}={}", k, v));
+            }
+        }
+    }
+    if !applied.is_empty() {
+        app.emit(
+            "model-log",
+            serde_json::json!({
+                "model_id": model_id,
+                "line": format!("[模型配置] 已应用模型清单 vllm_env（优先级最高）：{}", applied.join(", ")),
+                "source": "stdout",
+            }),
+        )
+        .ok();
+        crate::common::utils::logger::write_log("INFO", "MODEL", &format!("[{}] 应用模型清单 vllm_env: {}", model_id, applied.join(", ")));
+    }
+    if !extra_env_keys.contains("NCCL_DEBUG") {
+        extra_env_args.push("-e".to_string());
+        extra_env_args.push("NCCL_DEBUG=INFO".to_string());
+    }
+    extra_env_args
 }
 
 /// 共享 docker run 前缀（多机 head/worker 都用）：
@@ -2001,6 +2078,28 @@ fn push_vllm_args(args: &mut Vec<String>, vllm_args: &VllmArgs, ctx_size: Option
     }
 }
 
+/// 把设置页 vllm_args 中的通用子集映射为 SGLang `launch_server` 参数：
+/// ctx_size → `--context-length`、tp → `--tp`、gpu-memory-utilization → `--mem-fraction-static`、
+/// trust-remote-code → `--trust-remote-code`。其余 vLLM 专属字段（quantization / kv-cache /
+/// load-format / block-size / parser / max-num-* 等）合法值两边不同，不映射，
+/// 由模型清单 vllm_flags 承载完整 SGLang 配方（追加在最后，优先级最高）。
+fn push_sglang_args(args: &mut Vec<String>, vllm_args: &VllmArgs, ctx_size: Option<i32>) {
+    if let Some(ctx) = ctx_size {
+        if ctx > 0 {
+            args.extend(["--context-length".to_string(), ctx.to_string()]);
+        }
+    }
+    if vllm_args.tensor_parallel_size > 1 {
+        args.extend(["--tp".to_string(), vllm_args.tensor_parallel_size.to_string()]);
+    }
+    if vllm_args.gpu_memory_utilization > 0.0 {
+        args.extend(["--mem-fraction-static".to_string(), format!("{}", vllm_args.gpu_memory_utilization)]);
+    }
+    if vllm_args.trust_remote_code {
+        args.push("--trust-remote-code".to_string());
+    }
+}
+
 /// 把模型清单 vllm_flags 拼接为 `--key value` 追加到 args（每条 `--key value` 或 `--flag`，start_vllm_docker 同规则）。
 fn push_vllm_flags(args: &mut Vec<String>, vllm_flags: &Option<Vec<String>>) {
     let flags = vllm_flags.as_deref().unwrap_or(&[]);
@@ -2040,6 +2139,7 @@ fn push_vllm_flags(args: &mut Vec<String>, vllm_flags: &Option<Vec<String>>) {
 /// `build_head_vllm_exec_args` 单独拼装。
 fn build_multi_node_head_args(
     model_id: &str,
+    container_name: &str,
     model_dir: &std::path::Path,
     image: &str,
     shm_size: &str,
@@ -2051,9 +2151,8 @@ fn build_multi_node_head_args(
     model_env: &[String],
     extra_mounts: &[(String, String)],
 ) -> Vec<String> {
-    let container_name = format!("adm-vllm-{}-rank-0", model_id);
     let mount_dst = format!("/models/{}", model_id);
-    let mut args = build_common_docker_prefix(&container_name, shm_size, node_ip, iface, ib_iface, has_infiniband, &mn.extra_env, model_env);
+    let mut args = build_common_docker_prefix(container_name, shm_size, node_ip, iface, ib_iface, has_infiniband, &mn.extra_env, model_env);
     args.push("-v".to_string());
     args.push(format!("{}:{}:ro", model_dir.to_string_lossy(), mount_dst));
     // vllm_extra_mounts：附加模型目录（drafter 等），主挂载之后逐条追加，空列表零变化
@@ -2164,6 +2263,84 @@ fn build_multi_node_worker_vllm_args(
     args
 }
 
+/// 多机 head（rank 0）SGLang `launch_server` 命令参数：末尾追加 `--nnodes N --node-rank 0
+/// --tp N --dist-init-addr <head_ip>:<port>`（各节点同一命令、仅 node-rank 不同；rank 0 对外服务，
+/// TP 固定等于节点数，与 vLLM 多机路径语义一致）。
+fn build_head_sglang_exec_args(
+    model_id: &str,
+    port: u16,
+    vllm_args: &VllmArgs,
+    vllm_flags: &Option<Vec<String>>,
+    mn: &MultiNodeArgs,
+    ctx_size: Option<i32>,
+) -> Vec<String> {
+    let mount_dst = format!("/models/{}", model_id);
+    let mut args = vec![
+        "python3".to_string(),
+        "-m".to_string(),
+        "sglang.launch_server".to_string(),
+        "--model-path".to_string(),
+        mount_dst,
+        "--host".to_string(),
+        "0.0.0.0".to_string(),
+        "--port".to_string(),
+        port.to_string(),
+    ];
+    push_sglang_args(&mut args, vllm_args, ctx_size);
+    push_vllm_flags(&mut args, vllm_flags);
+    let n_nodes = mn.nodes.len();
+    args.extend([
+        "--nnodes".to_string(),
+        n_nodes.to_string(),
+        "--node-rank".to_string(),
+        "0".to_string(),
+        "--tp".to_string(),
+        n_nodes.to_string(),
+        "--dist-init-addr".to_string(),
+        format!("{}:{}", mn.nodes[0].ip, mn.dist_init_port),
+    ]);
+    args
+}
+
+/// 多机 worker（远端 rank i）SGLang `launch_server` 命令参数：与 head 同命令，仅 `--node-rank i`
+/// （SGLang 无 vLLM 式 `--headless`——各节点跑同一 server，仅 rank 0 对外提供服务）。
+fn build_multi_node_worker_sglang_args(
+    model_id: &str,
+    port: u16,
+    vllm_args: &VllmArgs,
+    vllm_flags: &Option<Vec<String>>,
+    rank: usize,
+    mn: &MultiNodeArgs,
+    ctx_size: Option<i32>,
+) -> Vec<String> {
+    let mount_dst = format!("/models/{}", model_id);
+    let mut args = vec![
+        "python3".to_string(),
+        "-m".to_string(),
+        "sglang.launch_server".to_string(),
+        "--model-path".to_string(),
+        mount_dst,
+        "--host".to_string(),
+        "0.0.0.0".to_string(),
+        "--port".to_string(),
+        port.to_string(),
+    ];
+    push_sglang_args(&mut args, vllm_args, ctx_size);
+    push_vllm_flags(&mut args, vllm_flags);
+    let n_nodes = mn.nodes.len();
+    args.extend([
+        "--nnodes".to_string(),
+        n_nodes.to_string(),
+        "--node-rank".to_string(),
+        rank.to_string(),
+        "--tp".to_string(),
+        n_nodes.to_string(),
+        "--dist-init-addr".to_string(),
+        format!("{}:{}", mn.nodes[0].ip, mn.dist_init_port),
+    ]);
+    args
+}
+
 /// 多机 worker（远端 rank i）docker run 参数：跑 `sleep infinity`（fork `launch-cluster.sh` keepalive）。
 ///
 /// 严格对齐 eugr/spark-vllm-docker fork `launch-cluster.sh --ray` 模式：
@@ -2179,10 +2356,10 @@ fn build_multi_node_worker_vllm_args(
 ///            --address=<head_ip>:<dist_init_port> --node-ip-address=<worker_ip>
 fn build_multi_node_worker_args(
     model_id: &str,
+    container_name: &str,
     model_dir: &std::path::Path,
     image: &str,
     shm_size: &str,
-    rank: usize,
     _node0_ip: &str,
     mn: &MultiNodeArgs,
     node_ip: &str,
@@ -2192,9 +2369,8 @@ fn build_multi_node_worker_args(
     model_env: &[String],
     extra_mounts: &[(String, String)],
 ) -> Vec<String> {
-    let container_name = format!("adm-vllm-{}-rank-{}", model_id, rank);
     let mount_dst = format!("/models/{}", model_id);
-    let mut args = build_common_docker_prefix(&container_name, shm_size, node_ip, iface, ib_iface, has_infiniband, &mn.extra_env, model_env);
+    let mut args = build_common_docker_prefix(container_name, shm_size, node_ip, iface, ib_iface, has_infiniband, &mn.extra_env, model_env);
     args.push("-v".to_string());
     args.push(format!("{}:{}:ro", model_dir.to_string_lossy(), mount_dst));
     // vllm_extra_mounts：附加模型目录（drafter 等），主挂载之后逐条追加，空列表零变化
@@ -2211,9 +2387,18 @@ fn build_multi_node_worker_args(
     args
 }
 
-/// 本机（rank 0）docker run 容器名（多机停止时据此识别多机模式）
-fn multi_container_name(model_id: &str, rank: usize) -> String {
-    format!("adm-vllm-{}-rank-{}", model_id, rank)
+/// 多机容器名前缀（vLLM / SGLang 各一套，供停止/监控/清理同源推导）
+fn multi_container_base(engine_label: &str, model_id: &str) -> String {
+    if engine_label == "sglang" {
+        format!("adm-sglang-{}", model_id)
+    } else {
+        format!("adm-vllm-{}", model_id)
+    }
+}
+
+/// 多机容器名 `<base>-rank-<R>`（本机 rank 0；停止时据此识别多机模式）
+fn multi_container_name(container_base: &str, rank: usize) -> String {
+    format!("{}-rank-{}", container_base, rank)
 }
 
 /// 停止已启动的远端节点容器（启动失败回滚 / 停止模型共用）
@@ -2221,14 +2406,19 @@ async fn stop_remote_containers(
     app: &tauri::AppHandle,
     mn: &MultiNodeArgs,
     key: Option<&str>,
-    model_id: &str,
+    container_base: &str,
     ranks_start: usize,
 ) {
     for (i, node) in mn.nodes.iter().enumerate().skip(ranks_start) {
         if node.is_self {
             continue;
         }
-        let container = multi_container_name(model_id, i);
+        // 从容器前缀还原 model_id（日志/前端事件按 model_id 关联卡片）
+        let model_id = container_base
+            .strip_prefix("adm-sglang-")
+            .or_else(|| container_base.strip_prefix("adm-vllm-"))
+            .unwrap_or(container_base);
+        let container = multi_container_name(container_base, i);
         let script = crate::common::ssh::stop_container_script(&container);
         match crate::common::ssh::ssh_run(
             &node.ip,
@@ -2267,8 +2457,17 @@ async fn start_multi_node(
     vllm_flags: Option<Vec<String>>,
     vllm_env: Option<Vec<String>>,
     extra_mounts: Option<Vec<String>>,
+    engine: Option<String>,
 ) -> Result<(), AppError> {
     let (mn, mut vllm_args) = load_multi_node_config(app);
+    // 引擎：缺省 vLLM；sglang 时容器名 / 命令 / 就绪信号 / 预检走 SGLang 分支
+    let is_sglang = engine
+        .as_deref()
+        .map(|s| s.trim().eq_ignore_ascii_case("sglang"))
+        .unwrap_or(false);
+    let engine_tag = if is_sglang { "sglang" } else { "vllm" };
+    let engine_display = if is_sglang { "SGLang" } else { "vLLM" };
+    let container_base = multi_container_base(engine_tag, model_id);
     // 多机路径：backend 由下方 build_head/worker_vllm_exec_args 末尾强制追加 mp，
     // 清除残留值避免 push_vllm_args 先推一个旧值再被 mp 覆盖（产生重复 flag）。
     vllm_args.distributed_executor_backend.clear();
@@ -2282,28 +2481,28 @@ async fn start_multi_node(
     };
     let key_ref = key.as_deref();
 
-    // 本地 vllm 日志落盘：<data_dir>/logs/adm_vllm_<model_id>_rank_0.log
-    // vllm 每行输出实时写文件（每行 flush），容器被清理后日志依然可查——
+    // 本地引擎日志落盘：<data_dir>/logs/adm_<engine>_<model_id>_rank_0.log
+    // 每行输出实时写文件（每行 flush），容器被清理后日志依然可查——
     // 排查"启动即失败被 docker rm 删掉、原因无处可看"的关键。
     let local_vllm_log = crate::common::config::get_data_dir(Some(app))?
         .join("logs")
-        .join(format!("adm_vllm_{}_rank_0.log", model_id));
+        .join(format!("adm_{}_{}_rank_0.log", engine_tag, model_id));
     if let Some(parent) = local_vllm_log.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let log_writer = std::sync::Arc::new(std::sync::Mutex::new(
         std::io::BufWriter::new(
             std::fs::File::create(&local_vllm_log)
-                .map_err(|e| AppError::msg(format!("创建 vllm 日志文件失败（{}）: {}", local_vllm_log.display(), e)))?,
+                .map_err(|e| AppError::msg(format!("创建引擎日志文件失败（{}）: {}", local_vllm_log.display(), e)))?,
         ),
     ));
 
-    // 镜像由远程 model.json 的 vllm_image 字段唯一指定（每模型独立配置），缺字段视为清单错误。
+    // 镜像由远程 model.json 的 engine_image / vllm_image 字段唯一指定（每模型独立配置），缺字段视为清单错误。
     let image = vllm_image
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| AppError::msg(format!("模型 {} 缺少 vllm_image 配置（远程 model.json 必填）", model_id)))?
+        .ok_or_else(|| AppError::msg(format!("模型 {} 缺少镜像配置（远程 model.json 的 engine_image / vllm_image 必填）", model_id)))?
         .to_string();
     let default_shm = "64g";
     let shm_size = if vllm_args.shm_size.is_empty() { default_shm.to_string() } else { vllm_args.shm_size.clone() };
@@ -2392,7 +2591,7 @@ async fn start_multi_node(
             "source": "stdout",
         }));
 
-        // 启动：nohup docker run 后台运行，日志落盘 /tmp/adm_vllm_<model>_rank_<i>.log
+        // 启动：nohup docker run 后台运行，日志落盘 /tmp/adm_<engine>_<model>_rank_<i>.log
         // 自动从节点 IP 反查互连网卡名
         let remote_iface = detect_remote_iface(
             &node.ip, &node.ssh_user, node.ssh_port, key_ref, &node.ip,
@@ -2428,12 +2627,14 @@ async fn start_multi_node(
         } else {
             None
         };
+        let container = multi_container_name(&container_base, i);
+        let log_path = format!("/tmp/adm_{}_{}_rank_{}.log", engine_tag, model_id, i);
         let args = build_multi_node_worker_args(
             model_id,
+            &container,
             &std::path::Path::new(&node_model_dir),
             &image,
             &shm_size,
-            i,
             &node0_ip,
             &mn,
             &node.ip,
@@ -2443,8 +2644,6 @@ async fn start_multi_node(
             vllm_env.as_deref().unwrap_or(&[]),
             &node_extra_mounts,
         );
-        let container = multi_container_name(model_id, i);
-        let log_path = format!("/tmp/adm_vllm_{}_rank_{}.log", model_id, i);
         // 清理远端同名残留容器（上次启动失败/手动残留，与 rank 0 的 docker rm -f 对齐），
         // 否则 docker run --name 立即失败且不会出现在 docker ps 中
         let clean_script = crate::common::ssh::stop_container_script(&container);
@@ -2469,7 +2668,7 @@ async fn start_multi_node(
             AppError::msg(format!("远端节点 {}（rank {}）启动命令执行失败: {}", node.ip, i, e))
         })?;
         if !sok {
-            let _ = stop_remote_containers(app, &mn, key_ref, model_id, 1).await;
+            let _ = stop_remote_containers(app, &mn, key_ref, &container_base, 1).await;
             bail!("远端节点 {}（rank {}）docker run 发起失败: {}", node.ip, i, serr);
         }
 
@@ -2506,7 +2705,7 @@ async fn start_multi_node(
             }
         }
         if !up {
-            let _ = stop_remote_containers(app, &mn, key_ref, model_id, 1).await;
+            let _ = stop_remote_containers(app, &mn, key_ref, &container_base, 1).await;
             // 兜底抓取容器状态与日志尾部，给出真实失败原因（而非笼统「未进入运行状态」）
             let ps_a = crate::common::ssh::ssh_run(
                 &node.ip, &node.ssh_user, node.ssh_port, key_ref,
@@ -2525,10 +2724,10 @@ async fn start_multi_node(
             let detail = if !tail.trim().is_empty() {
                 tail
             } else if let Some(st) = ps_a {
-                format!("容器状态：{}（日志为空，docker run 阶段即失败，可在远端查看 /tmp/adm_vllm_{}_rank_{}.log）", st, model_id, i)
+                format!("容器状态：{}（日志为空，docker run 阶段即失败，可在远端查看 /tmp/adm_{}_{}_rank_{}.log）", st, engine_tag, model_id, i)
             } else {
                 let hint = if poll_fail > 0 { format!("远端 SSH 轮询失败 {} 次；", poll_fail) } else { String::new() };
-                format!("{}30s 内未进入运行状态（未看到容器，docker run 可能立即失败，可在远端查看 /tmp/adm_vllm_{}_rank_{}.log）", hint, model_id, i)
+                format!("{}30s 内未进入运行状态（未看到容器，docker run 可能立即失败，可在远端查看 /tmp/adm_{}_{}_rank_{}.log）", hint, engine_tag, model_id, i)
             };
             crate::common::utils::logger::write_log("ERROR", "MODEL", &format!("[{}] 远端节点 {} 容器启动失败:\n{}", model_id, node.ip, detail));
             bail!("远端节点 {}（rank {}）容器启动失败，已回滚停止已启动节点：\n{}", node.ip, i, detail);
@@ -2538,35 +2737,51 @@ async fn start_multi_node(
             "line": format!("[多机] 远端节点 {}（rank {}）容器已就绪", node.ip, i),
             "source": "stdout",
         }));
-        // worker 容器内 vllm 可用性预检：worker 侧 vllm 缺失时其 vllm serve 秒退，
-        // head 会一直阻塞等 rank join（前端只见超时）。提前探测并失败回滚。
-        // 失败时同时回传容器内 PATH 与 vllm 常见安装位置（定位镜像是否为旧构建/venv 布局）。
+        // worker 容器内引擎可用性预检：缺失时 serve 进程秒退、head 阻塞等 rank join（前端只见超时）。
+        // vLLM 查 vllm 命令；SGLang 查 sglang 包（find_spec，避免重导入）。失败即回滚。
         {
-            let probe_cmd = format!(
-                "{} exec {} bash -c 'if command -v vllm >/dev/null 2>&1; then echo VLLM_BIN_OK; else echo VLLM_BIN_MISSING; echo \"PATH=$PATH\"; command -v sglang >/dev/null 2>&1 && echo IMAGE_IS_SGLANG; ls /usr/local/bin /usr/bin /opt/venv/bin /opt/conda/bin 2>/dev/null | grep -i vllm | head -5; fi'",
-                if use_sudo { "sudo -n docker" } else { "docker" },
-                crate::common::ssh::sh_quote(&container)
-            );
+            let probe_cmd = if is_sglang {
+                let inner = "if python3 -c \"import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('sglang') else 1)\" >/dev/null 2>&1; then echo SGLANG_PKG_OK; else echo SGLANG_PKG_MISSING; echo \"PATH=$PATH\"; command -v vllm >/dev/null 2>&1 && echo IMAGE_IS_VLLM; fi";
+                format!(
+                    "{} exec {} bash -c {}",
+                    if use_sudo { "sudo -n docker" } else { "docker" },
+                    crate::common::ssh::sh_quote(&container),
+                    crate::common::ssh::sh_quote(inner)
+                )
+            } else {
+                format!(
+                    "{} exec {} bash -c 'if command -v vllm >/dev/null 2>&1; then echo VLLM_BIN_OK; else echo VLLM_BIN_MISSING; echo \"PATH=$PATH\"; command -v sglang >/dev/null 2>&1 && echo IMAGE_IS_SGLANG; ls /usr/local/bin /usr/bin /opt/venv/bin /opt/conda/bin 2>/dev/null | grep -i vllm | head -5; fi'",
+                    if use_sudo { "sudo -n docker" } else { "docker" },
+                    crate::common::ssh::sh_quote(&container)
+                )
+            };
             let (pok, pout, perr) = crate::common::ssh::ssh_run(
                 &node.ip, &node.ssh_user, node.ssh_port, key_ref, &probe_cmd,
                 std::time::Duration::from_secs(15),
             ).await.unwrap_or((false, String::new(), String::new()));
-            if !pok || pout.contains("VLLM_BIN_MISSING") {
-                let _ = stop_remote_containers(app, &mn, key_ref, model_id, 1).await;
+            let engine_missing = if is_sglang { pout.contains("SGLANG_PKG_MISSING") } else { pout.contains("VLLM_BIN_MISSING") };
+            if !pok || engine_missing {
+                let _ = stop_remote_containers(app, &mn, key_ref, &container_base, 1).await;
                 let diag: Vec<&str> = pout.lines()
-                    .filter(|l| l.contains("PATH=") || l.to_lowercase().contains("vllm") || l.contains("IMAGE_IS_SGLANG"))
+                    .filter(|l| l.contains("PATH=") || l.to_lowercase().contains("vllm") || l.to_lowercase().contains("sglang"))
                     .collect();
                 let diag_str = if diag.is_empty() { String::new() } else { format!("（{}\n）", diag.join("\n")) };
-                let is_sglang = pout.contains("IMAGE_IS_SGLANG");
-                let sglang_hint = if is_sglang {
-                    "该镜像内是 sglang 而非 vllm（tag 实际被 SGLang 镜像占用/打错），请改用真正的 vLLM 镜像"
+                let missing_token = if is_sglang { "sglang 包" } else { "vllm 命令" };
+                let hint = if is_sglang {
+                    if pout.contains("IMAGE_IS_VLLM") {
+                        "该镜像内是 vllm 而非 sglang（若这是 vLLM 模型请去掉清单里的 \"engine\": \"sglang\"）"
+                    } else {
+                        "镜像可能为旧构建或经镜像加速器缓存（浮动 tag 内容不一致）"
+                    }
+                } else if pout.contains("IMAGE_IS_SGLANG") {
+                    "该镜像内是 sglang 而非 vllm（若这是 SGLang 模型请在清单标注 \"engine\": \"sglang\"；否则请改用真正的 vLLM 镜像）"
                 } else {
                     "镜像可能为旧构建或经镜像加速器缓存（浮动 tag 内容不一致）"
                 };
-                let detail = if pout.contains("VLLM_BIN_MISSING") {
-                    format!("容器内找不到 vllm 命令。{}。{}", sglang_hint, diag_str)
+                let detail = if engine_missing {
+                    format!("容器内找不到 {}。{}。{}", missing_token, hint, diag_str)
                 } else {
-                    "容器内 vllm 预检执行失败".to_string()
+                    format!("容器内 {} 预检执行失败", missing_token)
                 };
                 crate::common::utils::logger::write_log("ERROR", "MODEL", &format!("[{}] {}（节点 {}）: {}", model_id, detail, node.ip, perr));
                 bail!(
@@ -2580,7 +2795,7 @@ async fn start_multi_node(
     }
 
     // ===== 本机（rank 0）=====
-    let container0 = multi_container_name(model_id, 0);
+    let container0 = multi_container_name(&container_base, 0);
     // 清理同名残留容器
     let _ = crate::common::utils::platform::docker_cmd()
         .args(["rm", "-f", &container0])
@@ -2607,7 +2822,7 @@ async fn start_multi_node(
         None
     };
     let args0 = build_multi_node_head_args(
-        model_id, model_dir, &image, &shm_size, &mn, &node0_ip, local_iface.as_deref(), local_ib_iface.as_deref(), local_has_ib,
+        model_id, &container0, model_dir, &image, &shm_size, &mn, &node0_ip, local_iface.as_deref(), local_ib_iface.as_deref(), local_has_ib,
         vllm_env.as_deref().unwrap_or(&[]),
         &head_extra_mounts,
     );
@@ -2636,14 +2851,14 @@ async fn start_multi_node(
             let _ = crate::common::utils::platform::docker_cmd()
                 .args(["rm", "-f", &container0])
                 .output();
-            stop_remote_containers(app, &mn, key_ref, model_id, 1).await;
+            stop_remote_containers(app, &mn, key_ref, &container_base, 1).await;
             return Err(AppError::msg(format!("head 容器启动失败: {}", stderr.trim())));
         }
     } else {
         let _ = crate::common::utils::platform::docker_cmd()
             .args(["rm", "-f", &container0])
             .output();
-        stop_remote_containers(app, &mn, key_ref, model_id, 1).await;
+        stop_remote_containers(app, &mn, key_ref, &container_base, 1).await;
         return Err(AppError::msg("本地 docker run 失败".to_string()));
     }
 
@@ -2684,7 +2899,7 @@ async fn start_multi_node(
         let _ = crate::common::utils::platform::docker_cmd()
             .args(["rm", "-f", &container0])
             .output();
-        stop_remote_containers(app, &mn, key_ref, model_id, 1).await;
+        stop_remote_containers(app, &mn, key_ref, &container_base, 1).await;
         return Err(AppError::msg("head 容器 30s 内未进入 Up 状态".to_string()));
     }
     let _ = app.emit("model-log", serde_json::json!({
@@ -2693,63 +2908,83 @@ async fn start_multi_node(
         "source": "stdout",
     }));
 
-    // ===== Phase 2.5: head 容器内 vllm 可用性预检 =====
-    // 镜像 PATH 缺 vllm 时，Phase 4 的 `bash -c "vllm serve ..."` 只会留下
-    // `bash: line 1: vllm: command not found` 然后 head 阻塞等 rank join——提前探测，
-    // 失败即回滚并给出可操作的修复指引（重拉镜像）。顺带检测 sglang 占 tag 场景。
+    // ===== Phase 2.5: head 容器内引擎可用性预检 =====
+    // 镜像缺引擎时 Phase 4 的命令只会留下 `command not found` 然后 head 阻塞等 rank join——
+    // 提前探测，失败即回滚并给出可操作的修复指引（重拉镜像）。
     {
-        let probe = crate::common::utils::platform::docker_cmd()
-            .args(["exec", &container0, "bash", "-c",
-                   "if command -v vllm >/dev/null 2>&1; then echo VLLM_BIN_OK; else echo VLLM_BIN_MISSING; command -v sglang >/dev/null 2>&1 && echo IMAGE_IS_SGLANG; fi"])
-            .output();
+        let probe = if is_sglang {
+            crate::common::utils::platform::docker_cmd()
+                .args(["exec", &container0, "bash", "-c",
+                       "if python3 -c \"import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('sglang') else 1)\" >/dev/null 2>&1; then echo SGLANG_PKG_OK; else echo SGLANG_PKG_MISSING; command -v vllm >/dev/null 2>&1 && echo IMAGE_IS_VLLM; fi"])
+                .output()
+        } else {
+            crate::common::utils::platform::docker_cmd()
+                .args(["exec", &container0, "bash", "-c",
+                       "if command -v vllm >/dev/null 2>&1; then echo VLLM_BIN_OK; else echo VLLM_BIN_MISSING; command -v sglang >/dev/null 2>&1 && echo IMAGE_IS_SGLANG; fi"])
+                .output()
+        };
         if let Ok(o) = &probe {
             let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
-            if stdout.contains("VLLM_BIN_MISSING") {
-                let hint = if stdout.contains("IMAGE_IS_SGLANG") {
-                    "（该镜像内是 sglang 而非 vllm：此 tag 实际被 SGLang 镜像占用/打错，请改用真正的 vLLM 镜像，如 ghcr.io/spark-arena/dgx-vllm-eugr-nightly-b12x）"
+            let engine_missing = if is_sglang { stdout.contains("SGLANG_PKG_MISSING") } else { stdout.contains("VLLM_BIN_MISSING") };
+            if engine_missing {
+                let missing_token = if is_sglang { "sglang 包" } else { "vllm 命令" };
+                let hint = if is_sglang {
+                    if stdout.contains("IMAGE_IS_VLLM") {
+                        "（该镜像内是 vllm 而非 sglang：若这是 vLLM 模型请去掉清单里的 \"engine\": \"sglang\"）"
+                    } else {
+                        ""
+                    }
+                } else if stdout.contains("IMAGE_IS_SGLANG") {
+                    "（该镜像内是 sglang 而非 vllm：若这是 SGLang 模型请在清单标注 \"engine\": \"sglang\"；否则此 tag 实际被 SGLang 镜像占用/打错，请改用真正的 vLLM 镜像）"
                 } else {
                     ""
                 };
                 let diag = crate::common::utils::platform::docker_cmd()
                     .args(["exec", &container0, "bash", "-c",
-                           "echo PATH=$PATH; ls /usr/local/bin /usr/bin 2>/dev/null | grep -i vllm | head -3"])
+                           "echo PATH=$PATH; ls /usr/local/bin /usr/bin 2>/dev/null | grep -iE 'vllm|sglang' | head -3"])
                     .output()
                     .ok()
                     .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                     .unwrap_or_default();
                 let _ = app.emit("model-log", serde_json::json!({
                     "model_id": model_id,
-                    "line": format!("[ERROR] 镜像 {} 容器内找不到 vllm 命令{}（{}）", image, hint, if diag.is_empty() { "容器内无 vllm 相关文件".to_string() } else { diag }),
+                    "line": format!("[ERROR] 镜像 {} 容器内找不到 {}{}（{}）", image, missing_token, hint, if diag.is_empty() { format!("容器内无 {} 相关文件", missing_token) } else { diag }),
                     "source": "stderr",
                 }));
                 let _ = crate::common::utils::platform::docker_cmd()
                     .args(["rm", "-f", &container0])
                     .output();
-                stop_remote_containers(app, &mn, key_ref, model_id, 1).await;
+                stop_remote_containers(app, &mn, key_ref, &container_base, 1).await;
                 return Err(AppError::msg(format!(
-                    "镜像 {} 容器内找不到 vllm 命令{}（镜像内容可能不完整或被镜像加速器替换）：请执行 `docker rmi {}` 后在模型列表重新下载模型触发重新拉取，已回滚停止集群",
-                    image, hint, image
+                    "镜像 {} 容器内找不到 {}（镜像内容可能不完整或被镜像加速器替换）：请执行 `docker rmi {}` 后在模型列表重新下载模型触发重新拉取，已回滚停止集群",
+                    image, missing_token, image
                 )));
             }
         }
     }
 
-    // ===== Phase 3: 派发远端 worker 的 `vllm serve --headless`（no-Ray 多机，对齐 fork exec_no_ray_cluster）=====
-    // fork 镜像 pydantic 校验：nnodes > 1 只允许 mp / uni / external_launcher backend，
-    // 因此 worker 与 head 都用 `--distributed-executor-backend mp`（build 函数末尾强推，覆盖
-    // 用户 vllm_flags 里可能自带的 ray）。worker 必须先于 head 启动（但 docker exec -d 后台，
-    // 只派发不等待；head 的 vllm serve 会阻塞等所有 rank join）。
+    // ===== Phase 3: 派发远端 worker 引擎进程（vLLM：no-Ray mp / SGLang：launch_server 各 rank）=====
+    // vLLM：fork 镜像 pydantic 校验 nnodes>1 只允许 mp/uni/external_launcher，worker 与 head 都用
+    // `--distributed-executor-backend mp`（build 函数末尾强推，覆盖用户 vllm_flags 里可能自带的 ray）。
+    // 两种引擎都先起 worker（docker exec -d 后台，只派发不等待），head 随后前台启动并等所有 rank join。
+    let worker_serve_label = if is_sglang { "sglang.launch_server" } else { "vllm serve --headless" };
     let _ = app.emit("model-log", serde_json::json!({
         "model_id": model_id,
-        "line": format!("[多机] 派发远端 worker 的 vllm serve --headless（rank 1..{}）", n_nodes - 1),
+        "line": format!("[多机] 派发远端 worker 的 {}（rank 1..{}）", worker_serve_label, n_nodes - 1),
         "source": "stdout",
     }));
     for (i, container, use_sudo, _log_path) in &worker_runtime {
         let node = &mn.nodes[*i];
-        let worker_vllm_args = build_multi_node_worker_vllm_args(
-            model_id, port, &vllm_args, &vllm_flags, *i, &mn, params.ctx_size,
-        );
-        let start_script = crate::common::ssh::start_vllm_worker_script(
+        let worker_vllm_args = if is_sglang {
+            build_multi_node_worker_sglang_args(
+                model_id, port, &vllm_args, &vllm_flags, *i, &mn, params.ctx_size,
+            )
+        } else {
+            build_multi_node_worker_vllm_args(
+                model_id, port, &vllm_args, &vllm_flags, *i, &mn, params.ctx_size,
+            )
+        };
+        let start_script = crate::common::ssh::start_worker_script(
             container, &worker_vllm_args, *use_sudo,
         );
         match crate::common::ssh::ssh_run(
@@ -2759,37 +2994,38 @@ async fn start_multi_node(
             Ok((true, _, _)) => {
                 let _ = app.emit("model-log", serde_json::json!({
                     "model_id": model_id,
-                    "line": format!("[多机] 远端节点 {}（rank {}）vllm serve --headless 已派发", node.ip, *i),
+                    "line": format!("[多机] 远端节点 {}（rank {}）{} 已派发", node.ip, *i, worker_serve_label),
                     "source": "stdout",
                 }));
             }
             Ok((false, _, err)) => {
                 crate::common::utils::logger::write_log(
                     "WARN", "MODEL",
-                    &format!("[{}] 远端节点 {}（rank {}）vllm worker 派发失败: {}", model_id, node.ip, *i, err),
+                    &format!("[{}] 远端节点 {}（rank {}）worker 派发失败: {}", model_id, node.ip, *i, err),
                 );
                 let _ = app.emit("model-log", serde_json::json!({
                     "model_id": model_id,
-                    "line": format!("[多机] 远端节点 {}（rank {}）vllm worker 派发失败（继续，head 端可能超时）", node.ip, *i),
+                    "line": format!("[多机] 远端节点 {}（rank {}）worker 派发失败（继续，head 端可能超时）", node.ip, *i),
                     "source": "stderr",
                 }));
             }
             Err(e) => {
                 crate::common::utils::logger::write_log(
                     "WARN", "MODEL",
-                    &format!("[{}] 远端节点 {}（rank {}）vllm worker 派发异常: {}", model_id, node.ip, *i, e),
+                    &format!("[{}] 远端节点 {}（rank {}）worker 派发异常: {}", model_id, node.ip, *i, e),
                 );
             }
         }
     }
 
-    // ===== Phase 4: 在 head 容器内 exec vllm serve（本地 docker exec -i 捕获 stdout）=====
-    // 用 build_head_vllm_exec_args 拼 vllm serve 的命令 tokens；经 sh_quote + bash -c 串成一行，
-    // 整段塞进 `docker exec -i <head_container> bash -c "<cmd>"`，child stdout/stderr 仍归
-    // 我们管（沿用原 spawn_docker_run 的转发链路，避免再换 docker logs -f 拉一条新轮询线程）。
-    let vllm_exec_args = build_head_vllm_exec_args(
-        model_id, port, &vllm_args, &vllm_flags, &mn, params.ctx_size,
-    );
+    // ===== Phase 4: 在 head 容器内 exec 引擎命令（本地 docker exec -i 捕获 stdout）=====
+    // 用 build_head_*_exec_args 拼命令 tokens；经 sh_quote + bash -c 串成一行，整段塞进
+    // `docker exec -i <head_container> bash -c "<cmd>"`，child stdout/stderr 仍归我们管。
+    let vllm_exec_args = if is_sglang {
+        build_head_sglang_exec_args(model_id, port, &vllm_args, &vllm_flags, &mn, params.ctx_size)
+    } else {
+        build_head_vllm_exec_args(model_id, port, &vllm_args, &vllm_flags, &mn, params.ctx_size)
+    };
     let vllm_inner_cmd: String = vllm_exec_args.iter()
         .map(|s| crate::common::ssh::sh_quote(s))
         .collect::<Vec<_>>()
@@ -2802,7 +3038,7 @@ async fn start_multi_node(
     let vllm_inner = format!("{} 2>&1 | tee /proc/1/fd/1", vllm_inner_cmd);
     let _ = app.emit("model-log", serde_json::json!({
         "model_id": model_id,
-        "line": format!("[多机] 本机（rank 0）启动 vllm serve（docker exec -i，mp 多机模式）"),
+        "line": format!("[多机] 本机（rank 0）启动 {}（docker exec -i）", if is_sglang { "sglang.launch_server（多机模式）" } else { "vllm serve（mp 多机模式）" }),
         "source": "stdout",
     }));
     let mut child = {
@@ -2820,13 +3056,13 @@ async fn start_multi_node(
         match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                let msg = format!("启动 vllm serve 失败: {}", e);
+                let msg = format!("启动引擎进程失败: {}", e);
                 let _ = app.emit("model-log", serde_json::json!({
                     "model_id": model_id, "line": format!("[ERROR] {}", msg), "source": "stderr",
                 }));
                 let _ = crate::common::utils::platform::docker_cmd()
                     .args(["rm", "-f", &container0]).output();
-                stop_remote_containers(app, &mn, key_ref, model_id, 1).await;
+                stop_remote_containers(app, &mn, key_ref, &container_base, 1).await;
                 return Err(AppError::msg(msg));
             }
         }
@@ -2849,6 +3085,10 @@ async fn start_multi_node(
         let mut container_lock = state.running_container.lock().map_err(|e| e.to_string())?;
         *container_lock = Some(container0.clone());
     }
+    {
+        let mut engine_lock = state.running_engine.lock().map_err(|e| e.to_string())?;
+        *engine_lock = Some(engine_tag.to_string());
+    }
     state.set_model_running(true);
     state.bump_model_generation();
 
@@ -2864,11 +3104,12 @@ async fn start_multi_node(
     let key_clone = key.clone();
     let log_writer_stdout = std::sync::Arc::clone(&log_writer);
     let log_writer_stderr = std::sync::Arc::clone(&log_writer);
+    let container_base_clone = container_base.clone();
 
     // 提示用户本地日志路径（便于事后排查）
     let _ = app.emit("model-log", serde_json::json!({
         "model_id": model_id,
-        "line": format!("[多机] vllm 日志实时落盘：{}", local_vllm_log.display()),
+        "line": format!("[多机] {} 日志实时落盘：{}", engine_display, local_vllm_log.display()),
         "source": "stdout",
     }));
 
@@ -2882,7 +3123,7 @@ async fn start_multi_node(
             Some(std::thread::spawn(move || {
                 let reader = BufReader::new(stdout);
                 for line in reader.lines().map_while(Result::ok) {
-                    crate::common::utils::logger::write_log("INFO", "vLLM", &line);
+                    crate::common::utils::logger::write_log("INFO", engine_tag, &line);
                     if let Ok(mut w) = lw.lock() {
                         let _ = writeln!(w, "{}", line);
                         let _ = w.flush();
@@ -2890,10 +3131,14 @@ async fn start_multi_node(
                     app_c.emit("model-log", serde_json::json!({
                         "model_id": &mid, "line": line.clone(), "source": "stdout",
                     })).ok();
-                    if line.contains("Uvicorn running on")
-                        || line.contains("Application startup complete")
-                        || line.contains("Starting vLLM API server")
-                    {
+                    let ready = if is_sglang {
+                        line.contains("The server is fired up and ready to roll!")
+                    } else {
+                        line.contains("Uvicorn running on")
+                            || line.contains("Application startup complete")
+                            || line.contains("Starting vLLM API server")
+                    };
+                    if ready {
                         app_c.emit("model-started", serde_json::json!({
                             "model_id": &mid, "port": port,
                         })).ok();
@@ -2911,7 +3156,7 @@ async fn start_multi_node(
             Some(std::thread::spawn(move || {
                 let reader = BufReader::new(stderr);
                 for line in reader.lines().map_while(Result::ok) {
-                    crate::common::utils::logger::write_log("WARN", "vLLM", &line);
+                    crate::common::utils::logger::write_log("WARN", engine_tag, &line);
                     if let Ok(mut w) = lw.lock() {
                         let _ = writeln!(w, "{}", line);
                         let _ = w.flush();
@@ -2942,10 +3187,10 @@ async fn start_multi_node(
                 .collect::<Vec<_>>()
                 .join("\n");
             if !tail.trim().is_empty() {
-                crate::common::utils::logger::write_log("ERROR", "vLLM", &tail);
+                crate::common::utils::logger::write_log("ERROR", engine_tag, &tail);
                 app_clone2.emit("model-log", serde_json::json!({
                     "model_id": &model_id_clone2,
-                    "line": format!("[vllm exited] 容器日志尾部（清理前抓取）:\n{}", tail),
+                    "line": format!("[{} exited] 容器日志尾部（清理前抓取）:\n{}", engine_tag, tail),
                     "source": "stderr",
                 })).ok();
             }
@@ -2959,7 +3204,7 @@ async fn start_multi_node(
         let key_ref = key_clone.as_deref();
         for (i, node) in mn_clone.nodes.iter().enumerate().skip(1) {
             if node.is_self { continue; }
-            let c = multi_container_name(&model_id_clone2, i);
+            let c = multi_container_name(&container_base_clone, i);
             let script = crate::common::ssh::stop_container_script(&c);
             let _ = crate::common::ssh::ssh_run_blocking(
                 &node.ip, &node.ssh_user, node.ssh_port, key_ref, &script,
@@ -2978,6 +3223,7 @@ async fn start_multi_node(
             *state.running_model_id.lock().unwrap_or_else(|e| e.into_inner()) = None;
             *state.running_port.lock().unwrap_or_else(|e| e.into_inner()) = None;
             *state.running_container.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *state.running_engine.lock().unwrap_or_else(|e| e.into_inner()) = None;
             state.set_model_running(false);
         }
         app_clone2.emit("model-stopped", serde_json::json!({ "model_id": &model_id_clone2 })).ok();
@@ -2990,6 +3236,7 @@ async fn start_multi_node(
         let mn_c = mn.clone();
         let key_c = key.clone();
         let container0_c = container0.clone();
+        let container_base_m = container_base.clone();
         std::thread::spawn(move || {
             let key_ref = key_c.as_deref();
             loop {
@@ -3010,7 +3257,7 @@ async fn start_multi_node(
                 let mut checked = false;
                 for (i, node) in mn_c.nodes.iter().enumerate().skip(1) {
                     if node.is_self { continue; }
-                    let c = multi_container_name(&mid, i);
+                    let c = multi_container_name(&container_base_m, i);
                     let chk = format!("(sudo -n docker ps --filter name={} --format '{{{{.Names}}}} {{{{.Status}}}}' 2>/dev/null || docker ps --filter name={} --format '{{{{.Names}}}} {{{{.Status}}}}' 2>/dev/null)", crate::common::ssh::sh_quote(&c), crate::common::ssh::sh_quote(&c));
                     let status = crate::common::ssh::ssh_run_blocking(
                         &node.ip, &node.ssh_user, node.ssh_port, key_ref, &chk,
@@ -3023,7 +3270,7 @@ async fn start_multi_node(
                         }
                         Ok((_, out, _)) if out.contains("Exited") || out.contains("Dead") => {
                             checked = true;
-                            let log_path = format!("/tmp/adm_vllm_{}_rank_{}.log", mid, i);
+                            let log_path = format!("/tmp/adm_{}_{}_rank_{}.log", engine_tag, mid, i);
                             let tail = crate::common::ssh::ssh_run_blocking(
                                 &node.ip, &node.ssh_user, node.ssh_port, key_ref,
                                 &format!("tail -n 30 {}", crate::common::ssh::sh_quote(&log_path)),
@@ -3086,18 +3333,18 @@ async fn start_vllm_docker(
     // 多机模式由 start_multi_node 强制 mp，用户无需（也不应）手动配置分布式后端。
     vllm_args.distributed_executor_backend.clear();
 
-    // 镜像由远程 model.json 的 vllm_image 字段唯一指定（每模型独立配置），本地不再保留硬编码兜底；
+    // 镜像由远程 model.json 的 engine_image / vllm_image 字段唯一指定（每模型独立配置），本地不再保留硬编码兜底；
     // 缺字段视为模型清单配置错误，直接拒绝启动。
     let image = vllm_image
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| AppError::msg(format!("模型 {} 缺少 vllm_image 配置（远程 model.json 必填）", model_id)))?
+        .ok_or_else(|| AppError::msg(format!("模型 {} 缺少镜像配置（远程 model.json 的 engine_image / vllm_image 必填）", model_id)))?
         .to_string();
     crate::common::utils::logger::write_log("INFO", "DOCKER", &format!("[{}] 使用镜像 {}", model_id, image));
     app.emit("model-log", serde_json::json!({
         "model_id": model_id,
-        "line": format!("使用镜像 {}（模型 vllm_image）", image),
+        "line": format!("使用镜像 {}（模型 engine_image / vllm_image）", image),
         "source": "stdout",
     })).ok();
     let default_shm = match device.as_deref() {
@@ -3123,7 +3370,7 @@ async fn start_vllm_docker(
             let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
             if stdout.contains("VLLM_BIN_MISSING") {
                 let hint = if stdout.contains("IMAGE_IS_SGLANG") {
-                    "（检测到该镜像内是 sglang 而非 vllm：此 tag 实际被 SGLang 镜像占用/打错，请改用真正的 vLLM 镜像，如本清单其他模型使用的 ghcr.io/spark-arena/dgx-vllm-eugr-nightly-b12x）"
+                    "（检测到该镜像内是 sglang 而非 vllm：若这是 SGLang 模型，请在远程 model.json 为该模型标注 \"engine\": \"sglang\"；否则说明此 tag 实际被 SGLang 镜像占用/打错，请改用真正的 vLLM 镜像，如本清单其他模型使用的 ghcr.io/spark-arena/dgx-vllm-eugr-nightly-b12x）"
                 } else {
                     ""
                 };
@@ -3167,70 +3414,13 @@ async fn start_vllm_docker(
         extra_mounts.as_deref().unwrap_or(&[]),
     )?;
 
-    // ===== 设置页「额外环境变量」注入（与多机 build_common_docker_prefix 行为对齐）=====
-    // 每行 KEY=VALUE → -e KEY=VALUE；extra_env 已显式设置 NCCL_DEBUG 时不覆盖，未设置时默认 INFO。
-    // KEY 全大写+数字+下划线 + 长度 > 1 才视为合法（避免误把空行/残行注入）。
-    let mut extra_env_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut extra_env_args: Vec<String> = Vec::new();
-    for line in vllm_args.extra_env.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once('=') {
-            let k = k.trim();
-            let v = v.trim();
-            if !k.is_empty() && !v.is_empty() && k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') && k.len() > 1 {
-                extra_env_keys.insert(k.to_string());
-                extra_env_args.push("-e".to_string());
-                extra_env_args.push(format!("{}={}", k, v));
-            }
-        }
-    }
-    // ===== 模型清单 vllm_env 注入（docker 同名 -e 后者生效 → 模型清单优先级最高，与 vllm_flags 语义一致）=====
-    // 每条 KEY=VALUE → -e KEY=VALUE，紧接 extra_env 之后追加（与多机 build_common_docker_prefix 顺序一致：
-    // extra_env → vllm_env → NCCL_DEBUG 默认值检查，模型显式设置的键会被跳过默认值注入）。
-    // KEY 校验与 extra_env 同规则（全大写+数字+下划线 + 长度 > 1），非法键静默跳过。
-    if let Some(env_list) = vllm_env.as_deref().filter(|e| !e.is_empty()) {
-        let mut applied = Vec::new();
-        for raw in env_list {
-            let raw = raw.trim();
-            if raw.is_empty() {
-                continue;
-            }
-            if let Some((k, v)) = raw.split_once('=') {
-                let k = k.trim();
-                let v = v.trim();
-                let valid_key = !k.is_empty()
-                    && !v.is_empty()
-                    && k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-                    && k.len() > 1;
-                if valid_key {
-                    extra_env_keys.insert(k.to_string());
-                    extra_env_args.push("-e".to_string());
-                    extra_env_args.push(format!("{}={}", k, v));
-                    applied.push(format!("{}={}", k, v));
-                }
-            }
-        }
-        if !applied.is_empty() {
-            app.emit(
-                "model-log",
-                serde_json::json!({
-                    "model_id": model_id,
-                    "line": format!("[模型配置] 已应用模型清单 vllm_env（优先级最高）：{}", applied.join(", ")),
-                    "source": "stdout",
-                }),
-            )
-            .ok();
-            crate::common::utils::logger::write_log("INFO", "MODEL", &format!("[{}] 应用模型清单 vllm_env: {}", model_id, applied.join(", ")));
-        }
-    }
-    // NCCL_DEBUG 默认值：extra_env / vllm_env 均未显式设置时才注入（键集合已含模型清单键）
-    if !extra_env_keys.contains("NCCL_DEBUG") {
-        extra_env_args.push("-e".to_string());
-        extra_env_args.push("NCCL_DEBUG=INFO".to_string());
-    }
+    // ===== 设置页「额外环境变量」+ 模型清单 vllm_env 注入（vLLM / SGLang 单机路径共用 helper）=====
+    let extra_env_args = build_container_env_args(
+        app,
+        model_id,
+        &vllm_args.extra_env,
+        vllm_env.as_deref().unwrap_or(&[]),
+    );
 
     let mut args: Vec<String> = vec![
         "run".to_string(),
@@ -3369,6 +3559,10 @@ async fn start_vllm_docker(
         let mut container_lock = state.running_container.lock().map_err(|e| e.to_string())?;
         *container_lock = Some(container_name.clone());
     }
+    {
+        let mut engine_lock = state.running_engine.lock().map_err(|e| e.to_string())?;
+        *engine_lock = Some("vllm".to_string());
+    }
     state.set_model_running(true);
     state.bump_model_generation();
 
@@ -3465,6 +3659,355 @@ async fn start_vllm_docker(
             *state.running_model_id.lock().unwrap_or_else(|e| e.into_inner()) = None;
             *state.running_port.lock().unwrap_or_else(|e| e.into_inner()) = None;
             *state.running_container.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *state.running_engine.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            state.set_model_running(false);
+        }
+
+        app_clone2
+            .emit("model-stopped", serde_json::json!({ "model_id": &model_id_clone2 }))
+            .ok();
+    });
+
+    Ok(())
+}
+
+/// SGLang Docker 启动（单机）：镜像由模型清单 engine_image 指定（回退 vllm_image），
+/// 模型目录只读挂载，容器前台运行（生命周期 = docker run 进程），
+/// 就绪信号：stdout 出现 "The server is fired up and ready to roll!"（SGLang 官方就绪标志，
+/// 其 uvicorn 启动行早于完全就绪，不能沿用 vLLM 的信号）。
+async fn start_sglang_docker(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, AppState>,
+    model_id: &str,
+    model_dir: &std::path::Path,
+    params: LaunchParams,
+    device: Option<String>,
+    engine_image: Option<String>,
+    engine_flags: Option<Vec<String>>,
+    engine_env: Option<Vec<String>>,
+    extra_mounts: Option<Vec<String>>,
+) -> Result<(), AppError> {
+    const CONTAINER_PREFIX: &str = "adm-sglang-";
+    let container_name = format!("{}{}", CONTAINER_PREFIX, model_id);
+
+    // 设置页 vLLM 参数面板对 SGLang 仅取安全子集（push_sglang_args），其余由模型清单 vllm_flags 承载
+    let settings_path = config::get_data_dir(Some(app))?.join("config.json");
+    let mut sglang_args = VllmArgs::default();
+    if let Ok(json) = std::fs::read_to_string(&settings_path) {
+        if let Ok(parsed) = serde_json::from_str::<Settings>(&json) {
+            sglang_args = parsed.vllm_args;
+        }
+    }
+    sglang_args.distributed_executor_backend.clear();
+
+    let image = engine_image
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::msg(format!("模型 {} 缺少镜像配置（SGLang 引擎需在远程 model.json 指定 engine_image）", model_id)))?
+        .to_string();
+    crate::common::utils::logger::write_log("INFO", "DOCKER", &format!("[{}] 使用 SGLang 镜像 {}", model_id, image));
+    app.emit("model-log", serde_json::json!({
+        "model_id": model_id,
+        "line": format!("使用镜像 {}（引擎 SGLang，模型 engine_image）", image),
+        "source": "stdout",
+    })).ok();
+    let default_shm = match device.as_deref() {
+        Some("dgx-spark-128G") => "64g",
+        _ => "32g",
+    };
+    let shm_size = if sglang_args.shm_size.is_empty() { default_shm.to_string() } else { sglang_args.shm_size.clone() };
+
+    // ===== 启动前 Docker 环境预检（CLI / daemon / GPU runtime / 镜像；返回实际可用镜像名）=====
+    let image = check_docker_env(app, model_id, &image).await?;
+
+    // 镜像内 sglang 包可用性预检（--entrypoint bash 绕开镜像 ENTRYPOINT，无需 GPU）：
+    // 缺失时给出可操作指引；同时检测 vLLM 镜像误标为 SGLang 的场景。
+    {
+        let probe = crate::common::utils::platform::docker_cmd_tokio()
+            .args(["run", "--rm", "--entrypoint", "/bin/bash", &image, "-c",
+                   "if python3 -c \"import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('sglang') else 1)\" >/dev/null 2>&1; then echo SGLANG_PKG_OK; else echo SGLANG_PKG_MISSING; command -v vllm >/dev/null 2>&1 && echo IMAGE_IS_VLLM; fi"])
+            .output();
+        if let Ok(Ok(o)) = tokio::time::timeout(std::time::Duration::from_secs(60), probe).await {
+            let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
+            if stdout.contains("SGLANG_PKG_MISSING") {
+                let hint = if stdout.contains("IMAGE_IS_VLLM") {
+                    "（检测到该镜像内是 vllm 而非 sglang：若这是 vLLM 模型，请去掉远程 model.json 中该模型的 \"engine\": \"sglang\" 配置；否则请改用真正的 SGLang 镜像）"
+                } else {
+                    ""
+                };
+                let msg = format!(
+                    "镜像 {} 内找不到 sglang 包{}（镜像内容可能不完整或被镜像加速器替换）：请执行 `docker rmi {}` 后在模型列表重新下载模型触发重新拉取",
+                    image, hint, image
+                );
+                app.emit("model-log", serde_json::json!({
+                    "model_id": model_id, "line": format!("[ERROR] {}", msg), "source": "stderr",
+                })).ok();
+                bail!("{}", msg);
+            }
+        }
+    }
+
+    let port: u16 = params.port.unwrap_or(8000);
+    // Docker 容器内必须监听 0.0.0.0 才能经 -p 端口映射对外服务
+    let host = "0.0.0.0".to_string();
+
+    {
+        let probe = std::net::TcpListener::bind(("0.0.0.0", port));
+        if probe.is_err() {
+            bail!(
+                "端口 {} 已被占用，请先关闭占用该端口的进程，或在设置页更换监听端口",
+                port
+            );
+        }
+    }
+
+    let _ = crate::common::utils::platform::docker_cmd()
+        .args(["rm", "-f", &container_name])
+        .output();
+
+    let mount_src = model_dir.to_string_lossy().to_string();
+    let mount_dst = format!("/models/{}", model_id);
+    let extra_mounts = resolve_extra_mounts(
+        model_dir.parent().unwrap_or(model_dir),
+        extra_mounts.as_deref().unwrap_or(&[]),
+    )?;
+
+    let extra_env_args = build_container_env_args(
+        app,
+        model_id,
+        &sglang_args.extra_env,
+        engine_env.as_deref().unwrap_or(&[]),
+    );
+
+    let mut args: Vec<String> = vec![
+        "run".to_string(),
+        "-e".to_string(),
+        "PYTHONWARNINGS=ignore::FutureWarning".to_string(),
+        "--name".to_string(),
+        container_name.clone(),
+        "--gpus".to_string(),
+        "all".to_string(),
+        "--shm-size".to_string(),
+        shm_size,
+        "--cap-add".to_string(),
+        "SYS_NICE".to_string(),
+        "--ulimit".to_string(),
+        "stack=67108864".to_string(),
+        "--ipc".to_string(),
+        "host".to_string(),
+        "-p".to_string(),
+        format!("{}:{}", port, port),
+        "-v".to_string(),
+        format!("{}:{}:ro", mount_src, mount_dst),
+    ];
+    for (host_path, container_path) in &extra_mounts {
+        args.push("-v".to_string());
+        args.push(format!("{}:{}:ro", host_path, container_path));
+    }
+    args.extend(extra_env_args);
+    args.push("--entrypoint=".to_string());
+    args.push(image);
+    args.push("python3".to_string());
+    args.push("-m".to_string());
+    args.push("sglang.launch_server".to_string());
+    args.push("--model-path".to_string());
+    args.push(mount_dst);
+    args.push("--host".to_string());
+    args.push(host);
+    args.push("--port".to_string());
+    args.push(port.to_string());
+
+    push_sglang_args(&mut args, &sglang_args, params.ctx_size);
+
+    // 模型清单 vllm_flags（SGLang 配方，如 --tp / --context-length / --json-model-override-args /
+    // --reasoning-parser ling3 等）最后追加，优先级最高
+    if let Some(flags) = engine_flags.as_deref().filter(|f| !f.is_empty()) {
+        let mut applied = Vec::new();
+        for raw in flags {
+            let raw = raw.trim();
+            if raw.is_empty() { continue; }
+            let (k, v) = match raw.split_once(char::is_whitespace) {
+                Some((k, v)) => (k, v.trim()),
+                None => (raw, ""),
+            };
+            let k = k.trim_start_matches("--");
+            if k.is_empty() { continue; }
+            args.push(format!("--{}", k));
+            applied.push(format!("--{}", k));
+            if !v.is_empty() {
+                args.push(v.to_string());
+                applied.push(v.to_string());
+            }
+        }
+        if !applied.is_empty() {
+            app.emit(
+                "model-log",
+                serde_json::json!({
+                    "model_id": model_id,
+                    "line": format!("[模型配置] 已应用模型清单 vllm_flags（SGLang 参数，优先级最高）：{}", applied.join(" ")),
+                    "source": "stdout",
+                }),
+            )
+            .ok();
+            crate::common::utils::logger::write_log("INFO", "MODEL", &format!("[{}] 应用模型清单 vllm_flags（SGLang）: {}", model_id, applied.join(" ")));
+        }
+    }
+
+    dbg_log!("sglang docker args: {:?}", args);
+
+    app.emit(
+        "model-log",
+        serde_json::json!({
+            "model_id": model_id,
+            "line": format!("[DEBUG] full command: docker {:?}", args),
+            "source": "stdout",
+        }),
+    )
+    .ok();
+
+    #[cfg(target_os = "windows")]
+    let mut child = crate::common::utils::platform::docker_cmd()
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            let msg = format!("启动推理引擎容器失败: {}", e);
+            app.emit("model-log", serde_json::json!({
+                "model_id": model_id, "line": format!("[ERROR] {}", msg), "source": "stderr",
+            })).ok();
+            msg
+        })?;
+
+    #[cfg(not(target_os = "windows"))]
+    let mut child = crate::common::utils::platform::spawn_detached(
+        crate::common::utils::platform::docker_cmd().args(&args).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()),
+    )
+    .map_err(|e| {
+        let msg = format!("启动推理引擎容器失败: {}", e);
+        app.emit("model-log", serde_json::json!({
+            "model_id": model_id, "line": format!("[ERROR] {}", msg), "source": "stderr",
+        })).ok();
+        msg
+    })?;
+
+    let pid = child.id();
+
+    {
+        let mut pid_lock = state.running_process.lock().map_err(|e| e.to_string())?;
+        *pid_lock = Some(pid);
+    }
+    {
+        let mut model_lock = state.running_model_id.lock().map_err(|e| e.to_string())?;
+        *model_lock = Some(model_id.to_string());
+    }
+    {
+        let mut port_lock = state.running_port.lock().map_err(|e| e.to_string())?;
+        *port_lock = Some(port);
+    }
+    {
+        let mut container_lock = state.running_container.lock().map_err(|e| e.to_string())?;
+        *container_lock = Some(container_name.clone());
+    }
+    {
+        let mut engine_lock = state.running_engine.lock().map_err(|e| e.to_string())?;
+        *engine_lock = Some("sglang".to_string());
+    }
+    state.set_model_running(true);
+    state.bump_model_generation();
+
+    app.emit(
+        "model-started",
+        serde_json::json!({ "model_id": model_id, "port": port }),
+    )
+    .ok();
+
+    let app_clone = app.clone();
+    let model_id_clone = model_id.to_string();
+    let app_clone2 = app.clone();
+    let model_id_clone2 = model_id.to_string();
+
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+
+        let stdout_handle = if let Some(stdout) = child.stdout.take() {
+            let app_c = app_clone.clone();
+            let mid = model_id_clone.clone();
+            Some(std::thread::spawn(move || {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines().map_while(Result::ok) {
+                    crate::common::utils::logger::write_log("INFO", "SGLang", &line);
+                    app_c
+                        .emit("model-log", serde_json::json!({
+                            "model_id": &mid, "line": line.clone(), "source": "stdout",
+                        }))
+                        .ok();
+                    // SGLang 就绪信号（官方标志；uvicorn 启动行早于完全就绪，不作为就绪条件）
+                    if line.contains("The server is fired up and ready to roll!") {
+                        app_c
+                            .emit("model-started", serde_json::json!({
+                                "model_id": &mid, "port": port,
+                            }))
+                            .ok();
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+
+        let stderr_handle = if let Some(stderr) = child.stderr.take() {
+            let app_c = app_clone.clone();
+            let mid = model_id_clone.clone();
+            Some(std::thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().map_while(Result::ok) {
+                    crate::common::utils::logger::write_log("WARN", "SGLang", &line);
+                    app_c
+                        .emit("model-log", serde_json::json!({
+                            "model_id": &mid, "line": line, "source": "stderr",
+                        }))
+                        .ok();
+                }
+            }))
+        } else {
+            None
+        };
+
+        if let Some(h) = stdout_handle { let _ = h.join(); }
+        if let Some(h) = stderr_handle { let _ = h.join(); }
+
+        let exit_status = child.wait();
+        match &exit_status {
+            Ok(status) => {
+                app_clone2.emit("model-log", serde_json::json!({
+                    "model_id": &model_id_clone2,
+                    "line": format!("[DEBUG] 推理引擎容器退出 with status: {}", status),
+                    "source": "stdout",
+                })).ok();
+            }
+            Err(e) => {
+                app_clone2.emit("model-log", serde_json::json!({
+                    "model_id": &model_id_clone2,
+                    "line": format!("[ERROR] 推理引擎容器等待失败: {}", e),
+                    "source": "stderr",
+                })).ok();
+            }
+        }
+
+        // 容器退出：清理容器与状态
+        let _ = crate::common::utils::platform::docker_cmd()
+            .args(["rm", "-f", &container_name])
+            .output();
+
+        {
+            let state = app_clone2.state::<AppState>();
+            *state.running_process.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *state.running_model_id.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *state.running_port.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *state.running_container.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *state.running_engine.lock().unwrap_or_else(|e| e.into_inner()) = None;
             state.set_model_running(false);
         }
 
@@ -3487,9 +4030,11 @@ pub async fn start_model(
     vllm_flags: Option<Vec<String>>,
     vllm_env: Option<Vec<String>>,
     extra_mounts: Option<Vec<String>>,
+    engine: Option<String>,
+    engine_image: Option<String>,
 ) -> Result<(), AppError> {
     // 统一捕获启动失败并写入本地日志
-    let result = start_model_inner(&app, &state, &model_id, params, device, vllm_image, vllm_flags, vllm_env, extra_mounts).await;
+    let result = start_model_inner(&app, &state, &model_id, params, device, vllm_image, vllm_flags, vllm_env, extra_mounts, engine, engine_image).await;
     if let Err(ref e) = result {
         crate::common::utils::logger::write_log("ERROR", "MODEL", &format!("[{}] 启动失败: {}", model_id, e));
     }
@@ -3506,6 +4051,8 @@ async fn start_model_inner(
     vllm_flags: Option<Vec<String>>,
     vllm_env: Option<Vec<String>>,
     extra_mounts: Option<Vec<String>>,
+    engine: Option<String>,
+    engine_image: Option<String>,
 ) -> Result<(), AppError> {
     {
         let pid_lock = state.running_process.lock().map_err(|e| e.to_string())?;
@@ -3526,19 +4073,35 @@ async fn start_model_inner(
     let models_dir = data_dir.join("models");
     let model_dir = models_dir.join(model_id);
 
-    // ===== 新格式（safetensors 目录模型）：vLLM Docker 启动 =====
+    // ===== 新格式（safetensors 目录模型）：引擎分发（vLLM / SGLang）=====
     let is_dir_model = model_dir.join(".done").exists()
         || (model_dir.join("config.json").exists() && model_dir.join("model.safetensors").exists());
     if is_dir_model {
-        // 多机互联：设置页启用且节点数 >= 2 时走集群启动（单机路径不变）
+        // 有效镜像：engine_image 优先，回退旧字段 vllm_image
+        let effective_image = engine_image
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| vllm_image.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+            .map(|s| s.to_string());
+        // 引擎类型：缺省 = vLLM
+        let is_sglang = engine
+            .as_deref()
+            .map(|s| s.trim().eq_ignore_ascii_case("sglang"))
+            .unwrap_or(false);
+        // 多机互联：设置页启用且节点数 >= 2 时走集群启动（vLLM / SGLang 均支持）
         let (mn, _) = load_multi_node_config(app);
-        if mn.enabled && mn.nodes.len() >= 2 {
-            return start_multi_node(app, state, model_id, &model_dir, params, vllm_image, vllm_flags, vllm_env, extra_mounts).await;
+        let multi_node = mn.enabled && mn.nodes.len() >= 2;
+        if multi_node {
+            return start_multi_node(app, state, model_id, &model_dir, params, effective_image, vllm_flags, vllm_env, extra_mounts, engine).await;
         }
-        return start_vllm_docker(app, state, model_id, &model_dir, params, device, vllm_image, vllm_flags, vllm_env, extra_mounts).await;
+        if is_sglang {
+            return start_sglang_docker(app, state, model_id, &model_dir, params, device, effective_image, vllm_flags, vllm_env, extra_mounts).await;
+        }
+        return start_vllm_docker(app, state, model_id, &model_dir, params, device, effective_image, vllm_flags, vllm_env, extra_mounts).await;
     }
 
-    // 仅支持 vLLM Docker 部署（safetensors 目录模型）
+    // 仅支持 Docker 容器化部署（safetensors 目录模型）
     Err(AppError::msg("当前仅支持推理引擎（safetensors 目录）模型，请下载新版模型后重试"))
 }
 
@@ -3566,7 +4129,9 @@ pub async fn stop_model(app: tauri::AppHandle, state: tauri::State<'_, AppState>
                 } else {
                     Some(mn.ssh_key_path.trim().to_string())
                 };
-                stop_remote_containers(&app, &mn, key.as_deref(), &model_id, 1).await;
+                // 远端容器名与运行中容器同源（兼容 vLLM / SGLang 两种前缀）
+                let base = container_name.strip_suffix("-rank-0").unwrap_or(&container_name);
+                stop_remote_containers(&app, &mn, key.as_deref(), base, 1).await;
             }
         }
         // docker stop/rm 放进 spawn_blocking 并整体限时：docker CLI 卡死（守护进程无响应等）
@@ -3622,6 +4187,10 @@ pub async fn stop_model(app: tauri::AppHandle, state: tauri::State<'_, AppState>
     {
         let mut container_lock = state.running_container.lock().map_err(|e| e.to_string())?;
         *container_lock = None;
+    }
+    {
+        let mut engine_lock = state.running_engine.lock().map_err(|e| e.to_string())?;
+        *engine_lock = None;
     }
     state.set_model_running(false);
 

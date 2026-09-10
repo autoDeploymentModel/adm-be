@@ -43,12 +43,13 @@ fn cleanup_processes(app: &tauri::AppHandle) {
                         } else {
                             Some(mn.ssh_key_path.trim().to_string())
                         };
-                        let model_id = state.running_model_id.lock().ok().and_then(|l| l.clone()).unwrap_or_default();
+                        // 远端容器名与运行中容器同源（<base>-rank-<i>，兼容 vLLM / SGLang 两种前缀）
+                        let base = container.strip_suffix("-rank-0").unwrap_or(&container);
                         for (i, node) in mn.nodes.iter().enumerate().skip(1) {
                             if node.is_self {
                                 continue;
                             }
-                            let c = format!("adm-vllm-{}-rank-{}", model_id, i);
+                            let c = format!("{}-rank-{}", base, i);
                             let script = crate::common::ssh::stop_container_script(&c);
                             let _ = crate::common::ssh::ssh_run_blocking(
                                 &node.ip,

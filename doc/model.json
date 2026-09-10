@@ -199,5 +199,34 @@
         "support_tools": true,
         "support_reasoning": true,
         "support_images": true
+    },
+    {
+        "model_id": "Ling-3.0-flash-VL-fp8",
+        "model_download_files": [
+            "inclusionAI/Ling-3.0-flash-VL-fp8"
+        ],
+        "model_support_devices": [
+            "dgx-spark-128G"
+        ],
+        "engine": "sglang",
+        "engine_image": "lmsysorg/sglang:dev-Ling-3.0-flash-VL",
+        "vllm_flags": [
+            "--tp 2",
+            "--context-length 262144",
+            "--json-model-override-args {\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}",
+            "--mem-fraction-static 0.85",
+            "--trust-remote-code",
+            "--reasoning-parser auto",
+            "--tool-call-parser auto"
+        ],
+        "vllm_env": [
+            "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"
+        ],
+        "model_size": "124 GB",
+        "model_type": "多模态",
+        "model_description": "SGLang 引擎（engine=sglang）：Ling-3.0-flash-VL FP8 原生多模态（124B 总参 / 5.5B 激活），需多机部署（2 节点）",
+        "support_tools": true,
+        "support_reasoning": true,
+        "support_images": true
     }
 ]
