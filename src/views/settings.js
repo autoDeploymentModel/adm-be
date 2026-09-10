@@ -284,7 +284,7 @@ const template = `
           <div class="param-group-title">${_t("基础参数")}</div>
           <div class="param-row">
             <div class="param-label">${_t("最大上下文长度")}<div class="param-key">--max-model-len</div></div>
-            <div class="param-input"><input type="number" id="ctx_size" value="0" min="0"><div class="param-desc">${_t("模型最大上下文长度，留 0 表示使用模型自带默认值")}</div></div>
+            <div class="param-input"><input type="number" id="ctx_size" value="256000" min="0"><div class="param-desc">${_t("模型最大上下文长度，默认 256000")}</div></div>
           </div>
           <div class="param-row">
             <div class="param-label">${_t("共享内存")}<div class="param-key">--shm-size</div></div>
@@ -624,7 +624,7 @@ const template = `
 </div>
 `;
 
-const DEFAULT_CTX_SIZE = 0;
+const DEFAULT_CTX_SIZE = 256000;
 
 const invoke = () => window.__adm_invoke;
 

@@ -276,7 +276,7 @@ const EN = {
   "切换镜像源重试中...": "Retrying with next mirror...",
   "启动中": "Starting",
   "推理引擎": "Inference Engine",
-  "模型最大上下文长度，留 0 表示使用模型自带默认值": "Max context length; 0 uses the model default",
+  "模型最大上下文长度，默认 256000": "Max context length; defaults to 256000",
   "Docker 端口映射（容器内始终监听 0.0.0.0）": "Docker port mapping (container always listens on 0.0.0.0)",
   "Docker 部署": "Docker Deployment",
   "镜像": "Image",

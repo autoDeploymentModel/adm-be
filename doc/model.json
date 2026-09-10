@@ -9,6 +9,7 @@
         ],
         "vllm_image": "eugr/spark-vllm-b12x:nightly-20260908",
         "vllm_flags": [
+            "--max-model-len 256000",
             "--trust-remote-code",
             "--kv-cache-dtype fp8",
             "--block-size 256",
@@ -19,7 +20,7 @@
             "--load-format fastsafetensors",
             "--max-num-seqs 8",
             "--max-num-batched-tokens 8192",
-            "--gpu-memory-utilization 0.85",
+            "--gpu-memory-utilization 0.86",
             "--enable-prefix-caching",
             "--moe-backend b12x",
             "--linear-backend b12x",
@@ -66,6 +67,7 @@
         ],
         "vllm_image": "eugr/spark-vllm-b12x:nightly-20260908",
         "vllm_flags": [
+            "--max-model-len 256000",
             "--trust-remote-code",
             "--kv-cache-dtype fp8",
             "--block-size 256",
@@ -76,7 +78,7 @@
             "--load-format fastsafetensors",
             "--max-num-seqs 8",
             "--max-num-batched-tokens 8192",
-            "--gpu-memory-utilization 0.85",
+            "--gpu-memory-utilization 0.86",
             "--enable-prefix-caching",
             "--moe-backend b12x",
             "--linear-backend b12x",

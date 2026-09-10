@@ -34,18 +34,24 @@ pub async fn save_settings(app: tauri::AppHandle, settings: Settings) -> Result<
     Ok(())
 }
 
+const DEFAULT_CTX_SIZE: i32 = 256000;
+
 #[tauri::command]
 pub async fn load_settings(app: tauri::AppHandle) -> Result<Settings, AppError> {
     let data_dir = config::get_data_dir(Some(&app))?;
     let config_path = data_dir.join("config.json");
 
-    if !config_path.exists() {
+    let mut settings: Settings = if !config_path.exists() {
         dbg_log!("load_settings: config.json not found, returning defaults");
-        return Ok(Settings::default());
-    }
+        Settings::default()
+    } else {
+        let json = std::fs::read_to_string(&config_path).map_err(|e| AppError::msg(format!("读取配置文件失败: {}", e)))?;
+        serde_json::from_str(&json).map_err(|e| AppError::msg(format!("解析配置文件失败: {}", e)))?
+    };
 
-    let json = std::fs::read_to_string(&config_path).map_err(|e| AppError::msg(format!("读取配置文件失败: {}", e)))?;
-    let settings: Settings = serde_json::from_str(&json).map_err(|e| AppError::msg(format!("解析配置文件失败: {}", e)))?;
+    if !matches!(settings.launch_params.ctx_size, Some(ctx) if ctx > 0) {
+        settings.launch_params.ctx_size = Some(DEFAULT_CTX_SIZE);
+    }
 
     Ok(settings)
 }
