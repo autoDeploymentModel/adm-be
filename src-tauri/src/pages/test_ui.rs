@@ -13,10 +13,12 @@
 
 use crate::app_state::AppState;
 use crate::common::error::AppError;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::http::{header, Request, Response, StatusCode};
+use futures_util::{Stream, StreamExt};
 use include_dir::{include_dir, Dir};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 /// 内嵌的 llama-ui 静态构建产物
 static UI_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/ui");
@@ -252,6 +254,7 @@ async fn proxy_to_model(req: Request<Body>) -> Response<Body> {
     };
 
     let method = req.method().clone();
+    let path = req.uri().path().to_string();
     let path_and_query = req
         .uri()
         .path_and_query()
@@ -272,16 +275,25 @@ async fn proxy_to_model(req: Request<Body>) -> Response<Body> {
         forward_headers.remove(key);
     }
 
-    let body_bytes = match axum::body::to_bytes(req.into_body(), PROXY_BODY_LIMIT).await {
+    let mut body_bytes = match axum::body::to_bytes(req.into_body(), PROXY_BODY_LIMIT).await {
         Ok(b) => b,
         Err(e) => return json_error(StatusCode::BAD_REQUEST, &format!("读取请求体失败: {}", e)),
     };
+
+    // llama-ui 依赖 llama.cpp 的 timings 字段显示「prefill / decode 速度」，
+    // vLLM / SGLang 不会主动返回 —— 流式对话请求里补一个 OpenAI 标准的
+    // `stream_options.include_usage`，由代理侧根据响应流补齐 timings（见 sse_timings_stream）
+    let capture_timings = method == axum::http::Method::POST
+        && path == "/v1/chat/completions"
+        && inject_include_usage(&mut body_bytes);
 
     let mut builder = http_client().request(method, &url);
     for (key, value) in forward_headers.iter() {
         builder = builder.header(key, value);
     }
 
+    // t0 尽量贴近上游开始处理的时刻（后续用于估算 prefill 时长）
+    let t0 = Instant::now();
     let upstream = match builder.body(body_bytes).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -299,9 +311,266 @@ async fn proxy_to_model(req: Request<Body>) -> Response<Body> {
             out = out.header(&key, value.clone());
         }
     }
-    // 流式透传（SSE 逐块下发，不缓冲）
-    out.body(Body::from_stream(upstream.bytes_stream()))
+
+    let is_sse = upstream
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.starts_with("text/event-stream"))
+        .unwrap_or(false);
+
+    // 流式对话：透传 SSE 的同时统计并在 [DONE] 前追加 timings 记录
+    let stream: std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
+        if capture_timings && is_sse {
+            Box::pin(sse_timings_stream(upstream.bytes_stream(), t0))
+        } else {
+            Box::pin(upstream.bytes_stream().map(|r| {
+                r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            }))
+        };
+
+    out.body(Body::from_stream(stream))
         .unwrap_or_else(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "构建代理响应失败"))
+}
+
+/// 流式请求体注入 `stream_options.include_usage = true`（vLLM / SGLang 均支持），
+/// 以便拿到 prompt / completion token 数。请求里已有 stream_options 时不改动。
+fn inject_include_usage(body: &mut Bytes) -> bool {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    if value.get("stream").and_then(|v| v.as_bool()) != Some(true) {
+        return false;
+    }
+    if value.get("stream_options").is_some() {
+        return true;
+    }
+    value["stream_options"] = serde_json::json!({ "include_usage": true });
+    match serde_json::to_vec(&value) {
+        Ok(bytes) => {
+            *body = Bytes::from(bytes);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+// ===== SSE timings 合成（llama.cpp 兼容） =====
+
+#[derive(Clone, Copy, Default)]
+struct UsageInfo {
+    prompt_n: u64,
+    completion_n: u64,
+    cached_n: u64,
+}
+
+struct SseTimingsState {
+    buf: Vec<u8>,
+    t0: Instant,
+    t_first: Option<Instant>,
+    t_last: Option<Instant>,
+    content_chunks: u64,
+    usage: Option<UsageInfo>,
+    inner_done: bool,
+}
+
+enum RecordAction {
+    /// 原样透传
+    Forward,
+    /// 用重写后的记录替换原记录（如：内容块内联实时 timings）
+    Replace(Vec<u8>),
+    /// 在记录之前追加一条合成记录（如：[DONE] 前的最终 timings）
+    Prepend(Vec<u8>),
+}
+
+/// 从缓冲区取出一条完整 SSE 记录（以空行结尾）
+fn take_record(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let lf = buf.windows(2).position(|w| w == b"\n\n").map(|p| p + 2);
+    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4);
+    let end = match (lf, crlf) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (x, y) => x.or(y),
+    };
+    end.map(|e| buf.drain(..e).collect())
+}
+
+fn process_record(record: &[u8], st: &mut SseTimingsState) -> RecordAction {
+    let Ok(text) = std::str::from_utf8(record) else {
+        return RecordAction::Forward;
+    };
+    let data_lines: Vec<&str> = text
+        .split('\n')
+        .filter_map(|line| line.trim_start_matches('\r').strip_prefix("data:"))
+        .collect();
+
+    // 结束标记：先把最终 timings 插到 [DONE] 之前
+    if data_lines.iter().any(|p| p.trim() == "[DONE]") {
+        return match build_timings_record(st) {
+            Some(extra) => RecordAction::Prepend(extra),
+            None => RecordAction::Forward,
+        };
+    }
+
+    // 单条 data 的 JSON chunk：解析、统计，并给内容块内联实时 timings
+    if data_lines.len() == 1 {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data_lines[0].trim()) else {
+            return RecordAction::Forward;
+        };
+
+        if let Some(usage) = value.get("usage").filter(|u| !u.is_null()) {
+            st.usage = Some(UsageInfo {
+                prompt_n: usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                completion_n: usage
+                    .get("completion_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                cached_n: usage
+                    .pointer("/prompt_tokens_details/cached_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+            });
+        }
+
+        let has_content = value
+            .pointer("/choices/0/delta")
+            .map(|delta| {
+                ["content", "reasoning_content"].iter().any(|key| {
+                    delta
+                        .get(*key)
+                        .and_then(|v| v.as_str())
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+
+        if has_content {
+            let now = Instant::now();
+            if st.t_first.is_none() {
+                st.t_first = Some(now);
+            }
+            st.t_last = Some(now);
+            st.content_chunks += 1;
+
+            // 实时 timings（等价 llama.cpp 的 timings_per_token）：生成中即可显示 decode 速度
+            if let Some(timings) = live_timings(st) {
+                value["timings"] = timings;
+                if let Ok(serialized) = serde_json::to_string(&value) {
+                    return RecordAction::Replace(format!("data: {}\n\n", serialized).into_bytes());
+                }
+            }
+        }
+    }
+    RecordAction::Forward
+}
+
+/// 生成中的累计 timings（仅 decode 维度；prompt 数据要等 usage 回来）
+fn live_timings(st: &SseTimingsState) -> Option<serde_json::Value> {
+    let t_first = st.t_first?;
+    let t_last = st.t_last.unwrap_or(t_first);
+    let predicted_ms = (t_last.saturating_duration_since(t_first).as_secs_f64() * 1000.0).max(1.0);
+    Some(serde_json::json!({
+        "predicted_n": st.content_chunks,
+        "predicted_ms": predicted_ms.round() as u64,
+        "cache_n": st.usage.map(|u| u.cached_n).unwrap_or(0),
+    }))
+}
+
+/// 生成 llama.cpp 格式的 timings 记录（放在 [DONE] 之前）：
+/// prompt_n / prompt_ms ≈ prefill（首 token 时延），predicted_n / predicted_ms ≈ decode
+fn build_timings_record(st: &SseTimingsState) -> Option<Vec<u8>> {
+    let t_first = st.t_first?;
+    let t_last = st.t_last.unwrap_or(t_first);
+
+    let predicted_n = st
+        .usage
+        .map(|u| u.completion_n)
+        .filter(|n| *n > 0)
+        .unwrap_or(st.content_chunks);
+    if predicted_n == 0 {
+        return None;
+    }
+    let prompt_n = st.usage.map(|u| u.prompt_n).unwrap_or(0);
+    let cache_n = st.usage.map(|u| u.cached_n).unwrap_or(0);
+
+    let prompt_ms = t_first.saturating_duration_since(st.t0).as_secs_f64() * 1000.0;
+    // 至少 1ms，避免 UI 里 predicted_per_second 除零
+    let predicted_ms = (t_last.saturating_duration_since(t_first).as_secs_f64() * 1000.0).max(1.0);
+
+    let record = serde_json::json!({
+        "choices": [],
+        "timings": {
+            "prompt_n": prompt_n,
+            "prompt_ms": prompt_ms.round() as u64,
+            "predicted_n": predicted_n,
+            "predicted_ms": predicted_ms.round() as u64,
+            "cache_n": cache_n,
+        }
+    });
+    Some(format!("data: {}\n\n", record).into_bytes())
+}
+
+fn sse_timings_stream<S>(inner: S, t0: Instant) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+{
+    let state = SseTimingsState {
+        buf: Vec::new(),
+        t0,
+        t_first: None,
+        t_last: None,
+        content_chunks: 0,
+        usage: None,
+        inner_done: false,
+    };
+    futures_util::stream::unfold((Box::pin(inner), state), |(mut inner, mut st)| async move {
+        loop {
+            if let Some(record) = take_record(&mut st.buf) {
+                return match process_record(&record, &mut st) {
+                    RecordAction::Forward => Some((Ok(Bytes::from(record)), (inner, st))),
+                    RecordAction::Replace(new_record) => {
+                        Some((Ok(Bytes::from(new_record)), (inner, st)))
+                    }
+                    RecordAction::Prepend(extra) => {
+                        // 合成记录必须在原记录之前下发（如 timings 先于 [DONE]）
+                        let mut out = extra;
+                        out.extend_from_slice(&record);
+                        Some((Ok(Bytes::from(out)), (inner, st)))
+                    }
+                };
+            }
+            if st.inner_done {
+                if !st.buf.is_empty() {
+                    let tail: Vec<u8> = st.buf.drain(..).collect();
+                    let out = match process_record(&tail, &mut st) {
+                        RecordAction::Forward => tail,
+                        RecordAction::Replace(new_record) => new_record,
+                        RecordAction::Prepend(extra) => {
+                            let mut out = extra;
+                            out.extend_from_slice(&tail);
+                            out
+                        }
+                    };
+                    return Some((Ok(Bytes::from(out)), (inner, st)));
+                }
+                return None;
+            }
+            match inner.next().await {
+                Some(Ok(chunk)) => st.buf.extend_from_slice(&chunk),
+                Some(Err(e)) => {
+                    st.inner_done = true;
+                    return Some((
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("上游流中断: {}", e),
+                        )),
+                        (inner, st),
+                    ));
+                }
+                None => st.inner_done = true,
+            }
+        }
+    })
 }
 
 // ===== 静态资源 =====
@@ -445,8 +714,11 @@ mod tests {
         g.vision = true;
     }
 
-    /// 模拟 vLLM：/v1/models + 流式 /v1/chat/completions，其余 404
-    async fn spawn_mock_upstream() -> u16 {
+    /// 模拟 vLLM：/v1/models + 流式 /v1/chat/completions（含 usage 块），其余 404
+    /// 返回 (端口, 收到的 chat 请求体)
+    async fn spawn_mock_upstream() -> (u16, Arc<Mutex<Option<String>>>) {
+        let seen_body: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let seen_body_clone = seen_body.clone();
         let router = axum::Router::new()
             .route(
                 "/v1/models",
@@ -459,25 +731,42 @@ mod tests {
             )
             .route(
                 "/v1/chat/completions",
-                post(|| async {
-                    let stream = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
-                        axum::body::Bytes::from_static(
+                post(move |body: String| {
+                    let seen = seen_body_clone.clone();
+                    async move {
+                        *seen.lock().unwrap() = Some(body);
+                        let stream = futures_util::stream::iter(vec![
+                        Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+                            b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+                        )),
+                        Ok(axum::body::Bytes::from_static(
                             b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
-                        ),
-                    )]);
+                        )),
+                        Ok(axum::body::Bytes::from_static(
+                            b"data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n\n",
+                        )),
+                        Ok(axum::body::Bytes::from_static(
+                            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                        )),
+                        Ok(axum::body::Bytes::from_static(
+                            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":2,\"total_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":3}}}\n\n",
+                        )),
+                        Ok(axum::body::Bytes::from_static(b"data: [DONE]\n\n")),
+                    ]);
                     Response::builder()
                         .header(header::CONTENT_TYPE, "text/event-stream")
                         .body(Body::from_stream(stream))
                         .unwrap()
+                    }
                 }),
             );
-        spawn_server(router).await
+        (spawn_server(router).await, seen_body)
     }
 
     #[tokio::test]
     async fn static_props_and_proxy_work() {
         let _guard = TEST_LOCK.lock().unwrap();
-        let up_port = spawn_mock_upstream().await;
+        let (up_port, seen_body) = spawn_mock_upstream().await;
         set_target(up_port);
         let ui_port = spawn_server(build_router()).await;
         let base = format!("http://127.0.0.1:{}", ui_port);
@@ -518,18 +807,54 @@ mod tests {
         assert_eq!(props["model_path"], "mock-7b");
         assert_eq!(props["role"], "model");
 
-        // 5) /v1/* 透传（含 SSE 流式响应）
+        // 5) /v1/* 透传（含 SSE 流式响应 + timings 合成）
         let resp = client.get(format!("{}/v1/models", base)).send().await.unwrap();
         assert_eq!(resp.status(), 200);
         let resp = client
             .post(format!("{}/v1/chat/completions", base))
-            .json(&serde_json::json!({ "stream": true }))
+            .json(&serde_json::json!({ "stream": true, "messages": [{ "role": "user", "content": "hi" }] }))
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
+
+        // 5a) 请求体被注入 stream_options.include_usage
+        let echoed = seen_body.lock().unwrap().clone().unwrap_or_default();
+        assert!(
+            echoed.contains("\"include_usage\":true"),
+            "应注入 stream_options.include_usage，实际: {}",
+            echoed
+        );
+
         let text = resp.text().await.unwrap();
         assert!(text.contains("data: "), "SSE 数据应透传");
+        assert!(text.contains("\"content\":\"hi\""), "内容块应透传并内联实时 timings");
+
+        // 5b) 内容块内联了实时 timings（等价 timings_per_token）
+        let live_line = text
+            .lines()
+            .find(|l| l.contains("\"content\":\"hi\""))
+            .unwrap();
+        let live: serde_json::Value =
+            serde_json::from_str(live_line.trim_start_matches("data: ")).unwrap();
+        assert!(live["timings"]["predicted_n"].as_u64().unwrap_or(0) >= 1);
+        assert!(live["timings"]["predicted_ms"].as_u64().unwrap_or(0) >= 1);
+
+        // 5c) [DONE] 之前追加最终 timings 记录，数值来自 usage
+        let done_idx = text.find("[DONE]").expect("应包含 [DONE]");
+        let timings_idx = text.find("\"prompt_n\"").expect("应合成最终 timings");
+        assert!(timings_idx < done_idx, "最终 timings 必须出现在 [DONE] 之前");
+        let final_line = text
+            .lines()
+            .find(|l| l.contains("\"prompt_n\""))
+            .unwrap()
+            .trim_start_matches("data: ");
+        let chunk: serde_json::Value = serde_json::from_str(final_line).unwrap();
+        assert_eq!(chunk["timings"]["prompt_n"], 11);
+        assert_eq!(chunk["timings"]["predicted_n"], 2);
+        assert_eq!(chunk["timings"]["cache_n"], 3);
+        assert!(chunk["timings"]["prompt_ms"].as_u64().is_some());
+        assert!(chunk["timings"]["predicted_ms"].as_u64().unwrap_or(0) >= 1);
     }
 
     #[tokio::test]
