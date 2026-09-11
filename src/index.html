@@ -119,7 +119,7 @@
 
     #home-btn,
     #settings-btn,
-    #benchmark-btn {
+    #test-btn {
       cursor: pointer;
       font-size: 13px;
       padding: 2px 10px;
@@ -144,13 +144,13 @@
 
     #home-btn:hover,
     #settings-btn:hover,
-    #benchmark-btn:hover {
+    #test-btn:hover {
       color: var(--c-accent);
     }
 
     #home-btn.active,
     #settings-btn.active,
-    #benchmark-btn.active {
+    #test-btn.active {
       background: rgba(var(--c-accent-rgb), 0.20);
       color: var(--c-text-hi);
       border-radius: 6px;
@@ -158,7 +158,7 @@
     }
     #home-btn.active .btn-icon,
     #settings-btn.active .btn-icon,
-    #benchmark-btn.active .btn-icon {
+    #test-btn.active .btn-icon {
       color: var(--c-accent);
     }
 
@@ -324,7 +324,7 @@
         <span class="btn-icon">&#9881;</span>
         <span class="btn-text" data-i18n="设置">设置</span>
       </div>
-      <div id="benchmark-btn" onclick="location.hash='#/benchmark'">
+      <div id="test-btn" onclick="location.hash='#/test'">
         <span class="btn-icon">&#9889;</span>
         <span class="btn-text" data-i18n="测试">测试</span>
       </div>
@@ -401,7 +401,7 @@
 
     // ===== 导航激活态 =====
     function setActiveNav(id) {
-      ["home-btn", "settings-btn", "benchmark-btn"].forEach(function (b) {
+      ["home-btn", "settings-btn", "test-btn"].forEach(function (b) {
         const el = document.getElementById(b);
         if (el) el.classList.toggle("active", b === id);
       });
@@ -534,7 +534,7 @@
     const routes = {
       "/list":     { load: () => import("./views/model_list.js"),     nav: "home-btn" },
       "/settings": { load: () => import("./views/settings.js"),       nav: "settings-btn" },
-      "/benchmark": { load: () => import("./views/benchmark.js"),   nav: "benchmark-btn" },
+      "/test":     { load: () => import("./views/test.js"),           nav: "test-btn" },
     };
 
     let currentView = null;

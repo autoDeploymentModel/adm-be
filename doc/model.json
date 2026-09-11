@@ -7,9 +7,10 @@
         "model_support_devices": [
             "dgx-spark-128G"
         ],
+        "engine": "vllm",
         "vllm_image": "eugr/spark-vllm-b12x:nightly-20260908",
         "vllm_flags": [
-            "--max-model-len 256000",
+            "--max-model-len 262144",
             "--trust-remote-code",
             "--kv-cache-dtype fp8",
             "--block-size 256",
@@ -65,9 +66,10 @@
         "model_support_devices": [
             "dgx-spark-128G"
         ],
+        "engine": "vllm",
         "vllm_image": "eugr/spark-vllm-b12x:nightly-20260908",
         "vllm_flags": [
-            "--max-model-len 256000",
+            "--max-model-len 262144",
             "--trust-remote-code",
             "--kv-cache-dtype fp8",
             "--block-size 256",
@@ -123,6 +125,7 @@
         "model_support_devices": [
             "dgx-spark-128G"
         ],
+        "engine": "vllm",
         "vllm_image": "eugr/spark-vllm-b12x:nightly-20260908",
         "vllm_flags": [
             "--trust-remote-code",
@@ -174,6 +177,7 @@
         "model_support_devices": [
             "dgx-spark-128G"
         ],
+        "engine": "vllm",
         "vllm_image": "vllm-qwen38-fn-ple:20260828",
         "vllm_flags": [
             "--enable-expert-parallel",

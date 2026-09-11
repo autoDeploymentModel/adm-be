@@ -108,6 +108,7 @@ const EN = {
   "全部测试": "Test all",
   "测试": "Test",
   "未测试": "Not tested",
+  "测试中...": "Testing...",
   "本机": "This machine",
   "正常": "OK",
   "失败": "Failed",
@@ -379,17 +380,12 @@ const EN = {
   "日志已清空": "Logs cleared",
   "清空失败: ": "Failed to clear: ",
 
-  // ===== benchmark.js =====
-  "性能测试": "Benchmark",
-  "输入长度 (tokens)": "Input Length (tokens)",
-  "输出长度 (tokens)": "Output Length (tokens)",
-  "请求数": "Requests",
-  "开始测试": "Start Benchmark",
-  "测试中...": "Running...",
-  "测试启动中...": "Starting benchmark...",
-  "点击开始测试，测试结果将显示在此处": "Click start to run benchmark. Results will appear here.",
-  "测试启动失败: ": "Failed to start benchmark: ",
-  "测试未成功完成": "Benchmark did not complete successfully",
+  // ===== test.js =====
+  "模型测试": "Model Test",
+  "请先在首页启动模型，启动后即可在此对话测试": "Start a model on the Home page first — you can chat with it here afterwards.",
+  "测试页面加载中...": "Loading test page...",
+  "测试页面加载失败: ": "Failed to load test page: ",
+  "在浏览器中打开": "Open in browser",
 };
 
 let lang = "zh";

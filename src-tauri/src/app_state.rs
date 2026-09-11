@@ -21,8 +21,6 @@ pub struct AppState {
     /// 全局标识：是否有模型成功启动
     pub model_running: Mutex<bool>,
     pub model_generation: Mutex<u64>,
-    /// 性能测试是否正在进行
-    pub benchmark_running: Mutex<bool>,
 }
 
 impl AppState {
@@ -40,7 +38,6 @@ impl AppState {
             config_write_lock: std::sync::Mutex::new(()),
             model_running: Mutex::new(false),
             model_generation: Mutex::new(0),
-            benchmark_running: Mutex::new(false),
         }
     }
 
