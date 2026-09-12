@@ -129,6 +129,8 @@ pub struct DockerMirrorConfig {
     pub daemon_path: String,
     pub exists: bool,
     pub mirrors: Vec<String>,
+    /// daemon.json 中是否已存在 registry-mirrors 键（区分「用户显式清空」与「从未配置」）
+    pub configured: bool,
     pub platform: &'static str,
 }
 
@@ -148,23 +150,24 @@ pub async fn get_docker_mirror_config() -> Result<DockerMirrorConfig, AppError> 
     let path = docker_daemon_path();
     let path_obj = std::path::Path::new(&path);
     let exists = path_obj.exists();
-    let mirrors = if exists {
+    let daemon: Option<serde_json::Value> = if exists {
         std::fs::read_to_string(path_obj)
             .ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|v| {
-                v["registry-mirrors"]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
-            })
-            .unwrap_or_default()
     } else {
-        Vec::new()
+        None
     };
+    let configured = daemon.as_ref().map(|v| v.get("registry-mirrors").is_some()).unwrap_or(false);
+    let mirrors = daemon
+        .as_ref()
+        .and_then(|v| v["registry-mirrors"].as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
     Ok(DockerMirrorConfig {
         daemon_path: path,
         exists,
         mirrors,
+        configured,
         platform: if cfg!(target_os = "windows") { "windows" } else { "linux" },
     })
 }

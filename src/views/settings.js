@@ -1369,7 +1369,8 @@ async function loadDockerMirrorConfig() {
     const pathEl = document.getElementById("mirror-daemon-path");
     if (pathEl) pathEl.textContent = cfg.daemonPath + (cfg.exists ? "" : _t("（不存在，保存时将新建）"));
     const ta = document.getElementById("mirror-list");
-    if (ta) ta.value = (cfg.mirrors && cfg.mirrors.length ? cfg.mirrors : DEFAULT_DOCKER_MIRRORS).join("\n");
+    // 仅「从未配置过」时填入默认值；用户显式保存空列表（直连 Docker Hub）后保持为空，不再回填
+    if (ta) ta.value = (cfg.configured ? (cfg.mirrors || []) : DEFAULT_DOCKER_MIRRORS).join("\n");
     if (statusEl) statusEl.textContent = "";
   } catch (e) {
     if (statusEl) statusEl.textContent = _t("读取失败: ") + e;
