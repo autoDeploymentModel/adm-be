@@ -671,14 +671,14 @@ async fn hfd_download_one(
     use tokio::io::AsyncBufReadExt;
 
     // 进度基准：本仓库文件清单（含大小），按 include 模式过滤；
-    // 拉取失败则退化为纯日志跟随（进度停在 0%）
+    // 拉取失败时在轮询循环里退回 hfd 自带清单（`.hfd/manifest`），避免进度停在 0%
     let api_endpoint = if endpoint.is_empty() { "https://huggingface.co" } else { endpoint };
     let http = crate::common::utils::proxy::build_download_http(
         app,
         Some(std::time::Duration::from_secs(60)),
     )
     .await?;
-    let repo_files = fetch_repo_files(&http.client, api_endpoint, repo)
+    let mut repo_files = fetch_repo_files(&http.client, api_endpoint, repo)
         .await
         .map(|files| {
             files
@@ -785,6 +785,18 @@ async fn hfd_download_one(
                     )
                     .ok();
                     return Ok(HfdOutcome::Cancelled);
+                }
+                // 基准拉取失败时退回 hfd 自带清单（hfd 列完文件后写 `<local-dir>/.hfd/manifest`，
+                // 内容同样按 --include 过滤）：缺基准会让整段下载的进度都停在 0%
+                if repo_files.is_none() {
+                    repo_files = read_hfd_manifest(model_dir);
+                    if repo_files.is_some() {
+                        crate::common::utils::logger::write_log(
+                            "INFO",
+                            "DOWNLOAD",
+                            &format!("[{}] 进度基准改用 hfd 清单（HF API 不可达）", model_id),
+                        );
+                    }
                 }
                 if let Some(files) = &repo_files {
                     let (overall, bytes, cur_file) = hfd_poll_progress(model_dir, files);
@@ -983,49 +995,92 @@ async fn fetch_repo_files(
     )
 }
 
+/// 读取 hfd.sh 自己的下载清单（`<local-dir>/.hfd/manifest`，行格式 `大小\t相对路径`）
+/// 作为进度基准的兜底：内容与 hfd 实际下载的文件一致（已按 --include 过滤），
+/// HF API 不可达或首次运行尚未生成清单时返回 None。
+fn read_hfd_manifest(model_dir: &std::path::Path) -> Option<Vec<(String, u64)>> {
+    let text = std::fs::read_to_string(model_dir.join(".hfd").join("manifest")).ok()?;
+    let mut out: Vec<(String, u64)> = Vec::new();
+    for line in text.lines() {
+        let Some((size, path)) = line.trim_end().split_once('\t') else { continue };
+        let path = path.trim().trim_start_matches("./").to_string();
+        if path.is_empty() || path.starts_with('.') {
+            continue;
+        }
+        out.push((path, size.trim().parse::<u64>().unwrap_or(0)));
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 /// 轮询模型目录折算下载进度（递归扫 depth ≤ 3 子目录，仓库含文件夹时进度仍可折算）：
-/// 已完成 = 文件在且无对应 `.aria2` 控件且（大小未知或已到齐）——aria2 预分配会导致
-/// 未完成文件长度等于全量，必须以 `.aria2` 控件存在性为准；wget 模式无控件，按
-/// 长度 < 预期大小判断未完成并折算小数进度。返回 (总进度百分比, 已落盘字节, 进行中文件名)。
+/// 按**字节**折算——仓库内文件大小差异极大（如 H3 = 两个 21 GB DiT + 15.7 GB 编码器 + 若干小文件），
+/// 按文件数折算会被大文件拖成「长时间停在 0%」，断点续传后更是显示 0% 不动。
+/// 已完成 = 文件在且无对应 `.aria2` 控件且（大小未知或已到齐）→ 计预期全量；
+/// 进行中的文件（含续传留下的部分文件）计已落盘字节（见 hfd_scan_dir）。
+/// 返回 (总进度百分比, 已落盘字节, 进行中文件名)。
 fn hfd_poll_progress(model_dir: &std::path::Path, files: &[(String, u64)]) -> (u8, u64, Option<String>) {
-    let mut present: Vec<(String, u64)> = Vec::new();
+    let mut present: Vec<(String, u64, u64)> = Vec::new();
     hfd_scan_dir(model_dir, "", 3, &mut present);
-    let lens: std::collections::HashMap<&str, u64> =
-        present.iter().map(|(n, l)| (n.as_str(), *l)).collect();
+    let disk: std::collections::HashMap<&str, (u64, u64)> =
+        present.iter().map(|(n, l, a)| (n.as_str(), (*l, *a))).collect();
+    let total_known: u64 = files.iter().map(|(_, s)| *s).sum();
     let mut done = 0usize;
-    let mut bytes = 0u64;
+    let mut downloaded = 0u64;
     let mut frac = 0f32;
     let mut cur: Option<(String, u64)> = None;
     for (name, size) in files {
-        let len = lens.get(name.as_str()).copied();
+        let Some((len, allocated)) = disk.get(name.as_str()).copied() else { continue };
+        // aria2 断点续传时文件带 `.aria2` 控件：即使长度已到齐也需以控件消失为完成标志
         let aria2 = model_dir.join(format!("{}.aria2", name)).exists();
-        match len {
-            Some(l) if !aria2 && (*size == 0 || l >= *size) => {
-                done += 1;
-                bytes += l;
+        let is_done = !aria2 && (*size == 0 || len >= *size);
+        let written = if is_done {
+            if *size > 0 {
+                *size
+            } else {
+                len
             }
-            Some(l) => {
-                // aria2 预分配使文件长度不代表真实进度，不计入速度累计
-                if !aria2 {
-                    bytes += l;
-                    if *size > 0 {
-                        frac += (l as f32 / *size as f32).min(1.0);
-                    }
-                }
-                if cur.as_ref().map(|(_, cl)| l > *cl).unwrap_or(true) {
-                    cur = Some((name.clone(), l));
-                }
-            }
-            None => {}
+        } else if *size > 0 {
+            // 已分配块数（稀疏感知）即真实已落盘字节，按预期大小裁剪
+            allocated.min(*size)
+        } else {
+            allocated
+        };
+        downloaded += written;
+        if is_done {
+            done += 1;
+            continue;
+        }
+        if *size > 0 {
+            frac += (written as f32 / *size as f32).min(1.0);
+        }
+        if cur.as_ref().map(|(_, cw)| written > *cw).unwrap_or(true) {
+            cur = Some((name.clone(), written));
         }
     }
-    let total = files.len().max(1);
-    let overall = (((done as f32 + frac) * 100.0 / total as f32).min(99.0)) as u8;
-    (overall, bytes, cur.map(|c| c.0))
+    let overall = if total_known > 0 {
+        ((downloaded as f64 * 100.0 / total_known as f64).min(99.0)) as u8
+    } else {
+        // 清单未带大小（API 未返回 size）→ 退回按文件数折算
+        (((done as f32 + frac) * 100.0 / files.len().max(1) as f32).min(99.0)) as u8
+    };
+    (overall, downloaded, cur.map(|c| c.0))
 }
 
-/// 递归收集 dir 下相对路径文件（跳过点开头/`.aria2` 控件外的中间产物已由调用方过滤）
-fn hfd_scan_dir(dir: &std::path::Path, prefix: &str, depth: usize, out: &mut Vec<(String, u64)>) {
+/// 递归收集 dir 下相对路径文件 → (相对路径, 文件长度, 已落盘字节估计)
+/// （跳过点开头条目：`.done` / `.aria2` 控件 / hfd 的 `.hfd` 状态目录）。
+/// 已落盘字节用于折算 aria2 多段并行下载的真实进度：`--file-allocation=none` 下文件按段
+/// 稀疏写入，文件长度会在开始后瞬间逼近全量（最后一段立刻开始写），只有已分配的数据块
+/// 代表真实进度；其它平台退回文件长度。
+fn hfd_scan_dir(
+    dir: &std::path::Path,
+    prefix: &str,
+    depth: usize,
+    out: &mut Vec<(String, u64, u64)>,
+) {
     if depth == 0 {
         return;
     }
@@ -1040,7 +1095,7 @@ fn hfd_scan_dir(dir: &std::path::Path, prefix: &str, depth: usize, out: &mut Vec
         if p.is_dir() {
             hfd_scan_dir(&p, &rel, depth - 1, out);
         } else if let Ok(m) = e.metadata() {
-            out.push((rel, m.len()));
+            out.push((rel, m.len(), crate::common::utils::download::file_allocated_bytes(&m)));
         }
     }
 }

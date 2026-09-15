@@ -79,6 +79,8 @@ pub struct ComfyuiSetupStatus {
     pub weights_dir: String,
     /// 权重是否就绪（diffusion_models/ 与 text_encoders/ 下各有 ≥1 个 .safetensors）
     pub weights_downloaded: bool,
+    /// 是否存在断点续传现场（目录里有 `.aria2` 控件）→ 页面按钮显示「继续下载」
+    pub weights_partial: bool,
     /// 权重目录下 .safetensors 总字节数（页面折算 GB 展示）
     pub weights_bytes: u64,
 }
@@ -94,21 +96,30 @@ async fn image_exists_locally(image: &str) -> bool {
     }
 }
 
-/// 统计目录下（含一层子目录）指定类型文件的数量与总大小。
-fn scan_dir_counts(dir: &std::path::Path, depth: usize) -> (usize, u64) {
+/// 统计目录下（含一层子目录）指定类型文件的数量与已落盘字节：
+/// 数量只计已完成文件（有 `.aria2` 续传控件或未到齐的不算）；字节含续传中文件的已落盘部分，
+/// 并报告目录树里是否存在续传控件（`partial=true` 即仍在下载中）。
+fn scan_dir_counts(dir: &std::path::Path, depth: usize) -> (usize, u64, bool) {
     let mut count = 0usize;
     let mut bytes = 0u64;
+    let mut partial = false;
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return (0, 0);
+        return (0, 0, false);
     };
     for e in entries.flatten() {
         let p = e.path();
         if p.is_dir() {
             if depth > 1 {
-                let (c, b) = scan_dir_counts(&p, depth - 1);
+                let (c, b, pf) = scan_dir_counts(&p, depth - 1);
                 count += c;
                 bytes += b;
+                partial |= pf;
             }
+            continue;
+        }
+        // 续传控件：有它说明同目录下仍有未完成文件（即使长度已到齐）
+        if p.extension().map(|x| x.eq_ignore_ascii_case("aria2")).unwrap_or(false) {
+            partial = true;
             continue;
         }
         let is_model = p
@@ -118,20 +129,23 @@ fn scan_dir_counts(dir: &std::path::Path, depth: usize) -> (usize, u64) {
         if !is_model {
             continue;
         }
-        // aria2 预分配会让未完成文件也达到全量长度：有同名 .aria2 控件时视为未完成，不计入
+        // aria2 预分配会让未完成文件也达到全量长度：有同名 .aria2 控件时不计入完成数，
+        // 但已落盘字节仍计入（页面「已中断（已下载 xx GB）」不能只算完成文件）
         let aria2 = p.with_file_name(format!(
             "{}.aria2",
             p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
         ));
-        if aria2.exists() {
-            continue;
-        }
         if let Ok(m) = e.metadata() {
-            count += 1;
-            bytes += m.len();
+            if aria2.exists() {
+                partial = true;
+                bytes += crate::common::utils::download::file_allocated_bytes(&m);
+            } else {
+                count += 1;
+                bytes += m.len();
+            }
         }
     }
-    (count, bytes)
+    (count, bytes, partial)
 }
 
 /// ComfyUI 安装状态：镜像是否已构建 + 权重是否已下载。
@@ -152,15 +166,17 @@ pub async fn comfyui_setup_status(
         image_exists_locally(&image).await
     };
 
-    let (dit_count, dit_bytes) = scan_dir_counts(&weights_dir.join("diffusion_models"), 2);
-    let (enc_count, enc_bytes) = scan_dir_counts(&weights_dir.join("text_encoders"), 2);
+    let (dit_count, dit_bytes, dit_partial) = scan_dir_counts(&weights_dir.join("diffusion_models"), 2);
+    let (enc_count, enc_bytes, enc_partial) = scan_dir_counts(&weights_dir.join("text_encoders"), 2);
 
     Ok(ComfyuiSetupStatus {
         image,
         image_exists,
         build_dir: build_dir.to_string_lossy().to_string(),
         weights_dir: weights_dir.to_string_lossy().to_string(),
-        weights_downloaded: dit_count > 0 && enc_count > 0,
+        // 仍在断点续传（存在 .aria2 控件）时不算已下载，页面继续提供「下载权重」按钮
+        weights_downloaded: dit_count > 0 && enc_count > 0 && !dit_partial && !enc_partial,
+        weights_partial: dit_partial || enc_partial,
         weights_bytes: dit_bytes + enc_bytes,
     })
 }

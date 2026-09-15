@@ -30,6 +30,21 @@ pub fn is_cancelled(err: &AppError) -> bool {
     matches!(err, AppError::Cancelled(_))
 }
 
+/// 文件已落盘字节估计：Unix 用已分配块数（稀疏感知），其它平台退回文件长度。
+/// aria2 多段并行下载（`--file-allocation=none`）按段稀疏写盘，文件长度会瞬间逼近全量，
+/// 只有已分配的数据块代表真实进度——进度折算与「已下载 xx GB」均以此为准。
+pub fn file_allocated_bytes(m: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        m.blocks().saturating_mul(512)
+    }
+    #[cfg(not(unix))]
+    {
+        m.len()
+    }
+}
+
 /// 带断点续传的通用文件下载函数。
 ///
 /// - 如果 `final_path` 已存在，跳过下载（文件已完成）。

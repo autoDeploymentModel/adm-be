@@ -297,8 +297,10 @@ const LOG_LIMIT = 600;
 /** @type {{text: string, source: string}[]} */
 let logLines = [];
 /** 环境就绪状态（镜像 / 权重），由后端 comfyui_setup_status 返回 */
-let setup = /** @type {any} */ ({ image_exists: false, weights_downloaded: false, weights_bytes: 0, build_dir: "", weights_dir: "" });
+let setup = /** @type {any} */ ({ image_exists: false, weights_downloaded: false, weights_partial: false, weights_bytes: 0, build_dir: "", weights_dir: "" });
 let buildingImage = false;
+/** 权重下载速度（bytes/s，来自 download-progress 事件，仅用于本页展示） */
+let downloadSpeed = 0;
 /** @type {number | null} */
 let toastTimer = null;
 
@@ -440,20 +442,22 @@ function render() {
     buildBtn.disabled = buildingImage || !!setup.image_exists;
     buildBtn.textContent = setup.image_exists ? _t("已构建") : _t("构建镜像");
     if (downloading) {
-      weightsState.textContent = _t("下载中") + " " + dlProgress + "%";
+      const speed = formatSpeed(downloadSpeed);
+      weightsState.textContent = _t("下载中") + " " + dlProgress + "%" + (speed ? " · " + speed : "");
       weightsBtn.textContent = _t("停止下载");
       weightsBtn.disabled = false;
       progressWrap.style.display = "block";
       el("video-progress-bar").style.width = dlProgress + "%";
     } else {
-      weightsState.textContent = setup.weights_downloaded
-        ? _t("已下载") + "（" + formatBytes(setup.weights_bytes) + "）"
-        : _t("未下载") + _t("（首次约 67 GB）");
       if (setup.weights_downloaded) {
+        weightsState.textContent = _t("已下载") + "（" + formatBytes(setup.weights_bytes) + "）";
         weightsBtn.textContent = _t("已下载");
         weightsBtn.disabled = true;
       } else {
-        weightsBtn.textContent = _t("下载权重");
+        weightsState.textContent = setup.weights_partial
+          ? _t("已中断") + "（" + formatBytes(setup.weights_bytes) + _t("，可继续断点续传）")
+          : _t("未下载") + _t("（首次约 67 GB）");
+        weightsBtn.textContent = setup.weights_partial ? _t("继续下载") : _t("下载权重");
         weightsBtn.disabled = false;
       }
       progressWrap.style.display = "none";
@@ -484,6 +488,14 @@ function render() {
 function formatBytes(bytes) {
   if (!bytes || bytes <= 0) return "0 GB";
   return (bytes / 1e9).toFixed(1) + " GB";
+}
+
+/** 下载速度（bytes/s → 人类可读；未知/0 返回空串） @param {number} bytesPerSec */
+function formatSpeed(bytesPerSec) {
+  if (!bytesPerSec || bytesPerSec <= 0) return "";
+  return bytesPerSec >= 1e9
+    ? (bytesPerSec / 1e9).toFixed(1) + " GB/s"
+    : Math.round(bytesPerSec / 1e6) + " MB/s";
 }
 
 /** 查询镜像/权重就绪状态（后端 comfyui_setup_status） */
@@ -685,11 +697,18 @@ export default {
       if (!e || !p.model_id || p.model_id === e.model_id) appendLog(String(p.line || ""), String(p.source || "stdout"));
       return;
     }
-    if (type === "model-pull-progress" || type === "download-progress" || type === "download-cancelled" || type === "download-error") {
+    if (type === "download-progress") {
+      downloadSpeed = Number(p.speed) || 0;
+      render();
+      return;
+    }
+    if (type === "model-pull-progress" || type === "download-cancelled" || type === "download-error") {
+      if (type !== "model-pull-progress") downloadSpeed = 0;
       render();
       return;
     }
     if (type === "download-complete") {
+      downloadSpeed = 0;
       void (async function () {
         await refreshSetup();
         render();
