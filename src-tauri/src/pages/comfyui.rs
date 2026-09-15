@@ -186,26 +186,25 @@ fn base_image_candidates(mirrors: &[String]) -> Vec<String> {
     out
 }
 
-/// 探测镜像引用能否在 registry 侧解析：`docker manifest inspect` 只取元数据、不下载层，
-/// 与 BuildKit 构建时的 "load metadata" 走同一条「客户端 → registry」路径，可如实预判是否卡住。
-async fn probe_image_ref(reference: &str, proxy: &str) -> bool {
+/// 探测镜像引用能否在 registry 侧解析：`docker manifest inspect` 只取元数据、不下载层。
+/// **不用客户端代理**：BuildKit 的 FROM 元数据解析走 daemon 网络（daemon.json `proxies` /
+/// registry-mirrors 才生效），注入代理会得出“官方源可达”的假阳性→构建再一次卡住。
+async fn probe_image_ref(reference: &str) -> bool {
     let mut cmd = platform::docker_cmd_tokio();
     cmd.args(["manifest", "inspect", reference])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    if !proxy.is_empty() {
-        for key in [
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "all_proxy",
-        ] {
-            cmd.env(key, proxy);
-        }
-        cmd.env("NO_PROXY", "localhost,127.0.0.0/8,::1");
+    // 显式清掉可能从应用进程继承的代理变量，保证与 daemon 侧一致
+    for key in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        cmd.env_remove(key);
     }
     let Ok(mut child) = cmd.spawn() else {
         return false;
@@ -232,21 +231,21 @@ fn proxy_host_is_loopback(proxy: &str) -> bool {
     matches!(host.to_ascii_lowercase().as_str(), "localhost" | "127.0.0.1" | "::1")
 }
 
-/// 解析构建用基础镜像：Docker Hub 不可达（国内网络常见 `registry-1.docker.io` i/o timeout，
-/// 且 BuildKit 解析 FROM 不读 daemon.json 的 registry-mirrors）时改用可达的加速器前缀版本；
+/// 解析构建用基础镜像：Docker Hub 不可达（国内网络常见 `registry-1.docker.io` / `auth.docker.io`
+/// i/o timeout，且 BuildKit 解析 FROM 不读 daemon.json 的 registry-mirrors）时改用可达的加速器前缀版本；
 /// 全部不可达则仍返回官方名，由 docker build 报原始错误（报错里给出处理建议）。
-async fn resolve_base_image(app: &tauri::AppHandle, log: &impl Fn(&str, &str)) -> String {
+/// 注意：探测在 daemon 等效网络下进行（不带客户端代理）——代理只对构建内 RUN 步骤生效。
+async fn resolve_base_image(log: &impl Fn(&str, &str)) -> String {
     let mirrors = crate::pages::settings::get_docker_mirror_config()
         .await
         .map(|cfg| cfg.mirrors)
         .unwrap_or_default();
-    let proxy = crate::common::utils::proxy::proxy_url(app).await;
     for candidate in base_image_candidates(&mirrors) {
         if image_exists_locally(&candidate).await {
             log(&format!("[构建] 基础镜像已存在本地：{}", candidate), "stdout");
             return candidate;
         }
-        if probe_image_ref(&candidate, &proxy).await {
+        if probe_image_ref(&candidate).await {
             if candidate == DEFAULT_BASE_IMAGE {
                 log(&format!("[构建] 基础镜像源可达：{}", candidate), "stdout");
             } else {
@@ -264,7 +263,7 @@ async fn resolve_base_image(app: &tauri::AppHandle, log: &impl Fn(&str, &str)) -
     }
     log(
         &format!(
-            "[构建] 未探测到可达的基础镜像源，仍按官方源 {} 尝试（可在「设置 → Docker 镜像配置」填加速器或「设置 → 代理」后重试）",
+            "[构建] 未探测到可达的基础镜像源，仍按官方源 {} 尝试（可在「设置 → Docker 镜像配置」填加速器；或配「设置 → 代理」后点「保存并重启 Docker」让 daemon 也走代理）",
             DEFAULT_BASE_IMAGE
         ),
         "stderr",
@@ -378,7 +377,13 @@ pub async fn build_comfyui_image(
 
     // 基础镜像解析（官方源不可达时自动切换加速器前缀）+ 源码源探测 + 代理注入（构建期网络步骤）
     let proxy = crate::common::utils::proxy::proxy_url(&app).await;
-    let base_image = resolve_base_image(&app, &log).await;
+    let base_image = resolve_base_image(&log).await;
+    if !proxy.is_empty() && base_image != DEFAULT_BASE_IMAGE {
+        log(
+            "[构建] 说明：本地代理只注入构建内 RUN 步骤（apt/pip/git）；BuildKit 解析 FROM 由 daemon 发起，故基础镜像仍用加速器前缀。想让 daemon 也走代理：在「设置 → 代理」点「保存并重启 Docker」（写入 daemon.json proxies）",
+            "stdout",
+        );
+    }
     let (comfyui_repo, comfyui_repo_fallbacks) = resolve_comfyui_sources(&log, &proxy).await;
     let ref_sha = if reference == DEFAULT_COMFYUI_REF {
         DEFAULT_COMFYUI_REF_SHA.to_string()

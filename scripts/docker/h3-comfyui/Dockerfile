@@ -24,9 +24,11 @@
 #   PIP_INDEX_URL=                                # 留空 = 官方 PyPI；国内可填 https://pypi.tuna.tsinghua.edu.cn/simple
 #   HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY（大小写均可）——应用「设置 → 代理」开启后自动注入
 #
-# 网络说明（重要）：Docker Hub 不通（registry-1.docker.io i/o timeout）时，BuildKit 解析 FROM
-# 不会走 daemon.json 的 registry-mirrors；应用侧「构建镜像」会先用 docker manifest inspect 探测
-# 候选源（已配置加速器 → 官方源 → 内置加速器），把可达的那个前缀写进 BASE 再构建。
+# 网络说明（重要）：Docker Hub 不通（registry-1.docker.io / auth.docker.io i/o timeout）时，BuildKit
+# 解析 FROM（含取匿名 token）由 daemon 发起——不读 daemon.json 的 registry-mirrors、也不吃客户端代理
+# （daemon.json `proxies` 才生效）；应用侧「构建镜像」会先用 docker manifest inspect（同样**不带**客户端
+# 代理，避免误判官方源可达）探测候选源（已配置加速器 → 官方源 → 内置加速器），把可达前缀写进 BASE；
+# 客户端代理只经 --build-arg 注入 RUN 步骤（apt/pip/git）。
 # github.com 被 TLS 重置（GnuTLS recv error -110）同理：应用侧会探测 git 源可达性并把可达源排在前面。
 
 ARG BASE=nvidia/cuda:13.0.0-runtime-ubuntu24.04
