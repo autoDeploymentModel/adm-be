@@ -166,6 +166,8 @@ const template = `
 
   .video-inline-btn { margin-left: auto; }
 
+  .video-head-btn { margin-left: auto; }
+
   .video-progress {
     height: 6px;
     background: var(--c-raise);
@@ -199,6 +201,7 @@ const template = `
   <div class="video-head">
     <div class="video-title">${_t("视频生成")}</div>
     <div class="video-sub">MiniMax-H3 · ComfyUI · NVFP4</div>
+    <button id="video-refresh" class="video-btn video-btn-ghost video-btn-sm video-head-btn">${_t("刷新状态")}</button>
   </div>
 
   <div class="video-card">
@@ -632,6 +635,14 @@ export default {
       if (!dir) { notify(_t("未找到产物目录挂载")); return; }
       navigator.clipboard.writeText(dir);
       notify(_t("已复制: ") + dir);
+    });
+    el("video-refresh").addEventListener("click", function () {
+      void (async function () {
+        await refreshModelList();
+        await refreshSetup();
+        render();
+        notify(_t("状态已刷新"));
+      })();
     });
     el("video-build-image").addEventListener("click", function () { void handleBuildImage(); });
     el("video-download-weights").addEventListener("click", function () {

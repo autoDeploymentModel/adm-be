@@ -413,6 +413,8 @@ const EN = {
   "已复制: ": "Copied: ",
   "端口需在 1024-65535 之间": "Port must be between 1024 and 65535",
   "端口已保存，重启 ComfyUI 后生效": "Port saved; restart ComfyUI to apply",
+  "刷新状态": "Refresh",
+  "状态已刷新": "Status refreshed",
   "环境准备（首次使用）": "Setup (first run)",
   "已构建": "Built",
   "未构建": "Not built",

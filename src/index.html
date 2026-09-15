@@ -117,9 +117,7 @@
       flex-shrink: 0;
     }
 
-    #home-btn,
-    #settings-btn,
-    #test-btn {
+    .nav-btn {
       cursor: pointer;
       font-size: 13px;
       padding: 2px 10px;
@@ -142,23 +140,18 @@
       font-weight: 500;
     }
 
-    #home-btn:hover,
-    #settings-btn:hover,
-    #test-btn:hover {
+    .nav-btn:hover {
       color: var(--c-accent);
     }
 
-    #home-btn.active,
-    #settings-btn.active,
-    #test-btn.active {
+    .nav-btn.active {
       background: rgba(var(--c-accent-rgb), 0.20);
       color: var(--c-text-hi);
       border-radius: 6px;
       border-right-color: transparent;
     }
-    #home-btn.active .btn-icon,
-    #settings-btn.active .btn-icon,
-    #test-btn.active .btn-icon {
+
+    .nav-btn.active .btn-icon {
       color: var(--c-accent);
     }
 
@@ -316,19 +309,19 @@
   <div id="app">
     <div id="view-root"></div>
     <div id="hardware-bar">
-      <div id="home-btn" onclick="location.hash='#/list'">
+      <div id="home-btn" class="nav-btn" onclick="location.hash='#/list'">
         <span class="btn-icon">&#8962;</span>
         <span class="btn-text" data-i18n="首页">首页</span>
       </div>
-      <div id="video-btn" onclick="location.hash='#/video'">
+      <div id="video-btn" class="nav-btn" onclick="location.hash='#/video'">
         <span class="btn-icon">&#9654;</span>
         <span class="btn-text" data-i18n="视频生成">视频生成</span>
       </div>
-      <div id="settings-btn" onclick="location.hash='#/settings'">
+      <div id="settings-btn" class="nav-btn" onclick="location.hash='#/settings'">
         <span class="btn-icon">&#9881;</span>
         <span class="btn-text" data-i18n="设置">设置</span>
       </div>
-      <div id="test-btn" onclick="location.hash='#/test'">
+      <div id="test-btn" class="nav-btn" onclick="location.hash='#/test'">
         <span class="btn-icon">&#9889;</span>
         <span class="btn-text" data-i18n="测试">测试</span>
       </div>
