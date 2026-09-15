@@ -22,6 +22,19 @@ const COMFYUI_DOCKERFILE: &str = include_str!(concat!(
 /// 默认 ComfyUI 版本（H3 需 ≥ v0.30.0；Fun ControlNet 模板需 ≥ v0.35.0）
 const DEFAULT_COMFYUI_REF: &str = "v0.30.0";
 
+/// v0.30.0 对应上游 commit（`git ls-remote --tags` 与 gitee/gitcode/ghfast/gh-proxy 四源核对一致）；
+/// 回退到第三方镜像时用于校验克隆结果（git 对象按 SHA 校验，可挡住被篡改的镜像）
+const DEFAULT_COMFYUI_REF_SHA: &str = "b1693ecba9f5b65f8c80ab36b195ab963ec92413";
+
+/// ComfyUI 源码候选源（官方优先；github 被 TLS 重置时回退国内镜像/加速器）
+const COMFYUI_SOURCE_CANDIDATES: &[&str] = &[
+    "https://github.com/comfyanonymous/ComfyUI",
+    "https://gitee.com/mirrors/ComfyUI.git",
+    "https://gitcode.com/gh_mirrors/co/ComfyUI.git",
+    "https://ghfast.top/https://github.com/comfyanonymous/ComfyUI",
+    "https://gh-proxy.com/https://github.com/comfyanonymous/ComfyUI",
+];
+
 /// 构建基础镜像（Dockerfile `ARG BASE` 默认值，两处需保持一致）
 const DEFAULT_BASE_IMAGE: &str = "nvidia/cuda:13.0.0-runtime-ubuntu24.04";
 
@@ -259,6 +272,60 @@ async fn resolve_base_image(app: &tauri::AppHandle, log: &impl Fn(&str, &str)) -
     DEFAULT_BASE_IMAGE.to_string()
 }
 
+/// 探测 git 源可达性：对 `<repo>/info/refs?service=git-upload-pack` 发一次 GET
+/// （git 智能 HTTP 握手第一步，只取引用列表、不传输对象）。
+async fn probe_git_repo(url: &str, proxy: &str) -> bool {
+    let probe_url = format!(
+        "{}/info/refs?service=git-upload-pack",
+        url.trim_end_matches('/')
+    );
+    let mut builder = reqwest::Client::builder()
+        .user_agent("git/2.43.0")
+        .timeout(std::time::Duration::from_secs(8));
+    if !proxy.is_empty() {
+        if let Ok(p) = reqwest::Proxy::all(proxy) {
+            builder = builder.proxy(p);
+        }
+    }
+    let Ok(client) = builder.build() else {
+        return false;
+    };
+    match client.get(&probe_url).send().await {
+        Ok(resp) => resp.status().is_success() || resp.status().is_redirection(),
+        Err(_) => false,
+    }
+}
+
+/// 源码源排序：可达的排前面（不可达的保留在末尾兜底，构建时逐个尝试）。
+/// 返回（首选源，其余源）。
+async fn resolve_comfyui_sources(log: &impl Fn(&str, &str), proxy: &str) -> (String, Vec<String>) {
+    let mut reachable: Vec<String> = Vec::new();
+    let mut unreachable: Vec<String> = Vec::new();
+    for candidate in COMFYUI_SOURCE_CANDIDATES {
+        if probe_git_repo(candidate, proxy).await {
+            reachable.push((*candidate).to_string());
+        } else {
+            unreachable.push((*candidate).to_string());
+        }
+    }
+    if let Some(first) = reachable.first() {
+        if first == COMFYUI_SOURCE_CANDIDATES[0] {
+            log(&format!("[构建] ComfyUI 源码源可达：{}", first), "stdout");
+        } else {
+            log(&format!("[构建] 官方源码源不可达，改用：{}", first), "stdout");
+        }
+    } else {
+        log(
+            "[构建] 未探测到可达的 ComfyUI 源码源，仍按候选顺序尝试",
+            "stderr",
+        );
+    }
+    let mut ordered = reachable;
+    ordered.extend(unreachable);
+    let first = ordered.remove(0);
+    (first, ordered)
+}
+
 /// 在应用内构建 ComfyUI 镜像：写入内置 Dockerfile → `docker build -t <image> <dir>`，
 /// 输出逐行转发到「模型日志」（model-log 事件），失败时返回可操作的错误信息。
 #[tauri::command]
@@ -309,14 +376,28 @@ pub async fn build_comfyui_image(
 
     crate::pages::model_list::docker_preflight(&app, &model_id).await?;
 
-    // 基础镜像解析（官方源不可达时自动切换加速器前缀）+ 代理注入（构建期网络步骤）
+    // 基础镜像解析（官方源不可达时自动切换加速器前缀）+ 源码源探测 + 代理注入（构建期网络步骤）
     let proxy = crate::common::utils::proxy::proxy_url(&app).await;
     let base_image = resolve_base_image(&app, &log).await;
+    let (comfyui_repo, comfyui_repo_fallbacks) = resolve_comfyui_sources(&log, &proxy).await;
+    let ref_sha = if reference == DEFAULT_COMFYUI_REF {
+        DEFAULT_COMFYUI_REF_SHA.to_string()
+    } else {
+        String::new()
+    };
 
     log(
         &format!(
             "[构建] 开始构建镜像 {}（COMFYUI_REF={} / BASE={}）",
             image, reference, base_image
+        ),
+        "stdout",
+    );
+    log(
+        &format!(
+            "[构建] ComfyUI 源码：{}（候选回退 {} 个）",
+            comfyui_repo,
+            comfyui_repo_fallbacks.len()
         ),
         "stdout",
     );
@@ -331,6 +412,12 @@ pub async fn build_comfyui_image(
         format!("BASE={}", base_image),
         "--build-arg".to_string(),
         format!("COMFYUI_REF={}", reference),
+        "--build-arg".to_string(),
+        format!("COMFYUI_REPO={}", comfyui_repo),
+        "--build-arg".to_string(),
+        format!("COMFYUI_REPO_FALLBACKS={}", comfyui_repo_fallbacks.join(" ")),
+        "--build-arg".to_string(),
+        format!("COMFYUI_REF_SHA={}", ref_sha),
     ];
     if proxy.is_empty() {
         log("[构建] 未配置代理，构建期网络步骤（apt/pip/git）直连", "stdout");

@@ -90,6 +90,8 @@ docker build -t adm-comfyui-h3:nvfp4-20260915 scripts/docker/h3-comfyui
 ```
 
 > **基础镜像源自动探测（应用内构建）**：BuildKit 解析 `FROM` **不读** daemon.json 的 `registry-mirrors`，国内网络会直接卡在 `registry-1.docker.io … i/o timeout`；应用「构建镜像」会先用 `docker manifest inspect` 逐个探测候选源（已配置加速器 → 官方源 → 内置加速器），把可达的那个前缀写进 `BASE`（页内日志显示实际使用的源），代理也会自动注入为构建期变量。
+>
+> **源码源自动回退（同类问题）**：`github.com` 在部分网络被 TLS 重置（`GnuTLS recv error (-110)`）；应用会探测 `…/info/refs?service=git-upload-pack` 把可达的 git 源排到最前（官方 → gitee 镜像 → gitcode 镜像 → ghfast / gh-proxy 加速器），Dockerfile 内逐个尝试；克隆完成后用 `COMFYUI_REF_SHA` 校验 commit（`v0.30.0` = `b1693ecb…`，四个备用源与上游一致），不一致直接失败——被篡改/滞后的第三方镜像会被挡住。
 
 镜像要点：
 
@@ -319,7 +321,8 @@ WebUI 内（首次）：
 | 出片黑屏（用 int8 VAE 时） | 版本过低 | int8_convrot VAE 需 ComfyUI ≥0.31.0，否则用 fp16 VAE |
 | 启动即 OOM | 与 SGLang 服务同时在跑 | 用页内互斥提示或 `h3-switch.sh` 切换 |
 | 构建卡在 `failed to resolve source metadata for docker.io/nvidia/cuda…: i/o timeout` | Docker Hub 不可达（BuildKit 解析 `FROM` 不读 `registry-mirrors`） | 应用会自动探测加速器前缀并改写 `BASE`（页内日志可见）；仍失败时在「设置 → Docker 镜像配置」填加速器（保存并重启 Docker）或「设置 → 代理」后重试 |
-| 构建卡在 pip / git clone（慢或超时） | pypi.org / github.com 直连受限 | 「设置 → 代理」配置可用代理（构建期自动注入代理变量，本机代理自动加 `--network=host`）；手工构建时可加 `--build-arg PIP_INDEX_URL=…` |
+| 构建报 `unable to access 'https://github.com/comfyanonymous/ComfyUI/' … GnuTLS recv error (-110)` | github.com 被 TLS 重置 | 应用会自动探测并改用可达源（gitee 镜像 / gitcode 镜像 / ghfast、gh-proxy 加速器，页内日志显示实际源）；也可用「设置 → 代理」或手工 `--build-arg COMFYUI_REPO=<源>` |
+| 构建卡在 pip（慢或超时） | pypi.org 直连受限 | 「设置 → 代理」配置可用代理（构建期自动注入代理变量）；手工构建时可加 `--build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple` |
 
 ---
 
@@ -481,3 +484,4 @@ WebUI 内（首次）：
 | 2026-09-15 | **应用内准备流程**：新增「构建镜像」（内置 Dockerfile + `docker build`，日志流式）与「下载权重」（`Comfy-Org/MiniMax-H3` + include，≈67 GB）按钮与状态显示；`comfyui_setup_status` / `build_comfyui_image` 两个命令；挂载改为 `models/MiniMax-H3-ComfyUI:/opt/ComfyUI/models` |
 | 2026-09-15 | **开发落地**：附录 A 全部实现（`engine_ready_path` / `hidden_in_list` / `engine: comfyui` 分发 `start_comfyui_docker` / 挂载读写模式 / 底部「视频生成」Tab + `views/video.js` / 互斥守卫 / i18n）；`doc/model.json` 增补 ComfyUI 条目；`h3-switch.sh` 改为按前缀探测容器 |
 | 2026-09-15 | **构建网络加固**：`build_comfyui_image` 构建前用 `docker manifest inspect` 探测基础镜像源（已配置加速器 → 官方源 → 内置加速器）并把可达前缀写进 `--build-arg BASE`，构建期自动注入「设置 → 代理」（本机代理加 `--network=host`）；Dockerfile 新增 `COMFYUI_REPO` / `TORCH_INDEX_URL` / `PIP_INDEX_URL` / 代理构建参数 |
+| 2026-09-15 | **源码源回退**：`github.com` 被 TLS 重置时，应用侧探测 `…/info/refs` 并把可达源排前（gitee 镜像 / gitcode 镜像 / ghfast、gh-proxy 加速器），Dockerfile 内依次回退；克隆后用 `COMFYUI_REF_SHA` 校验 commit（`v0.30.0` = `b1693ecb…`，四源与上游一致），新增 `COMFYUI_REPO_FALLBACKS` / `COMFYUI_REF_SHA` 构建参数 |
