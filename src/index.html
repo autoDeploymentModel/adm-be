@@ -320,6 +320,10 @@
         <span class="btn-icon">&#8962;</span>
         <span class="btn-text" data-i18n="首页">首页</span>
       </div>
+      <div id="video-btn" onclick="location.hash='#/video'">
+        <span class="btn-icon">&#9654;</span>
+        <span class="btn-text" data-i18n="视频生成">视频生成</span>
+      </div>
       <div id="settings-btn" onclick="location.hash='#/settings'">
         <span class="btn-icon">&#9881;</span>
         <span class="btn-text" data-i18n="设置">设置</span>
@@ -401,7 +405,7 @@
 
     // ===== 导航激活态 =====
     function setActiveNav(id) {
-      ["home-btn", "settings-btn", "test-btn"].forEach(function (b) {
+      ["home-btn", "video-btn", "settings-btn", "test-btn"].forEach(function (b) {
         const el = document.getElementById(b);
         if (el) el.classList.toggle("active", b === id);
       });
@@ -533,6 +537,7 @@
     // ===== 路由器 =====
     const routes = {
       "/list":     { load: () => import("./views/model_list.js"),     nav: "home-btn" },
+      "/video":    { load: () => import("./views/video.js"),          nav: "video-btn" },
       "/settings": { load: () => import("./views/settings.js"),       nav: "settings-btn" },
       "/test":     { load: () => import("./views/test.js"),           nav: "test-btn" },
     };

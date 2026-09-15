@@ -147,6 +147,19 @@ async function loadChatFrame() {
     return;
   }
 
+  // 音视频生成类模型（扩散引擎，如 MiniMax-H3）没有对话接口：不加载对话 UI，直接给出 API 地址
+  var runningModel = (st.modelList || []).find(function(m) { return m.model_id === modelId; });
+  if (runningModel && runningModel.support_video) {
+    framedModelId = null;
+    chatFrameUrl = "";
+    els.frame.removeAttribute("src");
+    els.frame.style.display = "none";
+    els.hint.style.display = "flex";
+    els.hint.textContent = _t("当前模型为音视频生成模型，请通过视频生成 API 调用：") +
+      "http://127.0.0.1:" + port + "/v1/videos（异步任务，详见部署文档）";
+    return;
+  }
+
   els.hint.style.display = "flex";
   els.hint.textContent = _t("测试页面加载中...");
   try {

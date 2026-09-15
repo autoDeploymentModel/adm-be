@@ -224,17 +224,53 @@ impl Drop for DownloadCleanupGuard {
 }
 
 /// `model_download_files` 条目是否为 HF 仓库 ID（形如 `org/name`，非 URL）：
-/// hfd.sh 整仓下载格式，与完整文件 URL 清单格式互斥。
-fn is_hf_repo_id(entry: &str) -> bool {
-    if entry.starts_with("http://") || entry.starts_with("https://") {
-        return false;
+/// 解析 HF 仓库条目：`org/name` 或 `org/name/<仓库内路径或通配模式>`（第 3 段起为 `--include` 模式）。
+/// 完整文件 URL（http/https）返回 None（由逐文件 URL 下载路径处理）。
+fn parse_repo_entry(entry: &str) -> Option<(String, Option<String>)> {
+    let e = entry.trim();
+    if e.is_empty() || e.starts_with("http://") || e.starts_with("https://") {
+        return None;
     }
-    match entry.split_once('/') {
-        Some((org, name)) => {
-            !org.is_empty() && !name.is_empty() && !org.contains('/') && !name.contains('/')
+    let mut parts = e.splitn(3, '/');
+    let org = parts.next().unwrap_or("").trim();
+    let name = parts.next().unwrap_or("").trim();
+    if org.is_empty()
+        || name.is_empty()
+        || org.contains(char::is_whitespace)
+        || name.contains(char::is_whitespace)
+    {
+        return None;
+    }
+    let pattern = parts
+        .next()
+        .map(|p| p.trim().trim_start_matches('/').to_string())
+        .filter(|p| !p.is_empty());
+    Some((format!("{}/{}", org, name), pattern))
+}
+
+/// 条目是否为 HF 仓库条目（含带模式的 `org/name/path` 形式）。
+fn is_repo_entry(entry: &str) -> bool {
+    parse_repo_entry(entry).is_some()
+}
+
+/// 合并仓库条目：同一仓库的多条 `org/name/模式` 收敛为 (repo, [模式...])，
+/// 保持首次出现顺序、模式去重；无模式的条目表示整仓下载。
+fn merge_repo_entries(files: &[String]) -> Vec<(String, Vec<String>)> {
+    let mut merged: Vec<(String, Vec<String>)> = Vec::new();
+    for entry in files {
+        let Some((repo, pattern)) = parse_repo_entry(entry) else { continue };
+        match merged.iter_mut().find(|(r, _)| *r == repo) {
+            Some((_, pats)) => {
+                if let Some(p) = pattern {
+                    if !pats.contains(&p) {
+                        pats.push(p);
+                    }
+                }
+            }
+            None => merged.push((repo, pattern.into_iter().collect())),
         }
-        None => false,
     }
+    merged
 }
 
 #[tauri::command]
@@ -271,7 +307,7 @@ pub async fn fetch_model_list() -> Result<Vec<RemoteModel>, AppError> {
         let expanded: Vec<String> = m
             .model_download_files
             .iter()
-            .flat_map(|u| if is_hf_repo_id(u) { vec![u.clone()] } else { expand_shard_urls(u) })
+            .flat_map(|u| if is_repo_entry(u) { vec![u.clone()] } else { expand_shard_urls(u) })
             .collect();
         let mut seen = std::collections::HashSet::new();
         m.model_download_files = expanded
@@ -321,17 +357,27 @@ pub async fn download_model(
     let model_dir = data_dir.join("models").join(&model_id);
     std::fs::create_dir_all(&model_dir).map_err(|e| format!("创建模型目录失败: {}", e))?;
 
-    // ===== HF 仓库多文件目录下载（safetensors 模型，唯一支持的格式） =====
+    // ===== 下载清单分发（model_download_files 统一入口）=====
+    // 1) 仓库条目（`org/name` 或 `org/name/路径或通配模式`）→ hfd.sh 下载（同仓库条目合并 --include）
+    // 2) 完整文件 URL（http/https）→ 逐文件 .part 续传
+    // 两种格式不可混用（与历史约束一致）
     if let Some(files) = model_files {
-        // 清单为 HF 仓库 ID（org/name）→ hfd.sh 整仓下载
-        if files.iter().all(|f| is_hf_repo_id(f)) {
-            return hfd_download_repo(&app, &model_id, files, vllm_image, cancel_flag).await;
-        }
-        if files.iter().any(|f| is_hf_repo_id(f)) {
-            bail!(
-                "模型 {} 的 model_download_files 混用了仓库 ID 与文件 URL 格式，请检查远程 model.json 配置",
-                model_id
-            );
+        let repo_count = files.iter().filter(|f| is_repo_entry(f)).count();
+        if repo_count > 0 {
+            if repo_count != files.len() {
+                bail!(
+                    "模型 {} 的 model_download_files 混用了仓库条目与文件 URL 格式，请检查远程 model.json 配置",
+                    model_id
+                );
+            }
+            let repos = merge_repo_entries(&files);
+            if repos.is_empty() {
+                bail!(
+                    "模型 {} 的仓库条目解析失败，请检查 model.json（形如 org/name 或 org/name/目录/模式）",
+                    model_id
+                );
+            }
+            return hfd_download_repos(&app, &model_id, repos, vllm_image, cancel_flag).await;
         }
         {
             // 分片 URL 已在 fetch_model_list 中展开，此处直接使用
@@ -468,6 +514,20 @@ async fn finish_model_download(
     }
     // 镜像名必须由后端重新拉取远程清单解析（与启动流程一致），不能依赖前端卡片透传——
     // 远程配置更新后旧卡片透传值为空，会导致镜像被静默跳过，最终启动时才报「镜像尚未下载」。
+    // ComfyUI（engine=comfyui）镜像为「视频生成」页本地构建产物，跳过 registry 拉取校验。
+    if resolve_engine_is_comfyui(model_id).await {
+        let msg = format!(
+            "[Docker] 模型 {} 为 ComfyUI 本地构建镜像，跳过镜像拉取（缺失时请在「视频生成」页点击「构建镜像」）",
+            model_id
+        );
+        crate::common::utils::logger::write_log("INFO", "DOWNLOAD", &msg);
+        app.emit(
+            "model-log",
+            serde_json::json!({ "model_id": model_id, "line": msg, "source": "stdout" }),
+        )
+        .ok();
+        return;
+    }
     let resolved_image = resolve_engine_image(model_id, vllm_image.as_deref()).await;
     if let Some(image) = resolved_image {
         pull_image_if_configured(app, model_id, Some(&image)).await;
@@ -500,29 +560,31 @@ async fn finish_model_download(
     }
 }
 
-/// HF 仓库 ID 清单（如 `local-inference-lab/GLM-5.3-Flash-NVFP4-Spark`）→ hfd.sh 整仓下载：
+/// HF 仓库条目下载（`model_download_files` 中的仓库条目，safetensors 目录模型）：
+/// 条目形态 `org/name` 或 `org/name/<仓库内路径或通配模式>`（支持 `*`），
+/// 同一仓库的多条条目合并为一次下载、模式去重后作为 hfd `--include`（无模式 = 整仓）；
+/// 多个仓库按条目首次出现顺序依次下载。
 /// 1. 确保 `<data>/hfd.sh` 工具就绪（首次从 hf-mirror 下载，chmod 755，全局复用）；
 /// 2. 端点策略与 URL 清单一致：未配代理 → `HF_ENDPOINT=https://hf-mirror.com`；
 ///    配了代理 → hfd 默认源（huggingface.co）+ 注入代理 env；
-/// 3. `bash hfd.sh <repo> --local-dir <models>/<id>`，stdout/stderr 常规行转发 model-log
+/// 3. `bash hfd.sh <repo> --local-dir <models>/<id> [--include ...]`，输出转发 model-log
 ///    （wget/aria2 进度条行内含 `\r`，跳过避免刷屏）；
-/// 4. 每 2s 轮询模型目录 + HF API 文件清单折算进度/速度；
+/// 4. 每 2s 轮询模型目录 + HF API 文件清单（同样按模式过滤）折算进度/速度；
 /// 5. 取消：cancel_flag 置位 → 杀整个进程组（bash + aria2c/wget），发 download-cancelled；
-/// 6. 成功：finish_model_download 写 .done + 发完成事件 + 拉取 vLLM 镜像。
-async fn hfd_download_repo(
+/// 6. 全部成功：finish_model_download 写 .done + 发完成事件（ComfyUI 引擎跳过镜像拉取）。
+async fn hfd_download_repos(
     app: &tauri::AppHandle,
     model_id: &str,
-    repos: Vec<String>,
+    repos: Vec<(String, Vec<String>)>,
     vllm_image: Option<String>,
     cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), AppError> {
-    use tokio::io::AsyncBufReadExt;
-
     let _guard = DownloadCleanupGuard { h: app.clone(), id: model_id.to_string() };
     let script = ensure_hfd_script(app, model_id).await?;
     ensure_aria2c(app, model_id).await?;
     let data_dir = config::get_data_dir(Some(app))?;
     let model_dir = data_dir.join("models").join(model_id);
+    let first_label = repos.first().map(|(r, _)| r.clone()).unwrap_or_default();
 
     app.state::<AppState>()
         .downloading_progress
@@ -530,11 +592,11 @@ async fn hfd_download_repo(
         .unwrap_or_else(|e| e.into_inner())
         .insert(model_id.to_string(), 0u8);
     if let Ok(mut map) = app.state::<AppState>().downloading_phase.lock() {
-        map.insert(model_id.to_string(), repos[0].clone());
+        map.insert(model_id.to_string(), first_label.clone());
     }
     app.emit(
         "download-progress",
-        serde_json::json!({ "model_id": model_id, "progress": 0u8, "file": &repos[0], "type": "model" }),
+        serde_json::json!({ "model_id": model_id, "progress": 0u8, "file": &first_label, "type": "model" }),
     )
     .ok();
 
@@ -546,34 +608,103 @@ async fn hfd_download_repo(
         String::new()
     };
 
-    // 进度基准：仓库文件清单（含大小）；拉取失败则退化为纯日志跟随（进度停在 0%）
+    for (repo, includes) in &repos {
+        if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            app.emit(
+                "download-cancelled",
+                serde_json::json!({ "model_id": model_id, "type": "model" }),
+            )
+            .ok();
+            return Ok(());
+        }
+        crate::common::utils::logger::write_log(
+            "INFO",
+            "DOWNLOAD",
+            &format!(
+                "[{}] hfd 下载仓库 {}（include 模式 {} 条{}）",
+                model_id,
+                repo,
+                includes.len(),
+                if includes.is_empty() { "，整仓" } else { "" }
+            ),
+        );
+        match hfd_download_one(app, model_id, repo, includes, &script, &model_dir, &endpoint, &proxy, &cancel_flag).await? {
+            HfdOutcome::Cancelled => return Ok(()),
+            HfdOutcome::Exited(st) => {
+                if !st.success() {
+                    return Err(AppError::msg(format!(
+                        "hfd.sh 下载失败（仓库 {}，退出码 {:?}），详见模型日志",
+                        repo,
+                        st.code()
+                    )));
+                }
+            }
+        }
+    }
+
+    finish_model_download(app, model_id, &model_dir, vllm_image).await;
+    Ok(())
+}
+
+/// 单个仓库的 hfd 执行结果
+enum HfdOutcome {
+    /// 子进程已结束（退出码由调用方判断）
+    Exited(std::process::ExitStatus),
+    /// 用户取消（已杀进程组并发出 download-cancelled）
+    Cancelled,
+}
+
+/// 单个仓库的 hfd 执行 + 日志转发 + 进度折算（由 hfd_download_repos 逐仓库调用）。
+/// `endpoint` 为空 = hfd 默认源（配代理场景），否则注入 `HF_ENDPOINT`（hf-mirror）。
+#[allow(clippy::too_many_arguments)]
+async fn hfd_download_one(
+    app: &tauri::AppHandle,
+    model_id: &str,
+    repo: &str,
+    includes: &[String],
+    script: &std::path::Path,
+    model_dir: &std::path::Path,
+    endpoint: &str,
+    proxy: &str,
+    cancel_flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<HfdOutcome, AppError> {
+    use tokio::io::AsyncBufReadExt;
+
+    // 进度基准：本仓库文件清单（含大小），按 include 模式过滤；
+    // 拉取失败则退化为纯日志跟随（进度停在 0%）
+    let api_endpoint = if endpoint.is_empty() { "https://huggingface.co" } else { endpoint };
     let http = crate::common::utils::proxy::build_download_http(
         app,
         Some(std::time::Duration::from_secs(60)),
     )
     .await?;
-    let repo_files = if repos.len() == 1 {
-        fetch_repo_files(
-            &http.client,
-            if endpoint.is_empty() { "https://huggingface.co" } else { &endpoint },
-            &repos[0],
-        )
+    let repo_files = fetch_repo_files(&http.client, api_endpoint, repo)
         .await
-    } else {
-        None
-    };
+        .map(|files| {
+            files
+                .into_iter()
+                .filter(|(name, _)| matches_include_patterns(name, includes))
+                .collect::<Vec<_>>()
+        });
 
     let mut cmd = tokio::process::Command::new("bash");
-    cmd.arg(&script);
-    for r in &repos {
-        cmd.arg(r);
+    cmd.arg(script).arg(repo).arg("--local-dir").arg(model_dir);
+    if !includes.is_empty() {
+        cmd.arg("--include");
+        for pat in includes {
+            cmd.arg(pat);
+        }
+        crate::common::utils::logger::write_log(
+            "INFO",
+            "DOWNLOAD",
+            &format!("[{}] hfd include 过滤: {}", model_id, includes.join(" ")),
+        );
     }
-    cmd.arg("--local-dir").arg(&model_dir);
     if !endpoint.is_empty() {
-        cmd.env("HF_ENDPOINT", &endpoint);
+        cmd.env("HF_ENDPOINT", endpoint);
     }
     if !proxy.is_empty() {
-        cmd.env("http_proxy", &proxy).env("https_proxy", &proxy).env("all_proxy", &proxy);
+        cmd.env("http_proxy", proxy).env("https_proxy", proxy).env("all_proxy", proxy);
     }
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -653,10 +784,10 @@ async fn hfd_download_repo(
                         serde_json::json!({ "model_id": model_id, "type": "model" }),
                     )
                     .ok();
-                    return Ok(());
+                    return Ok(HfdOutcome::Cancelled);
                 }
                 if let Some(files) = &repo_files {
-                    let (overall, bytes, cur_file) = hfd_poll_progress(&model_dir, files);
+                    let (overall, bytes, cur_file) = hfd_poll_progress(model_dir, files);
                     let speed = tracker.update(bytes);
                     if let Some(f) = &cur_file {
                         if let Ok(mut map) = app.state::<AppState>().downloading_phase.lock() {
@@ -686,18 +817,10 @@ async fn hfd_download_repo(
         }
     };
 
-    match status {
-        Ok(st) if st.success() => {
-            finish_model_download(app, model_id, &model_dir, vllm_image).await;
-            Ok(())
-        }
-        Ok(st) => Err(AppError::msg(format!(
-            "hfd.sh 下载失败（退出码 {:?}），详见模型日志",
-            st.code()
-        ))),
-        Err(e) => Err(AppError::msg(format!("hfd.sh 执行失败: {}", e))),
-    }
+    let status = status.map_err(|e| AppError::msg(format!("hfd.sh 执行失败: {}", e)))?;
+    Ok(HfdOutcome::Exited(status))
 }
+
 
 /// 确保 aria2c 可用（hfd.sh 优先走 aria2c 多连接断点续传）。未安装时自动安装：
 /// 免密 `sudo -n` → 失败则 `pkexec` 弹系统密码框提权（对齐 settings.rs 镜像配置链路）。
@@ -922,6 +1045,48 @@ fn hfd_scan_dir(dir: &std::path::Path, prefix: &str, depth: usize, out: &mut Vec
     }
 }
 
+/// 极简 glob：仅支持 `*`（匹配任意字符序列，含 `/`），其余字符按字面比较。
+/// 用于 hfd `--include` 模式与仓库文件相对路径匹配（`FL2VA/*`、`model_index.json` 等）。
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let mut pos = 0usize;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            if !text[pos..].starts_with(part) {
+                return false;
+            }
+            pos += part.len();
+        } else if i == parts.len() - 1 {
+            return text[pos..].ends_with(part);
+        } else {
+            match text[pos..].find(part) {
+                Some(idx) => pos += idx + part.len(),
+                None => return false,
+            }
+        }
+    }
+    true
+}
+
+/// 仓库文件相对路径是否命中仓库条目的 include 模式（条目第 3 段起的路径/通配，空列表 = 全部命中）。
+/// hfd.sh 将模式转成正则后用“子串”匹配（`=~`），这里同样给模式补上隐式前后通配，
+/// 保证进度基准与 hfd 的实际过滤一致（否则进度可能到不了 100%）。
+fn matches_include_patterns(path: &str, patterns: &[String]) -> bool {
+    if patterns.is_empty() {
+        return true;
+    }
+    patterns.iter().any(|p| {
+        let p = p.trim();
+        if p.is_empty() {
+            return false;
+        }
+        glob_match(&format!("*{}*", p), path)
+    })
+}
+
 /// 终止 hfd.sh 进程组（process_group(0) → pgid == bash pid，aria2c/wget 同组一并终止）。
 /// force=false 发 TERM，true 发 KILL；pid==0 时不动（kill -0 会命中调用方进程组，绝对禁止）。
 fn kill_hfd_process_group(pid: u32, force: bool) {
@@ -972,6 +1137,79 @@ async fn resolve_engine_image(model_id: &str, fallback: Option<&str>) -> Option<
             })
             .or_else(from_fallback),
         Err(_) => from_fallback(),
+    }
+}
+
+/// HTTP 就绪探活（模型清单 `engine_ready_probe`）：扩散/视频类服务（SGLang diffusion）
+/// 没有 LLM 的固定就绪 banner，以 `GET /health` 返回 200 作为「可接受请求」信号
+/// （SGLang 扩散服务 warmup 未完成时返回 503）。5s 轮询，最长 90 分钟（大模型冷加载可达
+/// 数十分钟）；就绪后发一次 model-started 并退出，容器退出（run 状态清零）后自动停挑。
+fn spawn_ready_probe(app: tauri::AppHandle, model_id: String, port: u16, ready_path: String) {
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        // 就绪路径：默认 /health（SGLang/vLLM），ComfyUI 等应用服务用 /system_stats
+        let path = {
+            let p = ready_path.trim();
+            if p.starts_with('/') { p.to_string() } else { "/health".to_string() }
+        };
+        let url = format!("http://127.0.0.1:{}{}", port, path);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90 * 60);
+        crate::common::utils::logger::write_log(
+            "INFO",
+            "MODEL",
+            &format!("[{}] 已启用 HTTP 就绪探活: {}（返回 200 即就绪）", model_id, url),
+        );
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            // 容器退出（start_*_docker 的退出清理会把 running_model_id 置空）→ 结束探活
+            let running_id = app
+                .state::<AppState>()
+                .running_model_id
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or(None);
+            if running_id.as_deref() != Some(model_id.as_str())
+                || std::time::Instant::now() > deadline
+            {
+                return;
+            }
+            let ready = matches!(client.get(&url).send().await, Ok(resp) if resp.status().is_success());
+            if ready {
+                crate::common::utils::logger::write_log(
+                    "INFO",
+                    "MODEL",
+                    &format!("[{}] 就绪探活通过（/health 200）", model_id),
+                );
+                app.emit("model-log", serde_json::json!({
+                    "model_id": model_id,
+                    "line": "就绪探活通过（/health 返回 200），推理服务已可接受请求",
+                    "source": "stdout",
+                })).ok();
+                app.emit("model-started", serde_json::json!({
+                    "model_id": model_id,
+                    "port": port,
+                })).ok();
+                return;
+            }
+        }
+    });
+}
+
+/// 远程清单中该模型是否声明 `engine: "comfyui"`（本地构建镜像，需跳过 registry 拉取校验）。
+async fn resolve_engine_is_comfyui(model_id: &str) -> bool {
+    match fetch_model_list().await {
+        Ok(list) => list
+            .iter()
+            .find(|m| m.model_id == model_id)
+            .map(|m| m.engine.trim().eq_ignore_ascii_case("comfyui"))
+            .unwrap_or(false),
+        Err(_) => false,
     }
 }
 
@@ -1112,7 +1350,7 @@ async fn pull_docker_image(
 }
 
 /// CLI/daemon/GPU runtime 预检；输出镜像存在性检查外的环境信息
-async fn docker_preflight(app: &tauri::AppHandle, model_id: &str) -> Result<(), AppError> {
+pub(crate) async fn docker_preflight(app: &tauri::AppHandle, model_id: &str) -> Result<(), AppError> {
     let log = |line: String| {
         crate::common::utils::logger::write_log("INFO", "DOCKER", &line);
         app.emit(
@@ -1698,24 +1936,74 @@ fn effective_remote_model_dir(model_dir: &str, user: &str, model_id: &str) -> St
     }
 }
 
-/// 解析模型清单 `vllm_extra_mounts`（附加挂载的 model_id 列表，如投机解码 drafter 权重）：
-/// 每条对应本地 `<models>/<id>` 目录，校验下载完成（.done 或 config.json+model.safetensors），
-/// 未完成直接报错提示先在模型列表下载。返回 (宿主机路径, 容器路径) 列表，
-/// 由调用方逐条转成 `-v <host>:<container>:ro`。空列表返回空——所有既有模型 docker 参数不变。
-fn resolve_extra_mounts(models_dir: &std::path::Path, extra_mounts: &[String]) -> Result<Vec<(String, String)>, AppError> {
+/// 解析模型清单 `vllm_extra_mounts`（附加挂载清单）：
+/// 1. 条目为 `host:container` 显式映射（容器路径以 `/` 开头）→ 按原样挂载：host 为绝对路径或
+///    相对数据目录（`<data>`）的相对路径，目录不存在自动创建；如 H3 的媒体目录 `media:/data/minimax-h3`；
+/// 2. 其余条目视为 model_id：对应本地 `<models>/<id>` 目录，校验下载完成
+///    （.done 或 config.json+model.safetensors），未完成直接报错提示先在模型列表下载。
+/// 返回 (宿主机路径, 容器路径) 列表，由调用方逐条转成 `-v <host>:<container>:ro`。
+/// 空列表返回空——所有既有模型 docker 参数不变。
+/// 解析模型清单 `vllm_extra_mounts`（附加挂载清单）：
+/// 1. 条目为 `host:container` 显式映射（容器路径以 `/` 开头）→ 按原样挂载：host 为绝对路径或
+///    相对数据目录（`<data>`）的相对路径，目录不存在自动创建；可再跟 `:ro` / `:rw` 覆盖默认模式
+///    （如 H3 的媒体目录 `media:/data/minimax-h3:ro`、ComfyUI 的可写权重目录 `models/MiniMax-H3-ComfyUI:/opt/ComfyUI/models`）；
+/// 2. 其余条目视为 model_id：对应本地 `<models>/<id>` 目录，校验下载完成
+///    （.done 或 config.json+model.safetensors），未完成直接报错提示先在模型列表下载。
+/// 返回 (宿主机路径, 容器路径, 是否只读) 列表，由调用方逐条转成 `-v <host>:<container>[:ro]`。
+/// 空列表返回空——所有既有模型 docker 参数不变。
+fn resolve_extra_mounts(
+    models_dir: &std::path::Path,
+    extra_mounts: &[String],
+    default_read_only: bool,
+) -> Result<Vec<(String, String, bool)>, AppError> {
+    let data_dir = models_dir.parent().unwrap_or(models_dir).to_path_buf();
     let mut out = Vec::new();
-    for id in extra_mounts {
-        let id = id.trim();
-        if id.is_empty() {
+    for entry in extra_mounts {
+        let mut entry = entry.trim();
+        if entry.is_empty() {
             continue;
         }
+        // 显式模式后缀（`:ro` / `:rw`）优先于调用方默认
+        let mut read_only = default_read_only;
+        if let Some(stripped) = entry
+            .strip_suffix(":ro")
+            .or_else(|| entry.strip_suffix(":rw"))
+        {
+            read_only = entry.ends_with(":ro");
+            entry = stripped;
+        }
+        // 显式映射 `host:container`（容器路径必须以 / 开头，避免 Windows 盘符误判）
+        if let Some((host_raw, container_raw)) = entry.rsplit_once(':') {
+            let container = container_raw.trim();
+            let host_raw = host_raw.trim();
+            if container.starts_with('/') && !host_raw.is_empty() {
+                let host_path = {
+                    let raw = std::path::PathBuf::from(host_raw);
+                    if raw.is_absolute() { raw } else { data_dir.join(raw) }
+                };
+                std::fs::create_dir_all(&host_path).map_err(|e| {
+                    format!("创建附加挂载目录失败 {}: {}", host_path.display(), e)
+                })?;
+                out.push((
+                    host_path.to_string_lossy().to_string(),
+                    container.to_string(),
+                    read_only,
+                ));
+                continue;
+            }
+        }
+        let id = entry;
         let dir = models_dir.join(id);
         let complete = dir.join(".done").exists()
             || (dir.join("config.json").exists() && dir.join("model.safetensors").exists());
         if !complete {
             bail!("附加模型 {} 未下载或下载未完成，请先在模型列表下载该模型", id);
         }
-        out.push((dir.to_string_lossy().to_string(), format!("/models/{}", id)));
+        out.push((
+            dir.to_string_lossy().to_string(),
+            format!("/models/{}", id),
+            read_only,
+        ));
     }
     Ok(out)
 }
@@ -1726,7 +2014,7 @@ async fn probe_remote_extra_mounts(
     node: &crate::common::types::NodeInfo,
     key: Option<&str>,
     extra_mounts: &[String],
-) -> Result<Vec<(String, String)>, AppError> {
+) -> Result<Vec<(String, String, bool)>, AppError> {
     let mut out = Vec::new();
     for id in extra_mounts {
         let id = id.trim();
@@ -1748,7 +2036,7 @@ async fn probe_remote_extra_mounts(
         if !ok {
             bail!("远端节点 {} 缺少附加模型 {}（目录 {}），请先在该节点下载或使用设置页「同步模型到直连节点」", node.ip, id, dir);
         }
-        out.push((dir, format!("/models/{}", id)));
+        out.push((dir, format!("/models/{}", id), true));
     }
     Ok(out)
 }
@@ -2149,16 +2437,17 @@ fn build_multi_node_head_args(
     ib_iface: Option<&str>,
     has_infiniband: bool,
     model_env: &[String],
-    extra_mounts: &[(String, String)],
+    extra_mounts: &[(String, String, bool)],
 ) -> Vec<String> {
     let mount_dst = format!("/models/{}", model_id);
     let mut args = build_common_docker_prefix(container_name, shm_size, node_ip, iface, ib_iface, has_infiniband, &mn.extra_env, model_env);
     args.push("-v".to_string());
     args.push(format!("{}:{}:ro", model_dir.to_string_lossy(), mount_dst));
     // vllm_extra_mounts：附加模型目录（drafter 等），主挂载之后逐条追加，空列表零变化
-    for (host_path, container_path) in extra_mounts {
+    for (host_path, container_path, read_only) in extra_mounts {
         args.push("-v".to_string());
-        args.push(format!("{}:{}:ro", host_path, container_path));
+        let mode = if *read_only { ":ro" } else { "" };
+        args.push(format!("{}:{}{}", host_path, container_path, mode));
     }
     // 容器必须 detached（本地回头要 `docker exec -d` 起 worker/head 的 vllm serve），`-d` 放 image 之前
     // 不再注入 RAY_ADDRESS：fork 镜像禁止 ray backend + nnodes>1，多机走 no-Ray(mp) 模式
@@ -2367,16 +2656,17 @@ fn build_multi_node_worker_args(
     ib_iface: Option<&str>,
     has_infiniband: bool,
     model_env: &[String],
-    extra_mounts: &[(String, String)],
+    extra_mounts: &[(String, String, bool)],
 ) -> Vec<String> {
     let mount_dst = format!("/models/{}", model_id);
     let mut args = build_common_docker_prefix(container_name, shm_size, node_ip, iface, ib_iface, has_infiniband, &mn.extra_env, model_env);
     args.push("-v".to_string());
     args.push(format!("{}:{}:ro", model_dir.to_string_lossy(), mount_dst));
     // vllm_extra_mounts：附加模型目录（drafter 等），主挂载之后逐条追加，空列表零变化
-    for (host_path, container_path) in extra_mounts {
+    for (host_path, container_path, read_only) in extra_mounts {
         args.push("-v".to_string());
-        args.push(format!("{}:{}:ro", host_path, container_path));
+        let mode = if *read_only { ":ro" } else { "" };
+        args.push(format!("{}:{}{}", host_path, container_path, mode));
     }
     // fork 默认 `--entrypoint=` 清空镜像 ENTRYPOINT（避免 nvidia_entrypoint.sh 触发），
     // 命令仅 `sleep infinity`，让容器保活等待后续 docker exec 启动 Ray worker
@@ -2542,6 +2832,7 @@ async fn start_multi_node(
     let head_extra_mounts = resolve_extra_mounts(
         model_dir.parent().unwrap_or(model_dir),
         extra_mounts.as_deref().unwrap_or(&[]),
+        true,
     )?;
     // 收集各 worker 的 (rank, container, use_sudo, log_path)，供 Phase 5 复用——
     // 避免再对每个节点重复 SSH 探测 sudo（SSH 抖动可能导致 sudo 判定与容器启动时不一致）
@@ -3304,6 +3595,365 @@ async fn start_multi_node(
 }
 
 /// vLLM Docker 启动（Ubuntu / DGX Spark 等机型）。
+/// ComfyUI 应用服务（「视频生成」页入口，`engine: "comfyui"` 专用）：
+/// - 权重由 ComfyUI 自身管理（首次打开官方模板自动下载到挂载目录），**不挂载 `/models/<id>`**；
+/// - 挂载清单来自模型清单 `vllm_extra_mounts`，默认**读写**（模型/输出/输入/用户目录），
+///   条目可用 `:ro` / `:rw` 显式覆盖；
+/// - 容器内命令 = 模型清单 `engine_command`（缺省 `python3 main.py`）+ 自动补 `--listen 0.0.0.0`
+///   （未显式给出时）+ `--port <页面端口>` + 模型清单 `vllm_flags`（最后追加、优先级最高）；
+/// - 设置页「模型启动参数」（LLM 专属子集）整体跳过；
+/// - 就绪：`engine_ready_probe` + `engine_ready_path`（缺省 `/system_stats`；ComfyUI 无 `/health`）；
+/// - 容器名 `adm-comfyui-<model_id>`，`--ipc host` + `--shm-size`（DGX 默认 16g，其他 8g）。
+async fn start_comfyui_docker(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, AppState>,
+    model_id: &str,
+    models_dir: &std::path::Path,
+    params: LaunchParams,
+    device: Option<String>,
+    engine_image: Option<String>,
+    engine_command: Option<Vec<String>>,
+    engine_flags: Option<Vec<String>>,
+    engine_env: Option<Vec<String>>,
+    extra_mounts: Option<Vec<String>>,
+    ready_probe: bool,
+    ready_path: Option<String>,
+) -> Result<(), AppError> {
+    const CONTAINER_PREFIX: &str = "adm-comfyui-";
+    let container_name = format!("{}{}", CONTAINER_PREFIX, model_id);
+
+    // 设置页仅取 extra_env / shm_size（LLM 参数子集不适用于 ComfyUI）
+    let settings_path = config::get_data_dir(Some(app))?.join("config.json");
+    let mut vllm_args = VllmArgs::default();
+    if let Ok(json) = std::fs::read_to_string(&settings_path) {
+        if let Ok(parsed) = serde_json::from_str::<Settings>(&json) {
+            vllm_args = parsed.vllm_args;
+        }
+    }
+
+    let image = engine_image
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::msg(format!("模型 {} 缺少镜像配置（ComfyUI 引擎需在远程 model.json 指定 engine_image）", model_id)))?
+        .to_string();
+    crate::common::utils::logger::write_log("INFO", "DOCKER", &format!("[{}] 使用 ComfyUI 镜像 {}", model_id, image));
+    app.emit("model-log", serde_json::json!({
+        "model_id": model_id,
+        "line": format!("使用镜像 {}（引擎 ComfyUI，模型 engine_image）", image),
+        "source": "stdout",
+    })).ok();
+    let default_shm = match device.as_deref() {
+        Some("dgx-spark-128G") => "16g",
+        _ => "8g",
+    };
+    let shm_size = if vllm_args.shm_size.is_empty() { default_shm.to_string() } else { vllm_args.shm_size.clone() };
+
+    // ===== 启动前 Docker 环境预检（CLI / daemon / GPU runtime）+ 本地镜像校验 =====
+    // ComfyUI 镜像为「视频生成」页构建的本地产物（官方无 ARM64 镜像），不做 registry 拉取
+    docker_preflight(app, model_id).await?;
+    if !docker_image_exists(app, model_id, &image).await? {
+        bail!(
+            "镜像 {} 不存在：请在「视频生成」页点击「构建镜像」完成本地构建后重试",
+            image
+        );
+    }
+
+    // 镜像内 ComfyUI 预检（--entrypoint bash 绕开镜像 ENTRYPOINT，无需 GPU）
+    {
+        let probe = crate::common::utils::platform::docker_cmd_tokio()
+            .args(["run", "--rm", "--entrypoint", "/bin/bash", &image, "-c",
+                   "if [ -f /opt/ComfyUI/main.py ]; then echo COMFY_OK; else echo COMFY_MISSING; fi"])
+            .output();
+        if let Ok(Ok(o)) = tokio::time::timeout(std::time::Duration::from_secs(60), probe).await {
+            let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
+            if stdout.contains("COMFY_MISSING") {
+                let msg = format!(
+                    "镜像 {} 内未找到 ComfyUI（/opt/ComfyUI/main.py 缺失）：请按 scripts/docker/h3-comfyui/Dockerfile 构建镜像后重试",
+                    image
+                );
+                app.emit("model-log", serde_json::json!({
+                    "model_id": model_id, "line": format!("[ERROR] {}", msg), "source": "stderr",
+                })).ok();
+                bail!("{}", msg);
+            }
+        }
+    }
+
+    let port: u16 = params.port.unwrap_or(8188);
+    {
+        let probe = std::net::TcpListener::bind(("0.0.0.0", port));
+        if probe.is_err() {
+            bail!("端口 {} 已被占用，请先关闭占用该端口的进程，或在「视频生成」页更换端口", port);
+        }
+    }
+
+    // 清理同名残留容器
+    let _ = crate::common::utils::platform::docker_cmd()
+        .args(["rm", "-f", &container_name])
+        .output();
+
+    // 附加挂载：ComfyUI 默认读写（权重/输出/输入/用户目录），`:ro` 条目保持只读
+    let extra_mounts = resolve_extra_mounts(models_dir, extra_mounts.as_deref().unwrap_or(&[]), false)?;
+    if extra_mounts.is_empty() {
+        app.emit("model-log", serde_json::json!({
+            "model_id": model_id,
+            "line": "[警告] 模型清单未配置 vllm_extra_mounts：ComfyUI 权重与产物将落在容器内，容器删除后丢失",
+            "source": "stderr",
+        })).ok();
+    }
+
+    // 设置页「额外环境变量」+ 模型清单 vllm_env 注入
+    let extra_env_args = build_container_env_args(
+        app,
+        model_id,
+        &vllm_args.extra_env,
+        engine_env.as_deref().unwrap_or(&[]),
+    );
+
+    let mut args: Vec<String> = vec![
+        "run".to_string(),
+        "-e".to_string(),
+        "PYTHONWARNINGS=ignore::FutureWarning".to_string(),
+        "--name".to_string(),
+        container_name.clone(),
+        "--gpus".to_string(),
+        "all".to_string(),
+        "--shm-size".to_string(),
+        shm_size,
+        "--cap-add".to_string(),
+        "SYS_NICE".to_string(),
+        "--ulimit".to_string(),
+        "stack=67108864".to_string(),
+        "--ipc".to_string(),
+        "host".to_string(),
+        "-p".to_string(),
+        format!("{}:{}", port, port),
+    ];
+    for (host_path, container_path, read_only) in &extra_mounts {
+        args.push("-v".to_string());
+        let mode = if *read_only { ":ro" } else { "" };
+        args.push(format!("{}:{}{}", host_path, container_path, mode));
+    }
+    args.extend(extra_env_args);
+    // 清空镜像自带 ENTRYPOINT：命令完整自持（ComfyUI main.py）
+    args.push("--entrypoint=".to_string());
+    args.push(image);
+
+    // ===== 容器内启动命令（engine_command 优先，缺省 python3 main.py）=====
+    let mut cmd: Vec<String> = engine_command
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if cmd.is_empty() {
+        cmd = vec!["python3".to_string(), "main.py".to_string()];
+    }
+    if !cmd.iter().any(|s| s == "--listen") {
+        cmd.push("--listen".to_string());
+        cmd.push("0.0.0.0".to_string());
+    }
+    cmd.push("--port".to_string());
+    cmd.push(port.to_string());
+    app.emit("model-log", serde_json::json!({
+        "model_id": model_id,
+        "line": format!("容器启动命令: {}", cmd.join(" ")),
+        "source": "stdout",
+    })).ok();
+    args.extend(cmd.iter().cloned());
+
+    // 模型清单 vllm_flags（ComfyUI 参数）最后追加，优先级最高
+    if let Some(flags) = engine_flags.as_deref().filter(|f| !f.is_empty()) {
+        let mut applied = Vec::new();
+        for raw in flags {
+            let raw = raw.trim();
+            if raw.is_empty() { continue; }
+            let (k, v) = match raw.split_once(char::is_whitespace) {
+                Some((k, v)) => (k, v.trim()),
+                None => (raw, ""),
+            };
+            let k = k.trim_start_matches("--");
+            if k.is_empty() { continue; }
+            args.push(format!("--{}", k));
+            applied.push(format!("--{}", k));
+            if !v.is_empty() {
+                args.push(v.to_string());
+                applied.push(v.to_string());
+            }
+        }
+        if !applied.is_empty() {
+            app.emit("model-log", serde_json::json!({
+                "model_id": model_id,
+                "line": format!("[模型配置] 已应用模型清单 vllm_flags（ComfyUI 参数，优先级最高）：{}", applied.join(" ")),
+                "source": "stdout",
+            })).ok();
+            crate::common::utils::logger::write_log("INFO", "MODEL", &format!("[{}] 应用模型清单 vllm_flags（ComfyUI）: {}", model_id, applied.join(" ")));
+        }
+    }
+
+    dbg_log!("comfyui docker args: {:?}", args);
+    app.emit("model-log", serde_json::json!({
+        "model_id": model_id,
+        "line": format!("[DEBUG] full command: docker {:?}", args),
+        "source": "stdout",
+    })).ok();
+
+    #[cfg(target_os = "windows")]
+    let mut child = crate::common::utils::platform::docker_cmd()
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            let msg = format!("启动 ComfyUI 容器失败: {}", e);
+            app.emit("model-log", serde_json::json!({
+                "model_id": model_id, "line": format!("[ERROR] {}", msg), "source": "stderr",
+            })).ok();
+            msg
+        })?;
+
+    #[cfg(not(target_os = "windows"))]
+    let mut child = crate::common::utils::platform::spawn_detached(
+        crate::common::utils::platform::docker_cmd().args(&args).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()),
+    )
+    .map_err(|e| {
+        let msg = format!("启动 ComfyUI 容器失败: {}", e);
+        app.emit("model-log", serde_json::json!({
+            "model_id": model_id, "line": format!("[ERROR] {}", msg), "source": "stderr",
+        })).ok();
+        msg
+    })?;
+
+    let pid = child.id();
+
+    {
+        let mut pid_lock = state.running_process.lock().map_err(|e| e.to_string())?;
+        *pid_lock = Some(pid);
+    }
+    {
+        let mut model_lock = state.running_model_id.lock().map_err(|e| e.to_string())?;
+        *model_lock = Some(model_id.to_string());
+    }
+    {
+        let mut port_lock = state.running_port.lock().map_err(|e| e.to_string())?;
+        *port_lock = Some(port);
+    }
+    {
+        let mut container_lock = state.running_container.lock().map_err(|e| e.to_string())?;
+        *container_lock = Some(container_name.clone());
+    }
+    {
+        let mut engine_lock = state.running_engine.lock().map_err(|e| e.to_string())?;
+        *engine_lock = Some("comfyui".to_string());
+    }
+    state.set_model_running(true);
+    state.bump_model_generation();
+
+    // HTTP 就绪探活（模型清单 engine_ready_probe）：缺省路径 /system_stats
+    if ready_probe {
+        let path = {
+            let p = ready_path.unwrap_or_default();
+            let p = p.trim();
+            if p.starts_with('/') { p.to_string() } else { "/system_stats".to_string() }
+        };
+        spawn_ready_probe(app.clone(), model_id.to_string(), port, path);
+    }
+
+    app.emit(
+        "model-started",
+        serde_json::json!({ "model_id": model_id, "port": port }),
+    )
+    .ok();
+
+    let app_clone = app.clone();
+    let model_id_clone = model_id.to_string();
+    let app_clone2 = app.clone();
+    let model_id_clone2 = model_id.to_string();
+
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+
+        let stdout_handle = if let Some(stdout) = child.stdout.take() {
+            let app_c = app_clone.clone();
+            let mid = model_id_clone.clone();
+            Some(std::thread::spawn(move || {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines().map_while(Result::ok) {
+                    crate::common::utils::logger::write_log("INFO", "ComfyUI", &line);
+                    app_c
+                        .emit("model-log", serde_json::json!({
+                            "model_id": &mid, "line": line.clone(), "source": "stdout",
+                        }))
+                        .ok();
+                }
+            }))
+        } else {
+            None
+        };
+
+        let stderr_handle = if let Some(stderr) = child.stderr.take() {
+            let app_c = app_clone.clone();
+            let mid = model_id_clone.clone();
+            Some(std::thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().map_while(Result::ok) {
+                    crate::common::utils::logger::write_log("WARN", "ComfyUI", &line);
+                    app_c
+                        .emit("model-log", serde_json::json!({
+                            "model_id": &mid, "line": line, "source": "stderr",
+                        }))
+                        .ok();
+                }
+            }))
+        } else {
+            None
+        };
+
+        if let Some(h) = stdout_handle { let _ = h.join(); }
+        if let Some(h) = stderr_handle { let _ = h.join(); }
+
+        let exit_status = child.wait();
+        match &exit_status {
+            Ok(status) => {
+                app_clone2.emit("model-log", serde_json::json!({
+                    "model_id": &model_id_clone2,
+                    "line": format!("[DEBUG] ComfyUI 容器退出 with status: {}", status),
+                    "source": "stdout",
+                })).ok();
+            }
+            Err(e) => {
+                app_clone2.emit("model-log", serde_json::json!({
+                    "model_id": &model_id_clone2,
+                    "line": format!("[ERROR] ComfyUI 容器等待失败: {}", e),
+                    "source": "stderr",
+                })).ok();
+            }
+        }
+
+        // 容器退出：清理容器与状态
+        let _ = crate::common::utils::platform::docker_cmd()
+            .args(["rm", "-f", &container_name])
+            .output();
+
+        {
+            let state = app_clone2.state::<AppState>();
+            *state.running_process.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *state.running_model_id.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *state.running_port.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *state.running_container.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *state.running_engine.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            state.set_model_running(false);
+        }
+
+        app_clone2
+            .emit("model-stopped", serde_json::json!({ "model_id": &model_id_clone2 }))
+            .ok();
+    });
+
+    Ok(())
+}
+
 /// 模型目录以只读方式挂载进容器，容器前台运行（生命周期 = docker run 进程），
 /// 就绪信号：stdout 出现 "Application startup complete" / "Starting vLLM API server" / "Uvicorn running on"。
 async fn start_vllm_docker(
@@ -3317,6 +3967,10 @@ async fn start_vllm_docker(
     vllm_flags: Option<Vec<String>>,
     vllm_env: Option<Vec<String>>,
     extra_mounts: Option<Vec<String>>,
+    engine_command: Option<Vec<String>>,
+    engine_ready_patterns: Option<Vec<String>>,
+    engine_ready_probe: bool,
+    engine_ready_path: Option<String>,
 ) -> Result<(), AppError> {
     const CONTAINER_PREFIX: &str = "adm-vllm-";
     let container_name = format!("{}{}", CONTAINER_PREFIX, model_id);
@@ -3390,6 +4044,20 @@ async fn start_vllm_docker(
     // Docker 容器内必须监听 0.0.0.0 才能经 -p 端口映射对外服务；设置页 host 不适用容器内
     let host = "0.0.0.0".to_string();
 
+    // 就绪关键字：vLLM 内置标志 + 模型清单 engine_ready_patterns 追加的自定义标志
+    let mut ready_patterns: Vec<String> = vec![
+        "Application startup complete".to_string(),
+        "Starting vLLM API server".to_string(),
+        "Uvicorn running on".to_string(),
+    ];
+    ready_patterns.extend(
+        engine_ready_patterns
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+    );
+
     // 端口占用检查：镜像就绪后、容器启动前，先确认宿主机端口可 bind（避免启动即端口冲突退出）
     {
         let probe = std::net::TcpListener::bind(("0.0.0.0", port));
@@ -3412,6 +4080,7 @@ async fn start_vllm_docker(
     let extra_mounts = resolve_extra_mounts(
         model_dir.parent().unwrap_or(model_dir),
         extra_mounts.as_deref().unwrap_or(&[]),
+        true,
     )?;
 
     // ===== 设置页「额外环境变量」+ 模型清单 vllm_env 注入（vLLM / SGLang 单机路径共用 helper）=====
@@ -3444,9 +4113,10 @@ async fn start_vllm_docker(
         format!("{}:{}:ro", mount_src, mount_dst),
     ];
     // 附加挂载在主模型之后逐条追加（均在 image 之前）
-    for (host_path, container_path) in &extra_mounts {
+    for (host_path, container_path, read_only) in &extra_mounts {
         args.push("-v".to_string());
-        args.push(format!("{}:{}:ro", host_path, container_path));
+        let mode = if *read_only { ":ro" } else { "" };
+        args.push(format!("{}:{}{}", host_path, container_path, mode));
     }
     // 注入额外环境变量（必须在 image 之前）
     args.extend(extra_env_args);
@@ -3456,17 +4126,42 @@ async fn start_vllm_docker(
     // `vllm serve vllm serve ...`，bash 型 ENTRYPOINT 报 `bash: line 1: vllm: command not found`）
     args.push("--entrypoint=".to_string());
     args.push(image);
-    args.push("vllm".to_string());
-    args.push("serve".to_string());
-    args.push(mount_dst);
+    // 容器内启动命令：模型清单 engine_command 优先，缺省 `vllm serve <模型路径>`
+    let engine_command: Vec<String> = engine_command
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if engine_command.is_empty() {
+        args.push("vllm".to_string());
+        args.push("serve".to_string());
+        args.push(mount_dst);
+    } else {
+        app.emit("model-log", serde_json::json!({
+            "model_id": model_id,
+            "line": format!("使用模型清单 engine_command 作为容器启动命令: {}", engine_command.join(" ")),
+            "source": "stdout",
+        })).ok();
+        args.extend(engine_command.iter().cloned());
+        args.push(mount_dst);
+    }
     args.push("--host".to_string());
     args.push(host);
     args.push("--port".to_string());
     args.push(port.to_string());
 
-    // ===== 设置页 vLLM 详细参数（仅非空/非默认值才追加） =====
-    // 统一调用 push_vllm_args（与多机 head 同源，避免遗漏新参数）
-    push_vllm_args(&mut args, &vllm_args, params.ctx_size);
+    // 设置页 vLLM 详细参数（仅非空/非默认值才追加）——自定义启动入口（engine_command）
+    // 为非 LLM 服务（如 SGLang 扩散 `sglang serve`）时该子集不适用，完整参数由 vllm_flags 承载
+    if engine_command.is_empty() {
+        push_vllm_args(&mut args, &vllm_args, params.ctx_size);
+    } else {
+        app.emit("model-log", serde_json::json!({
+            "model_id": model_id,
+            "line": "已跳过设置页 vLLM 参数子集（模型使用 engine_command 自定义启动入口，参数全部由模型清单 vllm_flags 承载）",
+            "source": "stdout",
+        })).ok();
+    }
 
     // ===== 模型配置 vLLM 参数（vllm_flags）=====
     // 最后追加，优先级最高：同名参数可覆盖设置页配置与默认值。
@@ -3566,6 +4261,11 @@ async fn start_vllm_docker(
     state.set_model_running(true);
     state.bump_model_generation();
 
+    // HTTP 就绪探活（模型清单 engine_ready_probe）
+    if engine_ready_probe {
+        spawn_ready_probe(app.clone(), model_id.to_string(), port, engine_ready_path.clone().unwrap_or_default());
+    }
+
     app.emit(
         "model-started",
         serde_json::json!({ "model_id": model_id, "port": port }),
@@ -3592,11 +4292,8 @@ async fn start_vllm_docker(
                             "model_id": &mid, "line": line.clone(), "source": "stdout",
                         }))
                         .ok();
-                    // 推理引擎就绪信号
-                    if line.contains("Application startup complete")
-                        || line.contains("Starting vLLM API server")
-                        || line.contains("Uvicorn running on")
-                    {
+                    // 推理引擎就绪信号（vLLM 内置标志 + 模型清单 engine_ready_patterns）
+                    if ready_patterns.iter().any(|p| line.contains(p.as_str())) {
                         app_c
                             .emit("model-started", serde_json::json!({
                                 "model_id": &mid, "port": port,
@@ -3686,6 +4383,10 @@ async fn start_sglang_docker(
     engine_flags: Option<Vec<String>>,
     engine_env: Option<Vec<String>>,
     extra_mounts: Option<Vec<String>>,
+    engine_command: Option<Vec<String>>,
+    engine_ready_patterns: Option<Vec<String>>,
+    engine_ready_probe: bool,
+    engine_ready_path: Option<String>,
 ) -> Result<(), AppError> {
     const CONTAINER_PREFIX: &str = "adm-sglang-";
     let container_name = format!("{}{}", CONTAINER_PREFIX, model_id);
@@ -3752,6 +4453,17 @@ async fn start_sglang_docker(
     // Docker 容器内必须监听 0.0.0.0 才能经 -p 端口映射对外服务
     let host = "0.0.0.0".to_string();
 
+    // 就绪关键字：SGLang LLM 内置标志 + 模型清单 engine_ready_patterns（自定义启动入口用，
+    // 如扩散服务不打印 LLM banner 时先靠 engine_ready_probe 探活）
+    let mut ready_patterns: Vec<String> = vec!["The server is fired up and ready to roll!".to_string()];
+    ready_patterns.extend(
+        engine_ready_patterns
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+    );
+
     {
         let probe = std::net::TcpListener::bind(("0.0.0.0", port));
         if probe.is_err() {
@@ -3771,6 +4483,7 @@ async fn start_sglang_docker(
     let extra_mounts = resolve_extra_mounts(
         model_dir.parent().unwrap_or(model_dir),
         extra_mounts.as_deref().unwrap_or(&[]),
+        true,
     )?;
 
     let extra_env_args = build_container_env_args(
@@ -3801,16 +4514,35 @@ async fn start_sglang_docker(
         "-v".to_string(),
         format!("{}:{}:ro", mount_src, mount_dst),
     ];
-    for (host_path, container_path) in &extra_mounts {
+    for (host_path, container_path, read_only) in &extra_mounts {
         args.push("-v".to_string());
-        args.push(format!("{}:{}:ro", host_path, container_path));
+        let mode = if *read_only { ":ro" } else { "" };
+        args.push(format!("{}:{}{}", host_path, container_path, mode));
     }
     args.extend(extra_env_args);
     args.push("--entrypoint=".to_string());
     args.push(image);
-    args.push("python3".to_string());
-    args.push("-m".to_string());
-    args.push("sglang.launch_server".to_string());
+    // 容器内启动命令：模型清单 engine_command 优先（如扩散/视频服务 `["sglang","serve"]`），
+    // 缺省 = SGLang LLM 服务 `python3 -m sglang.launch_server`。
+    // 后续统一追加 `--model-path/--host/--port`，两种入口参数名一致。
+    let engine_command: Vec<String> = engine_command
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if engine_command.is_empty() {
+        args.push("python3".to_string());
+        args.push("-m".to_string());
+        args.push("sglang.launch_server".to_string());
+    } else {
+        app.emit("model-log", serde_json::json!({
+            "model_id": model_id,
+            "line": format!("使用模型清单 engine_command 作为容器启动命令: {}", engine_command.join(" ")),
+            "source": "stdout",
+        })).ok();
+        args.extend(engine_command.iter().cloned());
+    }
     args.push("--model-path".to_string());
     args.push(mount_dst);
     args.push("--host".to_string());
@@ -3818,7 +4550,18 @@ async fn start_sglang_docker(
     args.push("--port".to_string());
     args.push(port.to_string());
 
-    push_sglang_args(&mut args, &sglang_args, params.ctx_size);
+    // 设置页参数子集（ctx_size → --context-length / tp / mem-fraction-static / trust-remote-code）：
+    // 仅在默认 LLM 启动入口生效；自定义 engine_command（如扩散服务 `sglang serve`）下这些
+    // LLM 专属参数会被拒绝，整体跳过，完整参数由模型清单 vllm_flags 承载
+    if engine_command.is_empty() {
+        push_sglang_args(&mut args, &sglang_args, params.ctx_size);
+    } else {
+        app.emit("model-log", serde_json::json!({
+            "model_id": model_id,
+            "line": "已跳过设置页 SGLang 参数子集（模型使用 engine_command 自定义启动入口）",
+            "source": "stdout",
+        })).ok();
+    }
 
     // 模型清单 vllm_flags（SGLang 配方，如 --tp / --context-length / --json-model-override-args /
     // --reasoning-parser ling3 等）最后追加，优先级最高
@@ -3917,6 +4660,11 @@ async fn start_sglang_docker(
     state.set_model_running(true);
     state.bump_model_generation();
 
+    // HTTP 就绪探活（模型清单 engine_ready_probe）：扩散/视频类服务无固定就绪 banner
+    if engine_ready_probe {
+        spawn_ready_probe(app.clone(), model_id.to_string(), port, engine_ready_path.clone().unwrap_or_default());
+    }
+
     app.emit(
         "model-started",
         serde_json::json!({ "model_id": model_id, "port": port }),
@@ -3943,8 +4691,9 @@ async fn start_sglang_docker(
                             "model_id": &mid, "line": line.clone(), "source": "stdout",
                         }))
                         .ok();
-                    // SGLang 就绪信号（官方标志；uvicorn 启动行早于完全就绪，不作为就绪条件）
-                    if line.contains("The server is fired up and ready to roll!") {
+                    // 就绪信号：SGLang LLM 官方标志（uvicorn 启动行早于完全就绪，不作为就绪条件），
+                    // 以及模型清单 engine_ready_patterns 追加的自定义标志
+                    if ready_patterns.iter().any(|p| line.contains(p.as_str())) {
                         app_c
                             .emit("model-started", serde_json::json!({
                                 "model_id": &mid, "port": port,
@@ -4032,9 +4781,13 @@ pub async fn start_model(
     extra_mounts: Option<Vec<String>>,
     engine: Option<String>,
     engine_image: Option<String>,
+    engine_command: Option<Vec<String>>,
+    engine_ready_patterns: Option<Vec<String>>,
+    engine_ready_probe: Option<bool>,
+    engine_ready_path: Option<String>,
 ) -> Result<(), AppError> {
     // 统一捕获启动失败并写入本地日志
-    let result = start_model_inner(&app, &state, &model_id, params, device, vllm_image, vllm_flags, vllm_env, extra_mounts, engine, engine_image).await;
+    let result = start_model_inner(&app, &state, &model_id, params, device, vllm_image, vllm_flags, vllm_env, extra_mounts, engine, engine_image, engine_command, engine_ready_patterns, engine_ready_probe, engine_ready_path).await;
     if let Err(ref e) = result {
         crate::common::utils::logger::write_log("ERROR", "MODEL", &format!("[{}] 启动失败: {}", model_id, e));
     }
@@ -4053,6 +4806,10 @@ async fn start_model_inner(
     extra_mounts: Option<Vec<String>>,
     engine: Option<String>,
     engine_image: Option<String>,
+    engine_command: Option<Vec<String>>,
+    engine_ready_patterns: Option<Vec<String>>,
+    engine_ready_probe: Option<bool>,
+    engine_ready_path: Option<String>,
 ) -> Result<(), AppError> {
     {
         let pid_lock = state.running_process.lock().map_err(|e| e.to_string())?;
@@ -4072,6 +4829,23 @@ async fn start_model_inner(
     let data_dir = config::get_data_dir(Some(app))?;
     let models_dir = data_dir.join("models");
     let model_dir = models_dir.join(model_id);
+    let engine_ready_probe = engine_ready_probe.unwrap_or(false);
+
+    // ===== ComfyUI 应用服务（「视频生成」页）：无本地模型目录，先于目录模型判断分发 =====
+    let is_comfyui = engine
+        .as_deref()
+        .map(|s| s.trim().eq_ignore_ascii_case("comfyui"))
+        .unwrap_or(false);
+    if is_comfyui {
+        // 有效镜像：engine_image 优先，回退旧字段 vllm_image
+        let effective_image = engine_image
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| vllm_image.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+            .map(|s| s.to_string());
+        return start_comfyui_docker(app, state, model_id, &models_dir, params, device, effective_image, engine_command, vllm_flags, vllm_env, extra_mounts, engine_ready_probe, engine_ready_path).await;
+    }
 
     // ===== 新格式（safetensors 目录模型）：引擎分发（vLLM / SGLang）=====
     let is_dir_model = model_dir.join(".done").exists()
@@ -4096,9 +4870,9 @@ async fn start_model_inner(
             return start_multi_node(app, state, model_id, &model_dir, params, effective_image, vllm_flags, vllm_env, extra_mounts, engine).await;
         }
         if is_sglang {
-            return start_sglang_docker(app, state, model_id, &model_dir, params, device, effective_image, vllm_flags, vllm_env, extra_mounts).await;
+            return start_sglang_docker(app, state, model_id, &model_dir, params, device, effective_image, vllm_flags, vllm_env, extra_mounts, engine_command, engine_ready_patterns, engine_ready_probe, engine_ready_path).await;
         }
-        return start_vllm_docker(app, state, model_id, &model_dir, params, device, effective_image, vllm_flags, vllm_env, extra_mounts).await;
+        return start_vllm_docker(app, state, model_id, &model_dir, params, device, effective_image, vllm_flags, vllm_env, extra_mounts, engine_command, engine_ready_patterns, engine_ready_probe, engine_ready_path).await;
     }
 
     // 仅支持 Docker 容器化部署（safetensors 目录模型）

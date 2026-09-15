@@ -1,0 +1,67 @@
+# ADM-BE：ComfyUI（MiniMax-H3）服务——**方案主线**（§1–§12）
+#
+# 方案文档：doc/minimax-h3-single-node-deploy-plan.md
+#   主线：底部「视频生成」页（§5，路由 #/video）→ 本 compose 容器 → NVFP4 权重首次自动下载（§6/§7）
+#   互斥：与备选 SGLang 路径（附录 C）不能同时运行（≈44GB + ≈108GB > 121GiB）
+#
+# 注意：应用内（底部「视频生成」页）启动的容器名为 adm-comfyui-<model_id>
+# （如 adm-comfyui-MiniMax-H3-ComfyUI）；本 compose 仅用于手工/排障路径，
+# 两者不要同时运行（端口 8188 冲突）。
+#
+# 用法（先 export ADM_DATA_DIR，见 h3-switch.sh）：
+#   export ADM_DATA_DIR="$HOME/.local/share/com.adm.be"
+#   docker compose -f scripts/docker/h3-comfyui/docker-compose.yml up -d
+#
+# 重要：DGX Spark 为 128GB 统一内存，ComfyUI（H3 量化权重 ~44GB）与
+# ADM-BE 的 SGLang 服务（BF16 权重 ~108GB）**不能同时驻留**，请用
+# h3-switch.sh 做互斥切换（切换前会自动停掉另一个）。
+name: adm-h3-comfyui
+
+services:
+  comfyui:
+    image: ${ADM_COMFYUI_IMAGE:-adm-comfyui-h3:20260915}
+    container_name: adm-comfyui-h3
+    restart: "no"
+    # GB10 单卡：把整块 GPU 交给 ComfyUI（与 SGLang 互斥运行）
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      # 离线：权重全部来自挂载目录，禁止运行期回源
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      - TZ=Asia/Shanghai
+    ports:
+      # 仅本机可访问；如需局域网访问改为 "0.0.0.0:${ADM_COMFYUI_PORT:-8188}:8188"
+      - "127.0.0.1:${ADM_COMFYUI_PORT:-8188}:8188"
+    volumes:
+      # 注：ADM_DATA_DIR（数据目录）与 ADM_COMFYUI_WEIGHTS（权重目录）由 h3-switch.sh 自动导出
+      # 权重目录与应用内完全一致：<data>/models/MiniMax-H3-ComfyUI/<类型>/
+      # （应用内「下载权重」、download-comfy-h3.sh、ComfyUI 弹窗自助下载三处共用同一目录）
+      - ${ADM_COMFYUI_WEIGHTS:?未设置 ADM_COMFYUI_WEIGHTS：请用 h3-switch.sh 启动，或 export ADM_COMFYUI_WEIGHTS=<ADM_DATA_DIR>/models/MiniMax-H3-ComfyUI}:/opt/ComfyUI/models
+      - ${ADM_DATA_DIR}/comfyui/output:/opt/ComfyUI/output
+      - ${ADM_DATA_DIR}/comfyui/input:/opt/ComfyUI/input
+      - ${ADM_DATA_DIR}/comfyui/user:/opt/ComfyUI/user
+      # 与 SGLang 方案共用同一份参考素材目录（只读）
+      - ${ADM_DATA_DIR}/media:/data/minimax-h3:ro
+    shm_size: 16gb
+    ipc: host
+    # --disable-auto-launch：容器内不尝试拉起浏览器
+    # --disable-api-nodes：禁用云端 API 节点，保证纯离线
+    # 需要 SageAttention 加速时追加 --use-sage-attention（需镜像内已装对应 wheel）
+    command:
+      - python3
+      - main.py
+      - --listen
+      - 0.0.0.0
+      - --port
+      - "8188"
+      - --disable-auto-launch
+      - --disable-api-nodes
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8188/system_stats', timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s

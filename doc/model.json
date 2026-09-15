@@ -238,5 +238,52 @@
         "support_tools": true,
         "support_reasoning": true,
         "support_images": true
+    },
+    {
+        "model_id": "MiniMax-H3-ComfyUI",
+        "hidden_in_list": true,
+        "model_download_files": [
+            "Comfy-Org/MiniMax-H3/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+            "Comfy-Org/MiniMax-H3/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+            "Comfy-Org/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+            "Comfy-Org/MiniMax-H3/vae/minimax_h3_video_vae_fp16.safetensors",
+            "Comfy-Org/MiniMax-H3/vae/minimax_h3_audio_vae_fp32.safetensors",
+            "Comfy-Org/MiniMax-H3/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+            "Comfy-Org/MiniMax-H3/loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+            "Comfy-Org/MiniMax-H3/embeddings/*"
+        ],
+        "model_support_devices": [
+            "dgx-spark-128G"
+        ],
+        "engine": "comfyui",
+        "engine_image": "adm-comfyui-h3:nvfp4-20260915",
+        "engine_command": [
+            "python3",
+            "main.py",
+            "--listen",
+            "0.0.0.0",
+            "--disable-auto-launch",
+            "--disable-api-nodes"
+        ],
+        "engine_ready_probe": true,
+        "engine_ready_path": "/system_stats",
+        "exclusive_group": "h3",
+        "vllm_env": [
+            "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+        ],
+        "vllm_extra_mounts": [
+            "models/MiniMax-H3-ComfyUI:/opt/ComfyUI/models",
+            "comfyui/output:/opt/ComfyUI/output",
+            "comfyui/input:/opt/ComfyUI/input",
+            "comfyui/user:/opt/ComfyUI/user",
+            "media:/data/minimax-h3:ro"
+        ],
+        "model_size": "≈67 GB（应用内下载；仅 FL2VA 最小集 ≈44 GB）",
+        "model_type": "视频生成（ComfyUI）",
+        "model_description": "MiniMax-H3 via ComfyUI：NVFP4-AWQ 编码器 + int8 剪枝 DiT（FL2VA/Ref2VA），原生音视频（768p/24fps + 32kHz 立体声）；权重与镜像均可在底部「视频生成」页一键准备",
+        "support_tools": false,
+        "support_reasoning": false,
+        "support_images": true,
+        "support_video": true
     }
 ]

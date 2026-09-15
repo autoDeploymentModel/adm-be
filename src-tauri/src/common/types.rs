@@ -36,7 +36,10 @@ pub struct RemoteModel {
     /// 旧格式：单文件下载地址（GGUF），新格式模型为空
     #[serde(default)]
     pub model_url: String,
-    /// 下载清单：完整文件 URL（逐文件 `.part` 续传）或 HF 仓库 ID（形如 `org/name`，hfd.sh 整仓下载）
+    /// 下载清单（统一下载入口，两种格式不可混用）：
+    /// 1. HF 仓库条目：`org/name`（整仓）或 `org/name/<仓库内路径或通配模式>`（hfd.sh + `--include`，
+    ///    同仓库多条条目合并去重，如 `Comfy-Org/MiniMax-H3/diffusion_models/*`）；
+    /// 2. 完整文件 URL（http/https）：逐文件下载（`.part` 续传，huggingface.co 自动走镜像/代理）
     #[serde(default)]
     pub model_download_files: Vec<String>,
     /// 适配机型列表（如 "dgx-spark-128G"）；空数组 = 所有机型可用
@@ -62,6 +65,31 @@ pub struct RemoteModel {
     /// 引擎镜像（当前引擎专用）；为空回退 vllm_image（旧配置零改动）
     #[serde(default)]
     pub engine_image: String,
+    /// 容器内启动命令覆盖（逐段一个参数，如 ["sglang","serve"]）；缺省按引擎内置
+    /// （vLLM = `vllm serve`，SGLang = `python3 -m sglang.launch_server`）。
+    /// 用于扩散/视频类服务（SGLang diffusion 的 `sglang serve`）等非 LLM 启动入口。
+    #[serde(default)]
+    pub engine_command: Vec<String>,
+    /// 追加就绪关键字（stdout 子串命中即视为就绪），与引擎内置标志并列生效
+    #[serde(default)]
+    pub engine_ready_patterns: Vec<String>,
+    /// HTTP 就绪探活开关：true = 启动后轮询 `http://127.0.0.1:<port>/health`，
+    /// 返回 200 视为就绪（SGLang 扩散服务 warmup 未完成时返回 503）。
+    /// 用于没有固定就绪 banner 的引擎；纯 LLM 模型保持 false（行为不变）。
+    #[serde(default)]
+    pub engine_ready_probe: bool,
+    /// 就绪探活路径（engine_ready_probe=true 时生效）；空 = `/health`。
+    /// ComfyUI 用 `/system_stats`；路径需以 `/` 开头，非否则按 `/health` 处理。
+    #[serde(default)]
+    pub engine_ready_path: String,
+    /// 首页模型列表隐藏该条目（应用/服务型条目，如 ComfyUI 服务）：
+    /// 仅「视频生成」页等专用页面读取其配置，模型列表不渲染卡片
+    #[serde(default)]
+    pub hidden_in_list: bool,
+    /// 互斥组（如 "h3"）：同组模型不可同时运行；空 = 不参与互斥判断。
+    /// 前端启动前检查并提示先停止同组运行中的模型（后端仍以「已有模型在运行」兜底）
+    #[serde(default)]
+    pub exclusive_group: String,
     #[serde(default)]
     pub model_size: String,
     #[serde(default)]
@@ -76,6 +104,10 @@ pub struct RemoteModel {
     pub support_reasoning: bool,
     #[serde(default)]
     pub support_images: bool,
+    /// 支持音视频生成（扩散类视频模型，如 MiniMax-H3）：前端显示「音视频生成」标签，
+    /// 测试页不再加载对话 UI（引导改用 /v1/videos API）
+    #[serde(default)]
+    pub support_video: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]

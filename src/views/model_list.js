@@ -543,6 +543,8 @@ function showToast(message) {
 
 function getFilteredModelList() {
   let list = S().modelList;
+  // 应用/服务型条目（hidden_in_list，如 ComfyUI 服务）：不在模型列表渲染，由专用页管理
+  list = list.filter(function(m) { return !m.hidden_in_list; });
   // 机型过滤：model_support_devices 为空 = 全机型可用
   const dev = S().currentDeviceFilter;
   if (dev && dev !== "all") {
@@ -672,6 +674,7 @@ actionsHtml = '<button class="btn btn-view" id="view-' + safeModelId + '">' + _t
     if (model.support_tools) features.push('<span class="feature-badge feature-supported">' + _t("工具调用") + '</span>');
     if (model.support_reasoning) features.push('<span class="feature-badge feature-supported">' + _t("推理") + '</span>');
     if (model.support_images) features.push('<span class="feature-badge feature-supported">' + _t("图片识别") + '</span>');
+    if (model.support_video) features.push('<span class="feature-badge feature-supported">' + _t("音视频生成") + '</span>');
     const featuresHtml = features.length > 0 ? '<div class="card-features">' + features.join('') + '</div>' : '';
 
     const progressVisible = downloadingProgress !== undefined;
@@ -878,6 +881,14 @@ function showDockerPermissionDialog() {
 async function handleStart(btn) {
   const modelId = btn.dataset.startBtn;
   console.log("[model_list] 启动模型:", modelId);
+  // 互斥守卫：ComfyUI 服务（hidden_in_list 条目）运行中时，禁止直接启动模型
+  const comfyEntry = (S().modelList || []).find(function(m) {
+    return String(m.engine || "").toLowerCase() === "comfyui";
+  });
+  if (comfyEntry && S().runningModelId === comfyEntry.model_id) {
+    showToast(_t("ComfyUI 正在运行，请先在「视频生成」页停止后再启动该模型"));
+    return;
+  }
   try {
     const settings = await invoke()("load_settings");
     const params = settings.launch_params || settings.launchParams;
@@ -906,13 +917,20 @@ async function handleStart(btn) {
     const vllmFlags = (model && model.vllm_flags) || null;
     // 模型配置的 vllm_env（官方推荐容器环境变量，KEY=VALUE）→ 注入 docker -e，优先级最高
     const vllmEnv = (model && model.vllm_env) || null;
-    // 模型配置的 vllm_extra_mounts（附加挂载的 model_id 列表，如投机解码 drafter 权重）→ 逐条 -v /models/<id>:ro
+    // 模型配置的 vllm_extra_mounts（附加挂载清单：model_id 列表 / 显式 `host:container` 映射）→ 逐条挂载
     const extraMounts = (model && model.vllm_extra_mounts && model.vllm_extra_mounts.length) ? model.vllm_extra_mounts : null;
+    // 模型配置的 engine_command（容器内启动命令覆盖，如 SGLang 扩散服务 ["sglang","serve"]）
+    const engineCommand = (model && model.engine_command && model.engine_command.length) ? model.engine_command : null;
+    // 模型配置的 engine_ready_patterns（追加就绪关键字）/ engine_ready_probe（HTTP /health 探活）
+    const engineReadyPatterns = (model && model.engine_ready_patterns && model.engine_ready_patterns.length) ? model.engine_ready_patterns : null;
+    const engineReadyProbe = !!(model && model.engine_ready_probe);
+    // 就绪探活路径（默认 /health；ComfyUI 用 /system_stats 等）
+    const engineReadyPath = (model && model.engine_ready_path) || null;
 
     S().startingModelId = modelId;
     renderModelTable();
 
-    await invoke()("start_model", { modelId: modelId, params: params, device: device, vllmImage: vllmImage, vllmFlags: vllmFlags, vllmEnv: vllmEnv, extraMounts: extraMounts, engine: engine, engineImage: engineImage });
+    await invoke()("start_model", { modelId: modelId, params: params, device: device, vllmImage: vllmImage, vllmFlags: vllmFlags, vllmEnv: vllmEnv, extraMounts: extraMounts, engine: engine, engineImage: engineImage, engineCommand: engineCommand, engineReadyPatterns: engineReadyPatterns, engineReadyProbe: engineReadyProbe, engineReadyPath: engineReadyPath });
     console.log("[model_list] 启动模型 invoke 完成:", modelId);
   } catch (e) {
     console.error("[model_list] 启动失败:", e);
