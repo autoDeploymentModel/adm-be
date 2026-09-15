@@ -22,6 +22,21 @@ const COMFYUI_DOCKERFILE: &str = include_str!(concat!(
 /// 默认 ComfyUI 版本（H3 需 ≥ v0.30.0；Fun ControlNet 模板需 ≥ v0.35.0）
 const DEFAULT_COMFYUI_REF: &str = "v0.30.0";
 
+/// 构建基础镜像（Dockerfile `ARG BASE` 默认值，两处需保持一致）
+const DEFAULT_BASE_IMAGE: &str = "nvidia/cuda:13.0.0-runtime-ubuntu24.04";
+
+/// 官方源不可达时的内置加速器候选（与设置页「Docker 镜像配置」占位示例一致）；
+/// 仅在「已配置加速器」与「官方源」都探测失败后才尝试，避免给可直连网络引入额外绕行。
+const FALLBACK_MIRRORS: &[&str] = &[
+    "https://docker.nju.edu.cn",
+    "https://docker.m.daocloud.io",
+    "https://docker.1ms.run",
+    "https://docker.1panel.live",
+];
+
+/// 单个候选源的元数据探测超时（可达时秒级返回；不可达多为 TCP 超时，提前掐断换下一个）
+const BASE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+
 /// 页面上展示的安装状态
 #[derive(serde::Serialize)]
 pub struct ComfyuiSetupStatus {
@@ -121,6 +136,129 @@ pub async fn comfyui_setup_status(
     })
 }
 
+/// registry-mirrors 条目 → 镜像引用前缀（`https://docker.1ms.run/` → `docker.1ms.run`）
+fn mirror_prefix(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let host = trimmed
+        .split("://")
+        .last()
+        .unwrap_or(trimmed)
+        .trim_end_matches('/');
+    if host.is_empty() || !host.contains('.') {
+        return None;
+    }
+    Some(host.to_string())
+}
+
+fn push_unique(out: &mut Vec<String>, value: String) {
+    if !out.contains(&value) {
+        out.push(value);
+    }
+}
+
+/// 基础镜像候选引用（保序去重）：已配置加速器 → 官方源 → 内置加速器
+fn base_image_candidates(mirrors: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for mirror in mirrors {
+        if let Some(prefix) = mirror_prefix(mirror) {
+            push_unique(&mut out, format!("{}/{}", prefix, DEFAULT_BASE_IMAGE));
+        }
+    }
+    push_unique(&mut out, DEFAULT_BASE_IMAGE.to_string());
+    for mirror in FALLBACK_MIRRORS {
+        if let Some(prefix) = mirror_prefix(mirror) {
+            push_unique(&mut out, format!("{}/{}", prefix, DEFAULT_BASE_IMAGE));
+        }
+    }
+    out
+}
+
+/// 探测镜像引用能否在 registry 侧解析：`docker manifest inspect` 只取元数据、不下载层，
+/// 与 BuildKit 构建时的 "load metadata" 走同一条「客户端 → registry」路径，可如实预判是否卡住。
+async fn probe_image_ref(reference: &str, proxy: &str) -> bool {
+    let mut cmd = platform::docker_cmd_tokio();
+    cmd.args(["manifest", "inspect", reference])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if !proxy.is_empty() {
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            cmd.env(key, proxy);
+        }
+        cmd.env("NO_PROXY", "localhost,127.0.0.0/8,::1");
+    }
+    let Ok(mut child) = cmd.spawn() else {
+        return false;
+    };
+    match tokio::time::timeout(BASE_PROBE_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) => status.success(),
+        _ => {
+            let _ = child.kill().await;
+            false
+        }
+    }
+}
+
+/// 代理是否指向本机（localhost / 127.0.0.1 / ::1）：构建容器需 host 网络才能访问宿主代理
+fn proxy_host_is_loopback(proxy: &str) -> bool {
+    let after_scheme = proxy.split("://").last().unwrap_or(proxy);
+    let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
+    let host_port = host_port.rsplit('@').next().unwrap_or(host_port);
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        host_port.split(':').next().unwrap_or(host_port)
+    };
+    matches!(host.to_ascii_lowercase().as_str(), "localhost" | "127.0.0.1" | "::1")
+}
+
+/// 解析构建用基础镜像：Docker Hub 不可达（国内网络常见 `registry-1.docker.io` i/o timeout，
+/// 且 BuildKit 解析 FROM 不读 daemon.json 的 registry-mirrors）时改用可达的加速器前缀版本；
+/// 全部不可达则仍返回官方名，由 docker build 报原始错误（报错里给出处理建议）。
+async fn resolve_base_image(app: &tauri::AppHandle, log: &impl Fn(&str, &str)) -> String {
+    let mirrors = crate::pages::settings::get_docker_mirror_config()
+        .await
+        .map(|cfg| cfg.mirrors)
+        .unwrap_or_default();
+    let proxy = crate::common::utils::proxy::proxy_url(app).await;
+    for candidate in base_image_candidates(&mirrors) {
+        if image_exists_locally(&candidate).await {
+            log(&format!("[构建] 基础镜像已存在本地：{}", candidate), "stdout");
+            return candidate;
+        }
+        if probe_image_ref(&candidate, &proxy).await {
+            if candidate == DEFAULT_BASE_IMAGE {
+                log(&format!("[构建] 基础镜像源可达：{}", candidate), "stdout");
+            } else {
+                log(
+                    &format!("[构建] 官方源不可达，基础镜像改用加速器：{}", candidate),
+                    "stdout",
+                );
+            }
+            return candidate;
+        }
+        log(
+            &format!("[构建] 基础镜像源不可达，跳过：{}", candidate),
+            "stderr",
+        );
+    }
+    log(
+        &format!(
+            "[构建] 未探测到可达的基础镜像源，仍按官方源 {} 尝试（可在「设置 → Docker 镜像配置」填加速器或「设置 → 代理」后重试）",
+            DEFAULT_BASE_IMAGE
+        ),
+        "stderr",
+    );
+    DEFAULT_BASE_IMAGE.to_string()
+}
+
 /// 在应用内构建 ComfyUI 镜像：写入内置 Dockerfile → `docker build -t <image> <dir>`，
 /// 输出逐行转发到「模型日志」（model-log 事件），失败时返回可操作的错误信息。
 #[tauri::command]
@@ -171,18 +309,60 @@ pub async fn build_comfyui_image(
 
     crate::pages::model_list::docker_preflight(&app, &model_id).await?;
 
-    log(&format!("[构建] 开始构建镜像 {}（ComfyUI_REF={}）", image, reference), "stdout");
+    // 基础镜像解析（官方源不可达时自动切换加速器前缀）+ 代理注入（构建期网络步骤）
+    let proxy = crate::common::utils::proxy::proxy_url(&app).await;
+    let base_image = resolve_base_image(&app, &log).await;
+
+    log(
+        &format!(
+            "[构建] 开始构建镜像 {}（COMFYUI_REF={} / BASE={}）",
+            image, reference, base_image
+        ),
+        "stdout",
+    );
     log(&format!("[构建] Dockerfile: {}", dockerfile.display()), "stdout");
 
     let mut cmd = platform::docker_cmd_tokio();
-    cmd.args([
-        "build",
-        "-t",
-        &image,
-        "--build-arg",
-        &format!("COMFYUI_REF={}", reference),
-        &build_dir.to_string_lossy().to_string(),
-    ]);
+    let mut args: Vec<String> = vec![
+        "build".to_string(),
+        "-t".to_string(),
+        image.clone(),
+        "--build-arg".to_string(),
+        format!("BASE={}", base_image),
+        "--build-arg".to_string(),
+        format!("COMFYUI_REF={}", reference),
+    ];
+    if proxy.is_empty() {
+        log("[构建] 未配置代理，构建期网络步骤（apt/pip/git）直连", "stdout");
+    } else {
+        // 代理在本机时构建容器需 host 网络，否则容器内 127.0.0.1 指向容器自身、连不上宿主代理
+        if proxy_host_is_loopback(&proxy) {
+            args.push("--network=host".to_string());
+            log("[构建] 代理在本机：构建期使用 host 网络（--network=host）", "stdout");
+        }
+        // 构建期网络步骤走同一代理；--build-arg 不写入镜像 ENV（BuildKit 亦不记入镜像历史）
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+        ] {
+            let value = if key.eq_ignore_ascii_case("NO_PROXY") {
+                "localhost,127.0.0.0/8,::1".to_string()
+            } else {
+                proxy.clone()
+            };
+            args.push("--build-arg".to_string());
+            args.push(format!("{}={}", key, value));
+        }
+        log(&format!("[构建] 构建期注入代理：{}", proxy), "stdout");
+    }
+    args.push(build_dir.to_string_lossy().to_string());
+    cmd.args(&args);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -229,8 +409,10 @@ pub async fn build_comfyui_image(
         .map_err(|e| format!("等待 docker build 结束失败: {}", e))?;
     if !status.success() {
         let msg = format!(
-            "镜像构建失败（退出码 {:?}）：请检查上方构建日志（网络/代理、CUDA 源可达性）后重试",
-            status.code()
+            "镜像构建失败（退出码 {:?}）：基础镜像 {} 或构建期网络步骤（apt/pip/git）不可达。排查：①「设置 → Docker 镜像配置」填加速器并保存重启 Docker；②「设置 → 代理」配置可用代理（构建期自动注入）；③ 或手动 docker pull {} 后重试。详见上方日志",
+            status.code(),
+            base_image,
+            base_image
         );
         log(&format!("[ERROR] {}", msg), "stderr");
         bail!("{}", msg);

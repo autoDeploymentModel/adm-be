@@ -83,8 +83,13 @@
 ```bash
 docker build -t adm-comfyui-h3:nvfp4-20260915 scripts/docker/h3-comfyui
 # --build-arg COMFYUI_REF=v0.30.0 （H3 需 ≥0.30.0；Fun ControlNet 模板需 ≥0.35.0）
-# --build-arg BASE=nvidia/cuda:13.0.0-runtime-ubuntu24.04
+# --build-arg BASE=nvidia/cuda:13.0.0-runtime-ubuntu24.04   # Docker Hub 不可达时用加速器前缀（如 docker.1ms.run/nvidia/cuda:...）
+# --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple   # 可选：PyPI 加速（留空 = 官方源）
+# --build-arg TORCH_INDEX_URL=... / COMFYUI_REPO=...                   # 可选：wheel 源 / ComfyUI 源码仓库
+# 代理：HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY（应用「设置 → 代理」开启后自动注入）
 ```
+
+> **基础镜像源自动探测（应用内构建）**：BuildKit 解析 `FROM` **不读** daemon.json 的 `registry-mirrors`，国内网络会直接卡在 `registry-1.docker.io … i/o timeout`；应用「构建镜像」会先用 `docker manifest inspect` 逐个探测候选源（已配置加速器 → 官方源 → 内置加速器），把可达的那个前缀写进 `BASE`（页内日志显示实际使用的源），代理也会自动注入为构建期变量。
 
 镜像要点：
 
@@ -313,6 +318,8 @@ WebUI 内（首次）：
 | 产物没有声音 | 音频 VAE 未接/未解码 | 检查工作流 audio VAE 节点；`ffprobe` 确认 `aac 2ch 32000Hz` |
 | 出片黑屏（用 int8 VAE 时） | 版本过低 | int8_convrot VAE 需 ComfyUI ≥0.31.0，否则用 fp16 VAE |
 | 启动即 OOM | 与 SGLang 服务同时在跑 | 用页内互斥提示或 `h3-switch.sh` 切换 |
+| 构建卡在 `failed to resolve source metadata for docker.io/nvidia/cuda…: i/o timeout` | Docker Hub 不可达（BuildKit 解析 `FROM` 不读 `registry-mirrors`） | 应用会自动探测加速器前缀并改写 `BASE`（页内日志可见）；仍失败时在「设置 → Docker 镜像配置」填加速器（保存并重启 Docker）或「设置 → 代理」后重试 |
+| 构建卡在 pip / git clone（慢或超时） | pypi.org / github.com 直连受限 | 「设置 → 代理」配置可用代理（构建期自动注入代理变量，本机代理自动加 `--network=host`）；手工构建时可加 `--build-arg PIP_INDEX_URL=…` |
 
 ---
 
@@ -473,3 +480,4 @@ WebUI 内（首次）：
 | 2026-09-15 | **下载清单统一**：`model_download_includes` 删除，include 模式内联进 `model_download_files` 的仓库条目（`org/name/路径或通配`）；多仓库按条目顺序依次下载、同仓库模式合并去重，进度基准按同一模式过滤 |
 | 2026-09-15 | **应用内准备流程**：新增「构建镜像」（内置 Dockerfile + `docker build`，日志流式）与「下载权重」（`Comfy-Org/MiniMax-H3` + include，≈67 GB）按钮与状态显示；`comfyui_setup_status` / `build_comfyui_image` 两个命令；挂载改为 `models/MiniMax-H3-ComfyUI:/opt/ComfyUI/models` |
 | 2026-09-15 | **开发落地**：附录 A 全部实现（`engine_ready_path` / `hidden_in_list` / `engine: comfyui` 分发 `start_comfyui_docker` / 挂载读写模式 / 底部「视频生成」Tab + `views/video.js` / 互斥守卫 / i18n）；`doc/model.json` 增补 ComfyUI 条目；`h3-switch.sh` 改为按前缀探测容器 |
+| 2026-09-15 | **构建网络加固**：`build_comfyui_image` 构建前用 `docker manifest inspect` 探测基础镜像源（已配置加速器 → 官方源 → 内置加速器）并把可达前缀写进 `--build-arg BASE`，构建期自动注入「设置 → 代理」（本机代理加 `--network=host`）；Dockerfile 新增 `COMFYUI_REPO` / `TORCH_INDEX_URL` / `PIP_INDEX_URL` / 代理构建参数 |
