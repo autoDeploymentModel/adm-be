@@ -80,18 +80,44 @@
 
 ### 4.1 构建 ComfyUI ARM64 镜像（离线关键）
 
+**一键脚本（推荐；也可在另一台设备构建后拷回 DGX）**：
+
+```bash
+./scripts/docker/h3-comfyui/build-image.sh --save
+# 常用参数：
+#   --dry-run                      只打印解析结果与将执行的命令，不构建
+#   --proxy http://127.0.0.1:1080  构建期代理（本机代理会自动加 --network=host）
+#   --pip-index https://pypi.tuna.tsinghua.edu.cn/simple
+#   --platform linux/arm64         默认；x86 宿主跨架构需 binfmt/QEMU（脚本会提示安装命令）
+#   --force / --no-verify / --skip-runtime-check / --tag <image:tag> / --base <image> / --ref <tag>
+# 脚本自动完成：基础镜像源探测（官方 → 加速器）、ComfyUI 源码源回退 + commit 校验、代理注入、
+# 构建后自检；--save 额外导出 tar.gz + sha256。拷到 DGX 后导入：
+#   gunzip -c adm-comfyui-h3_nvfp4-20260915-linux_arm64.tar.gz | docker load
+```
+
+> **在 x86 宿主上构建（Ubuntu 22.04 / WSL2 / x86 Docker Desktop）**：目标 `linux/arm64` 属**跨架构构建**，需 QEMU/binfmt——
+> ① 一次性注册模拟器：`sudo docker run --privileged --rm tonistiigi/binfmt --install arm64`（Docker Desktop 自带，可跳过）；验证：`docker run --rm --platform linux/arm64 alpine uname -m` → `aarch64`；
+> ② Ubuntu 22.04 发行版自带 `docker.io` 是 20.10（classic builder），脚本会自动补 `DOCKER_BUILDKIT=1`；更省事是装 Docker CE 官方源（23+）；
+> ③ 直接跑 `./scripts/docker/h3-comfyui/build-image.sh --save`（自动加 `--platform linux/arm64`）——QEMU 模拟下预计 **1–3 小时**，磁盘预留 ≈30 GB；
+> ④ 若镜像内自检在模拟下异常，加 `--skip-runtime-check` 跳过，到 DGX 实机再验。
+
+手工等价命令：
+
 ```bash
 docker build -t adm-comfyui-h3:nvfp4-20260915 scripts/docker/h3-comfyui
 # --build-arg COMFYUI_REF=v0.30.0 （H3 需 ≥0.30.0；Fun ControlNet 模板需 ≥0.35.0）
 # --build-arg BASE=nvidia/cuda:13.0.0-runtime-ubuntu24.04   # Docker Hub 不可达时用加速器前缀（如 docker.1ms.run/nvidia/cuda:...）
-# --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple   # 可选：PyPI 加速（留空 = 官方源）
+# --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple   # 可选：PyPI 源（应用内构建会按吞吐自动择优；留空 = 官方）
 # --build-arg TORCH_INDEX_URL=... / COMFYUI_REPO=...                   # 可选：wheel 源 / ComfyUI 源码仓库
+# --build-arg SKIP_RUNTIME_CHECK=1                                    # 可选：跳过镜像内自检（QEMU 跨架构构建时用）
 # 代理：HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY（应用「设置 → 代理」开启后自动注入）
 ```
 
 > **基础镜像源自动探测（应用内构建）**：BuildKit 解析 `FROM`（含到 `auth.docker.io` 取匿名 token）**由 daemon 发起**——既不读 daemon.json 的 `registry-mirrors`，也不吃客户端代理；国内网络会直接卡在 `registry-1.docker.io / auth.docker.io … i/o timeout`。应用「构建镜像」会先用 `docker manifest inspect`（**不带客户端代理**，与 daemon 侧一致）逐个探测候选源（已配置加速器 → 官方源 → 内置加速器），把可达的那个前缀写进 `BASE`（页内日志显示实际使用的源）；「设置 → 代理」只注入构建内 RUN 步骤（apt/pip/git，本机代理自动加 `--network=host`），想让 daemon 也走代理需在该 Tab 点「保存并重启 Docker」（写 daemon.json `proxies`）。
 >
 > **源码源自动回退（同类问题）**：`github.com` 在部分网络被 TLS 重置（`GnuTLS recv error (-110)`）；应用会探测 `…/info/refs?service=git-upload-pack` 把可达的 git 源排到最前（官方 → gitee 镜像 → gitcode 镜像 → ghfast / gh-proxy 加速器），Dockerfile 内逐个尝试；克隆完成后用 `COMFYUI_REF_SHA` 校验 commit（`v0.30.0` = `b1693ecb…`，四个备用源与上游一致），不一致直接失败——被篡改/滞后的第三方镜像会被挡住。
+>
+> **PyPI 源自动择优（pip 层）**：`pypi.org` 的索引页本身很快，但**未托管在 PyTorch 索引的包**（`cuda-bindings`、`cuda-pathfinder`…）会被官方索引回落到 `files.pythonhosted.org`，弱网下长时间停读（实测 8.7 KB/s → `ReadTimeoutError`，整层构建失败，前面的 apt/torch 层白跑）。应用「构建镜像」会实测官方 + 清华 / 阿里 / 腾讯 / 华为云镜像的吞吐（GET `<源>/pip/` 索引页取最快）并把结果写进 `PIP_INDEX_URL`（页内日志显示实测 KB/s）；`torch / torchvision / torchaudio` 仍固定从 `TORCH_INDEX_URL` 取（`+cu130` 本地版本标记在同版本下优先于镜像里的普通轮子，已实测确认），其**依赖**则走选出的 PyPI 源。Dockerfile 侧：所有 pip 安装带 `--timeout 60 --retries 10`；requirements 与 `comfy-kitchen[cublas]` 主源失败会自动回退官方 PyPI；torch 装完校验 `torch.version.cuda` 大版本（与 `TORCH_INDEX_URL` 的 `cuNNN` 对齐），不符则从官方索引重装、仍不符直接失败——避免静默装出 cu12x 轮子。三个 pip 层还带 `--mount=type=cache,target=/root/.cache/pip`（wheel 存 BuildKit 缓存、不进镜像层：弱网失败后重试不必重下 2 GB+），该语法要求 BuildKit——Docker 23+ 默认即是，应用与 `build-image.sh` 都强制 `DOCKER_BUILDKIT=1`。
 
 镜像要点：
 
@@ -322,7 +348,7 @@ WebUI 内（首次）：
 | 启动即 OOM | 与 SGLang 服务同时在跑 | 用页内互斥提示或 `h3-switch.sh` 切换 |
 | 构建卡在 `failed to resolve source metadata …` / `failed to fetch anonymous token … auth.docker.io … i/o timeout` | Docker Hub 不可达（BuildKit 解析 `FROM`、取 token 由 **daemon** 发起：不吃客户端代理、不读 `registry-mirrors`） | 应用会自动探测加速器前缀并改写 `BASE`（探测不带客户端代理，页内日志可见）；仍失败时在「设置 → Docker 镜像配置」填加速器（保存并重启 Docker）；配了「设置 → 代理」仍失败 → 点该 Tab 的「保存并重启 Docker」让 daemon 也走代理 |
 | 构建报 `unable to access 'https://github.com/comfyanonymous/ComfyUI/' … GnuTLS recv error (-110)` | github.com 被 TLS 重置 | 应用会自动探测并改用可达源（gitee 镜像 / gitcode 镜像 / ghfast、gh-proxy 加速器，页内日志显示实际源）；也可用「设置 → 代理」或手工 `--build-arg COMFYUI_REPO=<源>` |
-| 构建卡在 pip（慢或超时） | pypi.org 直连受限 | 「设置 → 代理」配置可用代理（构建期自动注入代理变量）；手工构建时可加 `--build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple` |
+| 构建报 `ReadTimeoutError … files.pythonhosted.org` / pip 阶段长时间无进展 | PyPI 官方 CDN 弱网停读（索引可达 ≠ 包体可下） | 应用会自动实测并选用最快的 PyPI 镜像（页内日志显示实测 KB/s）；Dockerfile 已带 `--timeout 60 --retries 10` 且主源失败自动回退官方；仍慢就配「设置 → 代理」，或手工 `--pip-index <镜像>`（build-image.sh）/ `--build-arg PIP_INDEX_URL=<镜像>` |
 
 ---
 
@@ -486,3 +512,6 @@ WebUI 内（首次）：
 | 2026-09-15 | **构建网络加固**：`build_comfyui_image` 构建前用 `docker manifest inspect` 探测基础镜像源（已配置加速器 → 官方源 → 内置加速器）并把可达前缀写进 `--build-arg BASE`，构建期自动注入「设置 → 代理」（本机代理加 `--network=host`）；Dockerfile 新增 `COMFYUI_REPO` / `TORCH_INDEX_URL` / `PIP_INDEX_URL` / 代理构建参数 |
 | 2026-09-15 | **源码源回退**：`github.com` 被 TLS 重置时，应用侧探测 `…/info/refs` 并把可达源排前（gitee 镜像 / gitcode 镜像 / ghfast、gh-proxy 加速器），Dockerfile 内依次回退；克隆后用 `COMFYUI_REF_SHA` 校验 commit（`v0.30.0` = `b1693ecb…`，四源与上游一致），新增 `COMFYUI_REPO_FALLBACKS` / `COMFYUI_REF_SHA` 构建参数 |
 | 2026-09-15 | **构建探测修正**：基础镜像源探测不再注入客户端代理（BuildKit 的 `FROM`/token 解析由 daemon 发起，客户端代理只对 RUN 步骤生效）——避免「配了本地代理 → 误判官方源可达 → 构建再次卡在 `auth.docker.io`」；命中加速器时页内日志会说明原因与 daemon 代理做法 |
+| 2026-09-15 | **一键构建脚本**：新增 `scripts/docker/h3-comfyui/build-image.sh`（与应用侧同款「基础镜像源探测 → 加速器前缀、ComfyUI 源码源回退 + commit 校验、代理注入（本机代理加 `--network=host`）、跨架构 QEMU 提示」，另有 `--save` 导出 tar.gz + sha256、`--dry-run` 预览、构建后自检），可在网络更好的设备上构建后 `docker load` 回 DGX |
+| 2026-09-15 | **x86 宿主跨架构构建**：Dockerfile 新增 `SKIP_RUNTIME_CHECK` 参数（QEMU 模拟下可跳过镜像内自检）；`build-image.sh` 自动识别 x86→arm64（`--platform` + binfmt 检测提示 + 旧版 docker 自动 `DOCKER_BUILDKIT=1`）、新增 `--skip-runtime-check`；§4.1 补 Ubuntu 22.04 / WSL2 构建指引 |
+| 2026-09-15 | **pip 源加固（构建卡在 torch 依赖）**：实测确认 pip 同版本下「本地版本标记优先」（`2.14.0+cu130` 胜过镜像里的 `2.14.0`），于是 torch 步骤改为 `--index-url TORCH_INDEX_URL --extra-index-url PIP_INDEX_URL`（轮子固定官方、依赖走镜像，不再回落到 `files.pythonhosted.org`）；所有 pip 安装加 `--timeout 60 --retries 10`，requirements / `comfy-kitchen[cublas]` 主源失败自动回退官方 PyPI；torch 装完校验 `torch.version.cuda` 大版本（不符 → 官方索引重装 → 仍不符则构建失败）；三个 pip 层加 BuildKit cache mount（`--mount=type=cache,target=/root/.cache/pip`，wheel 不进镜像层，失败重试不重下 2 GB+），`build-image.sh` 相应强制 `DOCKER_BUILDKIT=1`；应用侧与 `build-image.sh` 均改为**实测各 PyPI 源吞吐择优**（官方 + 清华/阿里/腾讯/华为云，`<源>/pip/` 索引页），日志显示实测 KB/s |

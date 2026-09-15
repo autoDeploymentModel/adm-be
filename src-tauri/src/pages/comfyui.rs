@@ -10,6 +10,7 @@ use crate::bail;
 use crate::common::config;
 use crate::common::error::AppError;
 use crate::common::utils::platform;
+use futures_util::StreamExt;
 use tauri::Emitter;
 
 /// Dockerfile 单一真源：仓库内手工路径 `scripts/docker/h3-comfyui/Dockerfile`
@@ -46,6 +47,21 @@ const FALLBACK_MIRRORS: &[&str] = &[
     "https://docker.1ms.run",
     "https://docker.1panel.live",
 ];
+
+/// PyPI 源候选（官方 + 常见国内镜像）：torch 的依赖 / ComfyUI requirements / comfy-kitchen 都走选出的源。
+/// 官方源可达 ≠ 可下：未托管在 PyTorch 索引的包会回落到 files.pythonhosted.org，
+/// 弱网下长时间停读（实测 8.7 KB/s → pip Read timed out），故按吞吐实测择优。
+const PYPI_SOURCES: &[&str] = &[
+    "https://pypi.org/simple",
+    "https://pypi.tuna.tsinghua.edu.cn/simple",
+    "https://mirrors.aliyun.com/pypi/simple",
+    "https://mirrors.cloud.tencent.com/pypi/simple",
+    "https://repo.huaweicloud.com/repository/pypi/simple",
+];
+
+/// PyPI 源探测窗口：拉 `<源>/pip/`（PEP 503 索引页，约 70–100 KB），命中字节下限或超时即收手
+const PYPI_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+const PYPI_PROBE_MIN_BYTES: usize = 48 * 1024;
 
 /// 单个候选源的元数据探测超时（可达时秒级返回；不可达多为 TCP 超时，提前掐断换下一个）
 const BASE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
@@ -325,6 +341,80 @@ async fn resolve_comfyui_sources(log: &impl Fn(&str, &str), proxy: &str) -> (Str
     (first, ordered)
 }
 
+/// 实测 PyPI 源吞吐（KB/s）：GET `<源>/pip/` 索引页，读到字节下限或超时即收手；
+/// 不可达 / 非 200 返回 None。按吞吐而非「可达」择优，是因为官方源索引页很快、
+/// 但包体走 files.pythonhosted.org，弱网下长时间停读会把 pip 拖成 Read timed out。
+async fn probe_pypi_throughput(base: &str, proxy: &str) -> Option<f64> {
+    let url = format!("{}/pip/", base.trim_end_matches('/'));
+    let mut builder = reqwest::Client::builder()
+        .user_agent("adm-be/build-probe")
+        .timeout(PYPI_PROBE_TIMEOUT);
+    if !proxy.is_empty() {
+        if let Ok(p) = reqwest::Proxy::all(proxy) {
+            builder = builder.proxy(p);
+        }
+    }
+    let client = builder.build().ok()?;
+    let started = std::time::Instant::now();
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let mut bytes = 0usize;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.ok()?;
+        bytes += chunk.len();
+        if bytes >= PYPI_PROBE_MIN_BYTES {
+            break;
+        }
+    }
+    let secs = started.elapsed().as_secs_f64();
+    if bytes == 0 || secs <= 0.0 {
+        return None;
+    }
+    Some(bytes as f64 / 1024.0 / secs)
+}
+
+/// 选 PyPI 源（`docker build --build-arg PIP_INDEX_URL`）：各候选实测吞吐，取最快的一个；
+/// 全部不可达则仍返回官方源（Dockerfile 内每个 pip 步骤还带官方兜底与超时重试）。
+async fn resolve_pypi_index(log: &impl Fn(&str, &str), proxy: &str) -> String {
+    let mut best: Option<(String, f64)> = None;
+    for candidate in PYPI_SOURCES {
+        if let Some(kbps) = probe_pypi_throughput(candidate, proxy).await {
+            if best.as_ref().map(|(_, b)| kbps > *b).unwrap_or(true) {
+                best = Some(((*candidate).to_string(), kbps));
+            }
+        }
+    }
+    match best {
+        Some((url, kbps)) if url == PYPI_SOURCES[0] => {
+            log(
+                &format!("[构建] PyPI 源：{}（官方源实测最优 {:.0} KB/s）", url, kbps),
+                "stdout",
+            );
+            url
+        }
+        Some((url, kbps)) => {
+            log(
+                &format!(
+                    "[构建] PyPI 源改用镜像：{}（实测 {:.0} KB/s，官方源更慢/不可达）——torch 依赖与 comfy-kitchen 不再回落到 files.pythonhosted.org",
+                    url, kbps
+                ),
+                "stdout",
+            );
+            url
+        }
+        None => {
+            log(
+                "[构建] 未探测到可达的 PyPI 源，仍按官方源尝试（构建内自带官方兜底与超时重试）",
+                "stderr",
+            );
+            PYPI_SOURCES[0].to_string()
+        }
+    }
+}
+
 /// 在应用内构建 ComfyUI 镜像：写入内置 Dockerfile → `docker build -t <image> <dir>`，
 /// 输出逐行转发到「模型日志」（model-log 事件），失败时返回可操作的错误信息。
 #[tauri::command]
@@ -385,6 +475,7 @@ pub async fn build_comfyui_image(
         );
     }
     let (comfyui_repo, comfyui_repo_fallbacks) = resolve_comfyui_sources(&log, &proxy).await;
+    let pypi_index = resolve_pypi_index(&log, &proxy).await;
     let ref_sha = if reference == DEFAULT_COMFYUI_REF {
         DEFAULT_COMFYUI_REF_SHA.to_string()
     } else {
@@ -423,6 +514,8 @@ pub async fn build_comfyui_image(
         format!("COMFYUI_REPO_FALLBACKS={}", comfyui_repo_fallbacks.join(" ")),
         "--build-arg".to_string(),
         format!("COMFYUI_REF_SHA={}", ref_sha),
+        "--build-arg".to_string(),
+        format!("PIP_INDEX_URL={}", pypi_index),
     ];
     if proxy.is_empty() {
         log("[构建] 未配置代理，构建期网络步骤（apt/pip/git）直连", "stdout");
@@ -501,9 +594,10 @@ pub async fn build_comfyui_image(
         .map_err(|e| format!("等待 docker build 结束失败: {}", e))?;
     if !status.success() {
         let msg = format!(
-            "镜像构建失败（退出码 {:?}）：基础镜像 {} 或构建期网络步骤（apt/pip/git）不可达。排查：①「设置 → Docker 镜像配置」填加速器并保存重启 Docker；②「设置 → 代理」配置可用代理（构建期自动注入）；③ 或手动 docker pull {} 后重试。详见上方日志",
+            "镜像构建失败（退出码 {:?}）：基础镜像 {} / PyPI 源 {} / 构建期网络步骤（apt/pip/git）不可达。排查：①「设置 → Docker 镜像配置」填加速器并保存重启 Docker；②「设置 → 代理」配置可用代理（构建期自动注入）；③ 或手动 docker pull {} 后重试。详见上方日志",
             status.code(),
             base_image,
+            pypi_index,
             base_image
         );
         log(&format!("[ERROR] {}", msg), "stderr");
