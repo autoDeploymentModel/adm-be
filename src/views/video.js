@@ -297,9 +297,11 @@ const LOG_LIMIT = 600;
 /** @type {{text: string, source: string}[]} */
 let logLines = [];
 /** 环境就绪状态（镜像 / 权重），由后端 comfyui_setup_status 返回 */
-let setup = /** @type {any} */ ({ image_exists: false, weights_downloaded: false, weights_partial: false, weights_bytes: 0, weights_dir: "" });
+let setup = /** @type {any} */ ({ image_exists: false, weights_downloaded: false, weights_partial: false, weights_bytes: 0, weights_total_bytes: 0, weights_missing: [], weights_missing_count: 0, weights_dir: "" });
 /** 视图是否已挂载：拉镜/权重下载等长任务在切页后完成时不再回写已移除的 DOM */
 let mounted = false;
+/** 停止（docker stop/rm）进行中：按钮/状态卡显示「正在停止中...」，避免误以为没反应 */
+let stopping = false;
 /** 镜像下载（docker pull）进行中：进度取 st.pullProgress[modelId]（model-pull-progress 事件） */
 let pullingImage = false;
 /** 权重下载速度（bytes/s，来自 download-progress 事件，仅用于本页展示） */
@@ -401,6 +403,10 @@ function render() {
   if (!e) {
     dot.className = "video-state-dot";
     stateText.textContent = _t("未配置 ComfyUI 条目（检查远程 model.json）");
+  } else if (stopping) {
+    // 停止可能持续数秒（docker stop → rm），先明确告知正在停止
+    dot.className = "video-state-dot starting";
+    stateText.textContent = _t("正在停止中...");
   } else if (running) {
     dot.className = "video-state-dot running";
     stateText.textContent = _t("运行中");
@@ -412,7 +418,7 @@ function render() {
     stateText.textContent = _t("未启动");
   }
 
-  el("video-url").textContent = running ? webuiUrl() : "--";
+  el("video-url").textContent = running && !stopping ? webuiUrl() : "--";
   const portInput = el("video-port");
   if (portInput && document.activeElement !== portInput) portInput.value = String(getPort());
   el("video-image").textContent = (e && (e.engine_image || e.vllm_image)) || "--";
@@ -461,9 +467,23 @@ function render() {
         weightsBtn.textContent = _t("已下载");
         weightsBtn.disabled = true;
       } else {
+        // 后端按下载清单逐文件校验：有缺文件时给出「已下载 / 共 / 缺失个数」，tooltip 列具体文件名
+        const missing = Number(setup.weights_missing_count) || 0;
+        const missingList = Array.isArray(setup.weights_missing) ? setup.weights_missing : [];
+        const sizeText = formatBytes(setup.weights_bytes) +
+          (setup.weights_total_bytes ? " / " + formatBytes(setup.weights_total_bytes) : "");
         weightsState.textContent = setup.weights_partial
-          ? _t("已中断") + "（" + formatBytes(setup.weights_bytes) + _t("，可继续断点续传）")
+          ? _t("已中断") + "（" + sizeText +
+            (missing ? " · " + _t("缺失") + " " + missing + _t(" 个文件") : "") +
+            _t("，可继续断点续传）")
           : _t("未下载") + _t("（首次约 67 GB）");
+        const tip = missingList.length
+          ? _t("缺失文件") + "（" +
+            (missing > missingList.length ? missingList.length + "/" + missing : String(missingList.length)) +
+            "）：\n" + missingList.join("\n")
+          : "";
+        weightsState.title = tip;
+        weightsBtn.title = tip;
         weightsBtn.textContent = setup.weights_partial ? _t("继续下载") : _t("下载权重");
         weightsBtn.disabled = false;
       }
@@ -472,11 +492,13 @@ function render() {
     el("video-setup-paths").textContent = _t("权重目录") + ": " + (setup.weights_dir || "--");
   }
 
-  el("video-start").disabled = !e || running || starting || pullingImage || !setup.image_exists;
+  el("video-start").disabled = !e || running || starting || stopping || pullingImage || !setup.image_exists;
   el("video-start").title = !setup.image_exists ? _t("需先下载镜像") : "";
-  el("video-stop").disabled = !running;
-  el("video-restart").disabled = !running;
-  el("video-open").disabled = !running;
+  const stopBtn = el("video-stop");
+  stopBtn.disabled = !running || stopping;
+  stopBtn.textContent = stopping ? _t("停止中...") : _t("停止");
+  el("video-restart").disabled = !running || stopping;
+  el("video-open").disabled = !running || stopping;
 
   // 互斥提示：其它模型（SGLang 等）正在运行时
   const other = st.runningModelId && modelId && st.runningModelId !== modelId ? String(st.runningModelId) : "";
@@ -509,7 +531,8 @@ async function refreshSetup() {
   if (!e) return;
   const image = e.engine_image || e.vllm_image || "";
   try {
-    setup = await invoke()("comfyui_setup_status", { modelId: e.model_id, image: image });
+    // 传下载清单：后端逐文件校验权重完整性（缺失时能列出具体文件名）
+    setup = await invoke()("comfyui_setup_status", { modelId: e.model_id, image: image, modelFiles: e.model_download_files || [] });
   } catch (err) {
     console.warn("[video] 查询 ComfyUI 环境状态失败:", err);
   }
@@ -615,6 +638,10 @@ async function handleStart() {
 }
 
 async function handleStop() {
+  // 不依赖 entry()（远程清单拉不到时也要能停掉正在运行的容器）
+  if (stopping) return;
+  stopping = true;
+  render();
   try {
     await invoke()("stop_model");
     S().runningModelId = null;
@@ -622,6 +649,9 @@ async function handleStop() {
   } catch (err) {
     notify(_t("停止失败: ") + err);
   }
+  stopping = false;
+  // 停止后容器/端口状态需重新探测（stop_model 内部是 docker stop + rm）
+  await refreshSetup();
   render();
 }
 

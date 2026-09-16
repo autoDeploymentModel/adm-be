@@ -249,13 +249,13 @@ fn parse_repo_entry(entry: &str) -> Option<(String, Option<String>)> {
 }
 
 /// 条目是否为 HF 仓库条目（含带模式的 `org/name/path` 形式）。
-fn is_repo_entry(entry: &str) -> bool {
+pub(crate) fn is_repo_entry(entry: &str) -> bool {
     parse_repo_entry(entry).is_some()
 }
 
 /// 合并仓库条目：同一仓库的多条 `org/name/模式` 收敛为 (repo, [模式...])，
 /// 保持首次出现顺序、模式去重；无模式的条目表示整仓下载。
-fn merge_repo_entries(files: &[String]) -> Vec<(String, Vec<String>)> {
+pub(crate) fn merge_repo_entries(files: &[String]) -> Vec<(String, Vec<String>)> {
     let mut merged: Vec<(String, Vec<String>)> = Vec::new();
     for entry in files {
         let Some((repo, pattern)) = parse_repo_entry(entry) else { continue };
@@ -955,7 +955,7 @@ async fn ensure_hfd_script(app: &tauri::AppHandle, model_id: &str) -> Result<std
 
 /// 拉取 HF 仓库文件清单（`/api/models/<repo>?blobs=true`，含文件大小）作为进度基准。
 /// 点开头元数据（.gitattributes 等）不计入。失败返回 None（进度退化为不更新，仅日志跟随）。
-async fn fetch_repo_files(
+pub(crate) async fn fetch_repo_files(
     client: &reqwest::Client,
     endpoint: &str,
     repo: &str,
@@ -985,7 +985,7 @@ async fn fetch_repo_files(
 /// 读取 hfd.sh 自己的下载清单（`<local-dir>/.hfd/manifest`，行格式 `大小\t相对路径`）
 /// 作为进度基准的兜底：内容与 hfd 实际下载的文件一致（已按 --include 过滤），
 /// HF API 不可达或首次运行尚未生成清单时返回 None。
-fn read_hfd_manifest(model_dir: &std::path::Path) -> Option<Vec<(String, u64)>> {
+pub(crate) fn read_hfd_manifest(model_dir: &std::path::Path) -> Option<Vec<(String, u64)>> {
     let text = std::fs::read_to_string(model_dir.join(".hfd").join("manifest")).ok()?;
     let mut out: Vec<(String, u64)> = Vec::new();
     for line in text.lines() {
@@ -1116,7 +1116,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 /// 仓库文件相对路径是否命中仓库条目的 include 模式（条目第 3 段起的路径/通配，空列表 = 全部命中）。
 /// hfd.sh 将模式转成正则后用“子串”匹配（`=~`），这里同样给模式补上隐式前后通配，
 /// 保证进度基准与 hfd 的实际过滤一致（否则进度可能到不了 100%）。
-fn matches_include_patterns(path: &str, patterns: &[String]) -> bool {
+pub(crate) fn matches_include_patterns(path: &str, patterns: &[String]) -> bool {
     if patterns.is_empty() {
         return true;
     }
