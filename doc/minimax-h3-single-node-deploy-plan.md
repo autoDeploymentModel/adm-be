@@ -2,7 +2,7 @@
 
 > 目标机型：DGX Spark（GB10，128 GB 统一内存，ARM64 + CUDA 13，sm121）
 > **主方案**：Docker + ComfyUI，权重用 **NVFP4-AWQ 编码器 + 量化 DiT**，**首次打开由 ComfyUI 自动下载**
-> **入口**：底部导航**「视频生成」Tab** —— 镜像下载、权重下载、启动/停止/状态/日志/首次指引全部在该页内（首页模型列表**不出现** ComfyUI 卡片）
+> **入口**：底部导航**「视频生成」Tab** —— 镜像下载、权重下载、启动/停止/状态/首次指引全部在该页内（首页模型列表**不出现** ComfyUI 卡片；运行日志写入 `<data>/logs/YYYY-MM-DD.log`，见「设置 → 运行日志」）
 > 状态：**已实现**（附录 A 全部落地；本文件保留为设计与运维参考）
 
 ---
@@ -11,7 +11,7 @@
 
 | 项目 | 结论 |
 |---|---|
-| 入口 | **底部导航「视频生成」页**（新增 Tab，路由 `#/video`）：服务状态 + 启动 / 停止 / 重启 / 打开 WebUI / 日志 / 首次指引；数据来源于远程 `model.json` 的 ComfyUI 条目（见 §5、附录 B） |
+| 入口 | **底部导航「视频生成」页**（新增 Tab，路由 `#/video`）：服务状态 + 启动 / 停止 / 重启 / 打开 WebUI / 首次指引（日志见「设置 → 运行日志」）；数据来源于远程 `model.json` 的 ComfyUI 条目（见 §5、附录 B） |
 | 引擎 | ComfyUI 自 **v0.30.0** 起**原生支持 MiniMax-H3**（核心节点 + 官方模板，无需第三方插件），推理全程在 ComfyUI 内完成 |
 | 权重获取 | **应用内一键下载**（统一下载清单 `model_download_files` 里 `Comfy-Org/MiniMax-H3/<路径或通配>` 条目，默认 FL2VA+Ref2VA 量化集 **≈67 GB**，走 hf-mirror/代理、断点续传、`.done` 标记）；亦可在 ComfyUI 首次打开模板时用弹窗自助下载（官方默认集 ≈44 GB，仅 FL2VA）；离线预置脚本见 §4.2 |
 | 权重组合 | 文本编码器 `qwen3vl_32b_minimax_h3_nvfp4_awq`（15.69 GB）+ DiT `minimax_h3_fl2va_pruned_int8_convrot`（20.97 GB）+ 双 VAE（5.82 GB）+ turbo 8step LoRA（1.96 GB）；NVFP4 DiT 官方**不存在**（社区 w4a8 见 §7） |
@@ -111,11 +111,11 @@ docker build -t adm-comfyui-h3:nvfp4-20260915 scripts/docker/h3-comfyui
 # 代理：HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY（应用「设置 → 代理」开启后自动注入）
 ```
 
-> **基础镜像源自动探测（应用内构建）**：BuildKit 解析 `FROM`（含到 `auth.docker.io` 取匿名 token）**由 daemon 发起**——既不读 daemon.json 的 `registry-mirrors`，也不吃客户端代理；国内网络会直接卡在 `registry-1.docker.io / auth.docker.io … i/o timeout`。手工脚本 `build-image.sh` 会先用 `docker manifest inspect`（**不带客户端代理**，与 daemon 侧一致）逐个探测候选源（已配置加速器 → 官方源 → 内置加速器），把可达的那个前缀写进 `BASE`（页内日志显示实际使用的源）；「设置 → 代理」只注入构建内 RUN 步骤（apt/pip/git，本机代理自动加 `--network=host`），想让 daemon 也走代理需在该 Tab 点「保存并重启 Docker」（写 daemon.json `proxies`）。
+> **基础镜像源自动探测（手工脚本构建）**：BuildKit 解析 `FROM`（含到 `auth.docker.io` 取匿名 token）**由 daemon 发起**——既不读 daemon.json 的 `registry-mirrors`，也不吃客户端代理；国内网络会直接卡在 `registry-1.docker.io / auth.docker.io … i/o timeout`。手工脚本 `build-image.sh` 会先用 `docker manifest inspect`（**不带客户端代理**，与 daemon 侧一致）逐个探测候选源（已配置加速器 → 官方源 → 内置加速器），把可达的那个前缀写进 `BASE`（脚本日志显示实际使用的源）；「设置 → 代理」只注入构建内 RUN 步骤（apt/pip/git，本机代理自动加 `--network=host`），想让 daemon 也走代理需在该 Tab 点「保存并重启 Docker」（写 daemon.json `proxies`）。
 >
 > **源码源自动回退（同类问题）**：`github.com` 在部分网络被 TLS 重置（`GnuTLS recv error (-110)`）；应用会探测 `…/info/refs?service=git-upload-pack` 把可达的 git 源排到最前（官方 → gitee 镜像 → gitcode 镜像 → ghfast / gh-proxy 加速器），Dockerfile 内逐个尝试；克隆完成后用 `COMFYUI_REF_SHA` 校验 commit（`v0.30.0` = `b1693ecb…`，四个备用源与上游一致），不一致直接失败——被篡改/滞后的第三方镜像会被挡住。
 >
-> **PyPI 源自动择优（pip 层）**：`pypi.org` 的索引页本身很快，但**未托管在 PyTorch 索引的包**（`cuda-bindings`、`cuda-pathfinder`…）会被官方索引回落到 `files.pythonhosted.org`，弱网下长时间停读（实测 8.7 KB/s → `ReadTimeoutError`，整层构建失败，前面的 apt/torch 层白跑）。手工脚本 `build-image.sh` 会实测官方 + 清华 / 阿里 / 腾讯 / 华为云镜像的吞吐（GET `<源>/pip/` 索引页取最快）并把结果写进 `PIP_INDEX_URL`（页内日志显示实测 KB/s）；`torch / torchvision / torchaudio` 仍固定从 `TORCH_INDEX_URL` 取（`+cu130` 本地版本标记在同版本下优先于镜像里的普通轮子，已实测确认），其**依赖**则走选出的 PyPI 源。Dockerfile 侧：所有 pip 安装带 `--timeout 60 --retries 10`；requirements 与 `comfy-kitchen[cublas]` 主源失败会自动回退官方 PyPI；torch 装完校验 `torch.version.cuda` 大版本（与 `TORCH_INDEX_URL` 的 `cuNNN` 对齐），不符则从官方索引重装、仍不符直接失败——避免静默装出 cu12x 轮子。三个 pip 层还带 `--mount=type=cache,target=/root/.cache/pip`（wheel 存 BuildKit 缓存、不进镜像层：弱网失败后重试不必重下 2 GB+），该语法要求 BuildKit——Docker 23+ 默认即是，`build-image.sh` 强制 `DOCKER_BUILDKIT=1`。
+> **PyPI 源自动择优（pip 层）**：`pypi.org` 的索引页本身很快，但**未托管在 PyTorch 索引的包**（`cuda-bindings`、`cuda-pathfinder`…）会被官方索引回落到 `files.pythonhosted.org`，弱网下长时间停读（实测 8.7 KB/s → `ReadTimeoutError`，整层构建失败，前面的 apt/torch 层白跑）。手工脚本 `build-image.sh` 会实测官方 + 清华 / 阿里 / 腾讯 / 华为云镜像的吞吐（GET `<源>/pip/` 索引页取最快）并把结果写进 `PIP_INDEX_URL`（脚本日志显示实测 KB/s）；`torch / torchvision / torchaudio` 仍固定从 `TORCH_INDEX_URL` 取（`+cu130` 本地版本标记在同版本下优先于镜像里的普通轮子，已实测确认），其**依赖**则走选出的 PyPI 源。Dockerfile 侧：所有 pip 安装带 `--timeout 60 --retries 10`；requirements 与 `comfy-kitchen[cublas]` 主源失败会自动回退官方 PyPI；torch 装完校验 `torch.version.cuda` 大版本（与 `TORCH_INDEX_URL` 的 `cuNNN` 对齐），不符则从官方索引重装、仍不符直接失败——避免静默装出 cu12x 轮子。三个 pip 层还带 `--mount=type=cache,target=/root/.cache/pip`（wheel 存 BuildKit 缓存、不进镜像层：弱网失败后重试不必重下 2 GB+），该语法要求 BuildKit——Docker 23+ 默认即是，`build-image.sh` 强制 `DOCKER_BUILDKIT=1`。
 
 镜像要点：
 
@@ -133,7 +133,7 @@ docker build -t adm-comfyui-h3:nvfp4-20260915 scripts/docker/h3-comfyui
 
 | 路径 | 适用 | 做法 | 说明 |
 |---|---|---|---|
-| **A. 应用内一键（默认）** | 有外网/镜像加速 | 「视频生成」页 → 「下载镜像」（`docker pull <engine_image>`，日志流式进入页内日志区；镜像由手工脚本构建并推送，见 §4.1）→ 「下载权重」（`model_download_files` 中的 `Comfy-Org/MiniMax-H3/<路径或通配>` 条目 ≈67 GB，支持断点续传/停止） | 与模型下载链路同源（hf-mirror/代理、`.done` 标记）；落盘到 `<data>/models/MiniMax-H3-ComfyUI/{diffusion_models,text_encoders,vae,loras,embeddings}` 并整体挂载为 `/opt/ComfyUI/models` |
+| **A. 应用内一键（默认）** | 有外网/镜像加速 | 「视频生成」页 → 「下载镜像」（`docker pull <engine_image>`，日志落盘到 `<data>/logs/YYYY-MM-DD.log`；镜像由手工脚本构建并推送，见 §4.1）→ 「下载权重」（`model_download_files` 中的 `Comfy-Org/MiniMax-H3/<路径或通配>` 条目 ≈67 GB，支持断点续传/停止） | 与模型下载链路同源（hf-mirror/代理、`.done` 标记）；落盘到 `<data>/models/MiniMax-H3-ComfyUI/{diffusion_models,text_encoders,vae,loras,embeddings}` 并整体挂载为 `/opt/ComfyUI/models` |
 | B. ComfyUI 弹窗自助 | 首次只想跑 FL2VA | 启动容器 → 打开 WebUI → 打开官方模板 → 跟随弹窗下载（≈44 GB） | 直连 huggingface.co（受限时改用路径 A）；与 A 落盘目录相同，可混用/续下。⚠️ 清单默认带 `--disable-api-nodes`（禁云 API/前端外联），若该参数导致弹窗下载不可用，可临时从 `engine_command` 去掉它或直接用路径 A |
 | C. 离线预置 | 纯离线/内网 | `./scripts/docker/h3-comfyui/download-comfy-h3.sh minimal|ref2va|all`（默认 `<data>/models/MiniMax-H3-ComfyUI`，`ADM_COMFYUI_WEIGHTS` 可覆盖）+ `HF_HUB_OFFLINE=1` | 与 A 目录一致；镜像用 `docker build`（或在有网机器构建后 `docker save/load` 导入） |
 
@@ -190,7 +190,8 @@ docker build -t adm-comfyui-h3:nvfp4-20260915 scripts/docker/h3-comfyui
 │ │ 当前模型占用统一内存，启动 ComfyUI 前需先停止它                    │ │
 │ │ [ 停止当前模型并启动 ComfyUI ]                                     │ │
 │ └─────────────────────────────────────────────────────────────────────┘ │
-│ ┌ 日志（model-log 流式，限高滚动，可复制）───────────────────────────┐ │
+│ ┌ 日志 ───────────────────────────────────────────────────────────────┐ │
+│ │ 运行日志按统一格式写入 <data>/logs/YYYY-MM-DD.log  [ 打开日志目录 ] │ │
 │ └─────────────────────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -202,7 +203,7 @@ docker build -t adm-comfyui-h3:nvfp4-20260915 scripts/docker/h3-comfyui
    │                                   │
    │                        GET /system_stats == 200
    │                          ┌── 成功 ──▶ 运行中（按钮：停止 / 重启 / 打开 WebUI）
-   │                          └── 失败 ──▶ 启动失败（toast + 日志区高亮，按钮回「启动」）
+   │                          └── 失败 ──▶ 启动失败（toast + 按钮回「启动」，详情见「设置 → 运行日志」）
    └── 若检测到其它模型运行中 ──▶ 显示互斥提示条（见 5.2 第三块）
 ```
 
@@ -210,7 +211,7 @@ docker build -t adm-comfyui-h3:nvfp4-20260915 scripts/docker/h3-comfyui
 
 1. **服务与页面解耦**：服务生命周期由后端持有；切到别的页面/关闭窗口不影响运行中的容器（应用退出由 `cleanup_processes` 统一清理）。
 2. **状态恢复**：`mount()` 时调用 `get_model_status` + 读取 `window.__adm_state` 恢复状态卡（避免切页后误显示「未启动」）。
-3. **事件驱动**：`handleTauriEvent` 处理 `model-started` / `model-stopped` / `model-log` / `model-pull-progress` 更新状态与日志；事件监听仍只在壳层注册。
+3. **事件驱动**：`handleTauriEvent` 处理 `model-started` / `model-stopped` / `model-pull-progress` / `download-*` 更新状态（`model-log` 仍发事件，但本页不再消费——日志已由 `logger::model_log` 落盘到统一日志文件）；事件监听仍只在壳层注册。
 4. **互斥（已实现）**：其它模型运行中时页内显示黄色互斥横幅（含「停止当前模型并启动 ComfyUI」按钮）；模型列表侧启动其它模型时若 ComfyUI 在运行，提示先去「视频生成」页停止。
 5. **首次引导**：权重未就绪（`<data>/models/MiniMax-H3-ComfyUI` 下 diffusion_models/text_encoders 无关键文件）时高亮指引块；就绪后折叠为一行。
 6. **端口**：默认 8188，可在页面内修改（改动写入设置；容器重启生效）。
@@ -325,8 +326,8 @@ WebUI 内（首次）：
 | 场景 | 操作 |
 |---|---|
 | 启动/停止 | 「视频生成」页按钮（后端 `start_model` / `stop_model`，容器 `adm-comfyui-<model_id>`）；异常残留：`docker rm -f adm-comfyui-<model_id>` |
-| 下载镜像 / 下载权重 | 同页「环境准备」卡：镜像拉取日志与下载进度都在页内（`comfyui_setup_status` 显示镜像/权重状态与目录） |
-| 日志 | 页内日志区（`model-log` 流式）；容器输出含权重加载与推理进度 |
+| 下载镜像 / 下载权重 | 同页「环境准备」卡：镜像拉取与下载进度都在页内（`comfyui_setup_status` 显示镜像/权重状态、缺失文件与目录） |
+| 日志 | 统一写入 `<data>/logs/YYYY-MM-DD.log`（格式 `[时间] [级别] [标签] 内容`，设置页「运行日志」可查看/清空/打开目录）；容器输出（含权重加载与推理进度）同样落盘 |
 | 健康检查 | `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8188/system_stats` → `200` |
 | 端口变更 | 页内修改（默认 8188）→ 重启容器 |
 | 镜像更新 | 手工脚本重新构建并 push（新 tag）→ 页内「下载镜像」拉新版本（镜像已存在会自动跳过；需强制刷新先 `docker rmi <image>`）→ 页内「重启」 |
@@ -337,16 +338,16 @@ WebUI 内（首次）：
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| 启动失败：找不到镜像 | 未构建 | 执行 §4.1 构建后再启动 |
-| 一直「启动中」 | 探活路径不对/服务未起 | 确认 `engine_ready_path=/system_stats`；看页内日志 |
+| 启动失败：找不到镜像 | 镜像未就绪 | 页内「下载镜像」拉取；自制镜像按 §4.1 脚本构建后推送 registry |
+| 一直「启动中」 | 探活路径不对/服务未起 | 确认 `engine_ready_path=/system_stats`；看「设置 → 运行日志」 |
 | 模板弹窗下载失败/极慢 | 直连 huggingface.co 受限 | 改模式 B 预置（§4.2），或容器内试 `HF_ENDPOINT=https://hf-mirror.com` |
 | 加载 int8/w4a8 权重报错 | comfy-kitchen 内核不可用（ARM64/sm121 未覆盖） | 换 `fp8_scaled` 或 `bf16` DiT（§12 回退链） |
 | 产物没有声音 | 音频 VAE 未接/未解码 | 检查工作流 audio VAE 节点；`ffprobe` 确认 `aac 2ch 32000Hz` |
 | 出片黑屏（用 int8 VAE 时） | 版本过低 | int8_convrot VAE 需 ComfyUI ≥0.31.0，否则用 fp16 VAE |
 | 启动即 OOM | 与其它模型同时在跑 | 用页内互斥横幅一键切换，或手工 `docker stop` 另一个容器 |
-| 构建卡在 `failed to resolve source metadata …` / `failed to fetch anonymous token … auth.docker.io … i/o timeout` | Docker Hub 不可达（BuildKit 解析 `FROM`、取 token 由 **daemon** 发起：不吃客户端代理、不读 `registry-mirrors`） | 应用会自动探测加速器前缀并改写 `BASE`（探测不带客户端代理，页内日志可见）；仍失败时在「设置 → Docker 镜像配置」填加速器（保存并重启 Docker）；配了「设置 → 代理」仍失败 → 点该 Tab 的「保存并重启 Docker」让 daemon 也走代理 |
-| 构建报 `unable to access 'https://github.com/comfyanonymous/ComfyUI/' … GnuTLS recv error (-110)` | github.com 被 TLS 重置 | 应用会自动探测并改用可达源（gitee 镜像 / gitcode 镜像 / ghfast、gh-proxy 加速器，页内日志显示实际源）；也可用「设置 → 代理」或手工 `--build-arg COMFYUI_REPO=<源>` |
-| 构建报 `ReadTimeoutError … files.pythonhosted.org` / pip 阶段长时间无进展 | PyPI 官方 CDN 弱网停读（索引可达 ≠ 包体可下） | 应用会自动实测并选用最快的 PyPI 镜像（页内日志显示实测 KB/s）；Dockerfile 已带 `--timeout 60 --retries 10` 且主源失败自动回退官方；仍慢就配「设置 → 代理」，或手工 `--pip-index <镜像>`（build-image.sh）/ `--build-arg PIP_INDEX_URL=<镜像>` |
+| 构建卡在 `failed to resolve source metadata …` / `failed to fetch anonymous token … auth.docker.io … i/o timeout` | Docker Hub 不可达（BuildKit 解析 `FROM`、取 token 由 **daemon** 发起：不吃客户端代理、不读 `registry-mirrors`） | `build-image.sh` 会自动探测加速器前缀并改写 `BASE`（探测不带客户端代理，脚本日志可见）；仍失败时在「设置 → Docker 镜像配置」填加速器（保存并重启 Docker）；配了「设置 → 代理」仍失败 → 点该 Tab 的「保存并重启 Docker」让 daemon 也走代理 |
+| 构建报 `unable to access 'https://github.com/comfyanonymous/ComfyUI/' … GnuTLS recv error (-110)` | github.com 被 TLS 重置 | `build-image.sh` 会自动探测并改用可达源（gitee 镜像 / gitcode 镜像 / ghfast、gh-proxy 加速器，脚本日志显示实际源）；也可用「设置 → 代理」或手工 `--build-arg COMFYUI_REPO=<源>` |
+| 构建报 `ReadTimeoutError … files.pythonhosted.org` / pip 阶段长时间无进展 | PyPI 官方 CDN 弱网停读（索引可达 ≠ 包体可下） | `build-image.sh` 会自动实测并选用最快的 PyPI 镜像（脚本日志显示实测 KB/s）；Dockerfile 已带 `--timeout 60 --retries 10` 且主源失败自动回退官方；仍慢就配「设置 → 代理」，或手工 `--pip-index <镜像>`（build-image.sh）/ `--build-arg PIP_INDEX_URL=<镜像>` |
 
 ---
 
@@ -374,7 +375,7 @@ WebUI 内（首次）：
 | A.2 ✅ | `engine: "comfyui"` 分支 `start_comfyui_docker` | 容器名 `adm-comfyui-<model_id>`（沿用 `adm-<engine>-<model>` 约定）；`--gpus all`、`--ipc host`、`--shm-size`（DGX 16g / 其他 8g）、`-p <port>:<port>`；挂载默认**读写**（`:ro` 条目保持只读）；命令 = `engine_command`（缺省 `python3 main.py`）+ 自动补 `--listen 0.0.0.0` + `--port`，`vllm_flags` 最后追加；跳过设置页 LLM 参数子集；镜像内 `ComfyUI/main.py` 预检 |
 | A.3 ✅ | `RemoteModel.hidden_in_list` | 首页 `getFilteredModelList()` 过滤该条目；其它条目行为不变 |
 | A.4 ✅ | 底部导航新增 Tab | `src/index.html`：`#video-btn`（「视频生成」→ `#/video`）+ `routes` 注册（位于「首页」之后） |
-| A.5 ✅ | 新视图 `src/views/video.js` | 状态卡（状态/地址/端口/镜像/容器/挂载）、启动/停止/重启/打开 WebUI/复制产物路径、首次指引、互斥横幅、日志区（600 行上限、stderr 标红）；遵守视图约定（`video-*` 前缀、事件只在壳层、状态走 `__adm_state`） |
+| A.5 ✅ | 新视图 `src/views/video.js` | 状态卡（状态/地址/端口/镜像/容器/挂载）、启动/停止/重启/打开 WebUI/复制产物路径、首次指引、互斥横幅、日志行（提示 + 「打开日志目录」，日志统一落盘）；遵守视图约定（`video-*` 前缀、事件只在壳层、状态走 `__adm_state`） |
 | A.6 ✅ | 后端接口复用 | `start_model` / `stop_model` / `get_model_status` + `model-started` / `model-stopped` / `model-log` / `model-pull-progress`；未新增 API 面 |
 | A.7 ✅ | 端口配置 | 前端 `localStorage["adm_comfyui_port"]`（默认 8188）→ `params.port`；与设置页模型服务端口隔离 |
 | A.8 ✅ | 互斥 | 页内互斥横幅（其它模型运行中时）+ 模型列表侧守卫（ComfyUI 运行中禁止直接启动其它模型）；`exclusive_group` 字段已入模型（当前前端按「已有模型在运行」判断，字段供后续精细化） |

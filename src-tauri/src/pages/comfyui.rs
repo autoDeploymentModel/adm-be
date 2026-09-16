@@ -145,16 +145,20 @@ async fn resolve_expected_files(
     .ok()?;
 
     let mut out: Vec<(String, u64)> = Vec::new();
-    for (repo, includes) in crate::pages::model_list::merge_repo_entries(model_files) {
-        let files = match crate::pages::model_list::fetch_repo_files(&http.client, endpoint, &repo).await {
+    let repos = crate::pages::model_list::merge_repo_entries(model_files);
+    for (repo, includes) in &repos {
+        let files = match crate::pages::model_list::fetch_repo_files(&http.client, endpoint, repo).await {
             Some(files) => files,
-            // API 不可达（离线/弱网）：退回 hfd 清单（内容已按 --include 过滤）
-            None => crate::pages::model_list::read_hfd_manifest(weights_dir)?,
+            // API 不可达（离线/弱网）：退回 hfd 清单（内容已按 --include 过滤）兜底。
+            // 注意 hfd 清单只保留**最后一次**列出的那个仓库，多仓库模型用它当基准会漏判（误报「已下载」），
+            // 因此仅单仓库时采用，多仓库宁可不给结论（返回 None → 调用方退回目录启发式）
+            None if repos.len() == 1 => crate::pages::model_list::read_hfd_manifest(weights_dir)?,
+            None => return None,
         };
         out.extend(
             files
                 .into_iter()
-                .filter(|(name, _)| crate::pages::model_list::matches_include_patterns(name, &includes)),
+                .filter(|(name, _)| crate::pages::model_list::matches_include_patterns(name, includes)),
         );
     }
     if out.is_empty() {
