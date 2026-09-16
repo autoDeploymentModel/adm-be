@@ -402,7 +402,11 @@ function render() {
     progressWrap.style.display = "none";
   } else {
     if (pullingImage) {
-      imageState.textContent = _t("下载中...") + (pull !== undefined && pull > 0 ? " " + pull + "%" : "");
+      // 拉镜进度（model-pull-progress 事件）：与权重下载共用底部进度条
+      const imagePct = pull !== undefined ? pull : 0;
+      imageState.textContent = _t("下载中...") + " " + imagePct + "%";
+      progressWrap.style.display = "block";
+      el("video-progress-bar").style.width = imagePct + "%";
     } else {
       imageState.textContent = setup.image_exists ? _t("已下载") : _t("未下载");
     }
@@ -441,7 +445,8 @@ function render() {
         weightsBtn.textContent = setup.weights_partial ? _t("继续下载") : _t("下载权重");
         weightsBtn.disabled = false;
       }
-      progressWrap.style.display = "none";
+      // 拉镜进行中时保留进度条（与上面的拉镜百分比共用）
+      if (!pullingImage) progressWrap.style.display = "none";
     }
     el("video-setup-paths").textContent = _t("权重目录") + ": " + (setup.weights_dir || "--");
   }

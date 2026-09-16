@@ -1478,9 +1478,362 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-/// 拉取单个镜像：stdout/stderr 逐行转发到 model-log，进度按 `\r` 段解析后发
+/// `docker pull` 输出流的工作模式。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PullTty {
+    /// 通过 `script` 分配 PTY：docker 渲染逐层字节进度（`Downloading [..] 1.2GB/3.4GB`），
+    /// 可折算连续百分比。
+    Pty,
+    /// 普通管道：docker CLI 在非 TTY 下会丢弃带字节数的进度消息（jsonmessage：
+    /// `Progress.Current/Total > 0` 且非终端直接跳过），只留 `Pulling fs layer` /
+    /// `Download complete` 这类状态行，进度按层状态折算。
+    Pipe,
+}
+
+/// PTY 模式是否可用：仅 Linux 且 `script` 来自 util-linux（Ubuntu 由基础包 bsdutils 自带，
+/// 支持 `-q -e -c`）。结果缓存，只探测一次；不可用时静默回退管道模式。
+#[cfg(target_os = "linux")]
+async fn script_pty_available() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if let Some(&ok) = SUPPORTED.get() {
+        return ok;
+    }
+    let ok = tokio::process::Command::new("script")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("util-linux"))
+        .unwrap_or(false);
+    let _ = SUPPORTED.set(ok);
+    ok
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn script_pty_available() -> bool {
+    false
+}
+
+/// 选择本次 pull 的输出模式（能用 PTY 就用 PTY）
+async fn pull_tty_mode() -> PullTty {
+    if script_pty_available().await {
+        PullTty::Pty
+    } else {
+        PullTty::Pipe
+    }
+}
+
+/// POSIX shell 单引号转义（供 `script -c` 拼接命令）
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// 去掉 ANSI 控制序列（PTY 模式下 docker 用 `\x1b[2K` 清行 + 光标上下移动重绘进度行）
+fn strip_ansi(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            // CSI：ESC [ ... <0x40-0x7E 终止字节>
+            Some('[') => {
+                chars.next();
+                for c2 in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c2) {
+                        break;
+                    }
+                }
+            }
+            // OSC：ESC ] ... BEL / ESC \
+            Some(']') => {
+                chars.next();
+                for c2 in chars.by_ref() {
+                    if c2 == '\u{7}' || c2 == '\\' {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// 拆分 `<sha>: <状态>` 形式的层输出行；首个冒号前不是层 ID（十六进制）时按纯文本行处理
+/// （如 `Digest: sha256:...` / `Status: Downloaded newer image ...`）。
+fn split_layer_line(line: &str) -> (&str, &str) {
+    match line.split_once(':') {
+        Some((head, rest)) => {
+            let head = head.trim();
+            let is_layer_id = head.len() >= 6 && head.chars().all(|c| c.is_ascii_hexdigit());
+            if is_layer_id {
+                (head, rest.trim_start())
+            } else {
+                ("", line)
+            }
+        }
+        None => ("", line),
+    }
+}
+
+/// 状态词（剥掉进度条与字节尾巴）：`Downloading [==>  ] 1.2GB/3.4GB` → `Downloading`。
+/// 用于日志去重（同一层同一状态只记一次）。
+fn status_word(status: &str) -> String {
+    status
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic() || *c == ' ')
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// 解析 `123.4MB` / `45KB` / `2.5GB` 为字节数（docker 进度条用十进制单位）
+fn parse_size(tok: &str) -> Option<f64> {
+    let tok = tok.trim();
+    let num_end = tok
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(tok.len());
+    if num_end == 0 {
+        return None;
+    }
+    let num: f64 = tok[..num_end].parse().ok()?;
+    let unit = tok[num_end..].trim();
+    let exp = match unit.chars().next()?.to_ascii_uppercase() {
+        'B' => 0,
+        'K' => 1,
+        'M' => 2,
+        'G' => 3,
+        'T' => 4,
+        _ => return None,
+    };
+    Some(num * 1000f64.powi(exp))
+}
+
+/// 解析一行里的「当前/总量」字节（`123.4MB/1.5GB`、`45KB/2MB`），返回 0.0-1.0 的比例。
+/// docker 进度条两侧单位可能不同（十进制 KB/MB/GB/TB），各自换算后再比。
+fn progress_fraction(raw: &str) -> Option<f64> {
+    let slash = raw.find('/')?;
+    let before = raw[..slash].trim_end();
+    let after = raw[slash + 1..].trim_start();
+    let current = parse_size(before.split_whitespace().last()?)?;
+    let total = parse_size(after.split_whitespace().next()?)?;
+    if total <= 0.0 {
+        return None;
+    }
+    Some((current / total).clamp(0.0, 1.0))
+}
+
+/// 读取 pull 输出流：按 `\n` / `\r` 切分为逻辑行（PTY 模式下 docker 用 `\r` 重绘进度行，
+/// 管道模式只有 `\n`），逐行交给进度回调。`source` 为日志来源标注（stdout/stderr）。
+async fn pump_pull_stream<R, F>(mut stream: R, source: &'static str, mut on_line: F)
+where
+    R: tokio::io::AsyncRead + Unpin,
+    F: FnMut(&str, &'static str),
+{
+    use tokio::io::AsyncReadExt;
+    let mut buf = [0u8; 8192];
+    let mut pending: Vec<u8> = Vec::new();
+    loop {
+        let n = match stream.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        pending.extend_from_slice(&buf[..n]);
+        while let Some(pos) = pending.iter().position(|b| *b == b'\n' || *b == b'\r') {
+            let chunk: Vec<u8> = pending.drain(..=pos).collect();
+            on_line(&String::from_utf8_lossy(&chunk[..chunk.len() - 1]), source);
+        }
+        // 异常保护：长时间收不到分隔符（如非文本噪声）时丢弃缓冲，避免内存无界增长
+        if pending.len() > 64 * 1024 {
+            pending.clear();
+        }
+    }
+    // 进程退出时尾部可能没有分隔符，剩余内容也要处理
+    if !pending.is_empty() {
+        on_line(&String::from_utf8_lossy(&pending), source);
+    }
+}
+
+/// `docker pull` 进度状态机（stdout / stderr 两个读取任务共享）。
+///
+/// 进度模型（只统计**需要下载/解压**的层）：
+/// - 分母：出现 `Pulling fs layer` 的层数；`Already exists` 的层不耗时、不计入
+///   （旧实现的 bug：它同时进分子与分母，首批输出就得到 done==total → 进度顶到 99% 卡死）；
+/// - 分子：Σ 各层完成度，单层权重 = 下载 0→0.6（有字节行时按字节比例插值）→ 校验/下载完成 0.6
+///   → 解压 0.6→1.0（有字节行时插值）→ `Pull complete` 1.0；
+/// - 上限 99%：仅 pull 进程成功退出才发 100%（避免「显示 100% 实际仍在拉」）。
+struct PullState {
+    /// 需要下载/解压的层数（进度分母）
+    total: std::sync::atomic::AtomicUsize,
+    /// sha → 该层完成度（0.0-1.0，只增不减）
+    layers: std::sync::Mutex<HashMap<String, f64>>,
+    /// 已上报的最高进度（并行下载完成顺序不定，保证单调不回退）
+    last_pct: std::sync::atomic::AtomicU8,
+    /// 上次上报时间（毫秒）：PTY 模式输出密集，事件按 ~400ms 合并
+    last_emit: std::sync::atomic::AtomicU64,
+    /// 层 ID → 最近一次已写日志的状态词（同一状态重绘上百次，去重防日志刷屏）
+    logged: std::sync::Mutex<HashMap<String, String>>,
+    /// 闲置超时计时基准：任一输出到达即刷新（进度在动 = 永不超时）
+    last_activity: std::sync::atomic::AtomicU64,
+    /// pull 输出的 manifest digest（`Digest: sha256:...` 行），成功后用于修正 untagged 镜像
+    digest: std::sync::Mutex<Option<String>>,
+}
+
+impl PullState {
+    fn new() -> Self {
+        Self {
+            total: std::sync::atomic::AtomicUsize::new(0),
+            layers: std::sync::Mutex::new(HashMap::new()),
+            last_pct: std::sync::atomic::AtomicU8::new(0),
+            last_emit: std::sync::atomic::AtomicU64::new(0),
+            logged: std::sync::Mutex::new(HashMap::new()),
+            last_activity: std::sync::atomic::AtomicU64::new(now_millis()),
+            digest: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// 直接上报进度（起点 0% / 成功退出 100% / 失败与超时 0%）
+    fn report(&self, app: &tauri::AppHandle, model_id: &str, image: &str, pct: u8) {
+        use std::sync::atomic::Ordering;
+        self.last_pct.store(pct, Ordering::Relaxed);
+        self.last_emit.store(now_millis(), Ordering::Relaxed);
+        app.emit(
+            "model-pull-progress",
+            serde_json::json!({ "model_id": model_id, "image": image, "progress": pct }),
+        )
+        .ok();
+    }
+
+    /// 距最近一次输出的空闲毫秒数（超时熔断用）
+    fn idle_ms(&self) -> u64 {
+        now_millis().saturating_sub(self.last_activity.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// pull 输出里的 manifest digest
+    fn pull_digest(&self) -> Option<String> {
+        self.digest.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// 处理一行 pull 输出：写日志（按层状态去重）+ 更新进度事件
+    fn on_line(&self, app: &tauri::AppHandle, model_id: &str, raw: &str, source: &'static str) {
+        use std::sync::atomic::Ordering;
+        let line = strip_ansi(raw);
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        self.last_activity.store(now_millis(), Ordering::Relaxed);
+
+        // `Digest: sha256:...`：成功后用于把 untagged 镜像精确 tag 回原名
+        if let Some(d) = trimmed.strip_prefix("Digest:") {
+            let d = d.trim().to_string();
+            if d.starts_with("sha256:") && d.len() > "sha256:".len() {
+                *self.digest.lock().unwrap_or_else(|e| e.into_inner()) = Some(d);
+            }
+        }
+
+        // `<sha>: <状态>`；首段不是层 ID 的行走纯文本分支（Digest / Status / 报错信息）
+        let (id, status) = split_layer_line(trimmed);
+
+        // 日志：同一层同一状态只写一次（PTY 模式每秒重绘多次，全部落盘会刷爆日志）
+        let word = status_word(status);
+        let fresh = if id.is_empty() {
+            true
+        } else {
+            let mut map = self.logged.lock().unwrap_or_else(|e| e.into_inner());
+            let changed = map.get(id).map(|prev| prev != &word).unwrap_or(true);
+            if changed {
+                map.insert(id.to_string(), word);
+            }
+            changed
+        };
+        if fresh {
+            let text = if id.is_empty() {
+                trimmed.to_string()
+            } else {
+                format!("{}: {}", id, status)
+            };
+            let level = if source == "stderr" { "WARN" } else { "INFO" };
+            crate::common::utils::logger::write_log(level, "DOCKER", &format!("[{}] {}", model_id, text));
+            app.emit(
+                "model-log",
+                serde_json::json!({
+                    "model_id": model_id, "line": format!("[docker pull] {}", text), "source": source,
+                }),
+            )
+            .ok();
+        }
+
+        if id.is_empty() {
+            return;
+        }
+
+        // 层状态 → 该层完成度（0.0-1.0）
+        let credit = if status.starts_with("Pulling fs layer") {
+            self.total.fetch_add(1, Ordering::Relaxed);
+            Some(0.0)
+        } else if status.starts_with("Already exists") {
+            // 本地已有该层：不耗时，也不计入分母
+            None
+        } else if status.starts_with("Downloading") {
+            Some(0.6 * progress_fraction(status).unwrap_or(0.0))
+        } else if status.starts_with("Extracting") {
+            Some(0.6 + 0.4 * progress_fraction(status).unwrap_or(0.0))
+        } else if status.starts_with("Verifying Checksum") || status.starts_with("Download complete") {
+            Some(0.6)
+        } else if status.starts_with("Pull complete") {
+            Some(1.0)
+        } else {
+            None
+        };
+        if let Some(c) = credit {
+            {
+                let mut layers = self.layers.lock().unwrap_or_else(|e| e.into_inner());
+                let slot = layers.entry(id.to_string()).or_insert(0.0);
+                if c > *slot {
+                    *slot = c;
+                }
+            }
+            self.emit_progress(app, model_id);
+        }
+    }
+
+    /// 按各层完成度折算进度并上报：只在高于已上报值时发；PTY 模式输出密集，
+    /// 事件按 ~400ms 合并（99% 立即发，避免卡在最后一格）。
+    fn emit_progress(&self, app: &tauri::AppHandle, model_id: &str) {
+        use std::sync::atomic::Ordering;
+        let total = self.total.load(Ordering::Relaxed);
+        if total == 0 {
+            return;
+        }
+        let sum: f64 = self.layers.lock().unwrap_or_else(|e| e.into_inner()).values().sum();
+        let pct = ((sum / total as f64) * 99.0).floor().clamp(0.0, 99.0) as u8;
+        if pct <= self.last_pct.load(Ordering::Relaxed) {
+            return;
+        }
+        let now = now_millis();
+        if pct < 99 && now.saturating_sub(self.last_emit.load(Ordering::Relaxed)) < 400 {
+            return;
+        }
+        self.last_pct.store(pct, Ordering::Relaxed);
+        self.last_emit.store(now, Ordering::Relaxed);
+        app.emit(
+            "model-pull-progress",
+            serde_json::json!({ "model_id": model_id, "image": "", "progress": pct }),
+        )
+        .ok();
+    }
+}
+
+/// 拉取单个镜像：输出逐行转发到 model-log，进度经状态机（层状态 + 字节插值）折算后发
 /// `model-pull-progress` 事件（{ model_id, image, progress } 0-100）；成功返回 true，
-/// 超时返回 Err（内部已 kill 子进程）。
+/// 空闲超时返回 Err（内部已 kill 子进程）。
 async fn pull_image(
     app: &tauri::AppHandle,
     model_id: &str,
@@ -1490,8 +1843,45 @@ async fn pull_image(
     // 客户端侧代理 env 兜底（rootless / podman-docker 等客户端直连场景）；
     // 标准 dockerd 拉取由 daemon 完成，需设置页「代理」→「保存并重启 Docker」
     // 把代理写入 daemon.json proxies 才真正生效。
-    let mut docker_cmd = crate::common::utils::platform::docker_cmd_tokio();
     let proxy_url = crate::common::utils::proxy::proxy_url(app).await;
+
+    // PTY 模式（Linux + script）能让 docker 渲染逐层字节进度；不可用则退回管道模式，
+    // 只按层状态折算（docker CLI 非 TTY 下会丢弃带字节数的进度消息）。
+    let tty = pull_tty_mode().await;
+    crate::common::utils::logger::write_log(
+        "INFO",
+        "DOCKER",
+        &format!(
+            "[{}] docker pull {}（{}）",
+            model_id,
+            image,
+            if tty == PullTty::Pty {
+                "PTY 模式：逐层字节进度"
+            } else {
+                "管道模式：按层状态估算进度"
+            }
+        ),
+    );
+
+    let mut cmd = match tty {
+        PullTty::Pty => {
+            // `script -q -e -c "<docker pull ...>" /dev/null`：给 docker 一个 PTY，
+            // 输出经管道回到本进程（-e 让 script 透传子进程退出码，-q 去掉脚本头尾提示）
+            let mut c = tokio::process::Command::new("script");
+            let inner = format!(
+                "{} pull {}",
+                crate::common::utils::platform::docker_shell_prefix(),
+                shell_quote(image)
+            );
+            c.args(["-q", "-e", "-c", &inner, "/dev/null"]);
+            c
+        }
+        PullTty::Pipe => {
+            let mut c = crate::common::utils::platform::docker_cmd_tokio();
+            c.args(["pull", image]);
+            c
+        }
+    };
     if !proxy_url.is_empty() {
         crate::common::utils::logger::write_log(
             "INFO",
@@ -1499,178 +1889,65 @@ async fn pull_image(
             &format!("[{}] docker pull 注入代理: {}", model_id, proxy_url),
         );
         let no_proxy = "localhost,127.0.0.0/8,::1";
-        docker_cmd
-            .env("HTTP_PROXY", &proxy_url)
-            .env("HTTPS_PROXY", &proxy_url)
-            .env("ALL_PROXY", &proxy_url)
-            .env("http_proxy", &proxy_url)
-            .env("https_proxy", &proxy_url)
-            .env("all_proxy", &proxy_url)
-            .env("NO_PROXY", no_proxy)
-            .env("no_proxy", no_proxy);
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            cmd.env(key, &proxy_url);
+        }
+        for key in ["NO_PROXY", "no_proxy"] {
+            cmd.env(key, no_proxy);
+        }
     }
-    let mut child = docker_cmd
-        .args(["pull", image])
+    let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| AppError::msg(format!("docker pull 启动失败: {}", e)))?;
 
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
-    // 进度估算（非 TTY 下 docker pull 无统一百分比）：
-    //   层维度：Pulling fs layer / Pull complete 计数跳格；
-    //   字节维度：Downloading / Extracting 行的「当前/总字节」在当前层槽位内插值 → 连续移动
-    let total_layers = Arc::new(AtomicUsize::new(0));
-    let completed_layers = Arc::new(AtomicUsize::new(0));
-    // layer 槽位：sha → 0-based 序号（按出现顺序登记，字节插值用）
-    let layer_order: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
-    // 已上报的最高进度：docker 并行下载层完成可能乱序，防止进度条回退
-    let last_pct = Arc::new(AtomicU8::new(0));
-    // pull 输出的 manifest digest（`Digest: sha256:...` 行）：成功后用于把
-    // untagged 镜像精确 tag 回原名（比按创建时间找 dangling 更可靠）
-    let pull_digest: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // 进度状态机：stdout / stderr 读取任务共享（层状态 → 完成度 → model-pull-progress）
+    let st = Arc::new(PullState::new());
+    st.report(app, model_id, image, 0);
 
-    let emit_progress = |p: u8| {
-        app.emit(
-            "model-pull-progress",
-            serde_json::json!({
-                "model_id": model_id,
-                "image": image,
-                "progress": p,
-            }),
-        )
-        .ok();
-    };
-    emit_progress(0);
-
-    // 闲置超时计时基准：任一输出行到达即刷新时间戳（下载进度在动 = 永不超时）
-    let last_activity = Arc::new(AtomicU64::new(now_millis()));
-
-    let app_c = app.clone();
-    let mid = model_id.to_string();
-    let _img = image.to_string();
-
-    // stdout：逐行读取（非 TTY 下 docker pull 进度走 stdout）
+    // stdout：按 `\n` / `\r` 切分逻辑行（PTY 模式下 docker 用 `\r` 重绘进度行）
     if let Some(stdout) = child.stdout.take() {
-        let mut reader = BufReader::new(stdout).lines();
-        let app_c2 = app_c.clone();
-        let mid2 = mid.clone();
-        let total2 = total_layers.clone();
-        let done2 = completed_layers.clone();
-        let order2 = layer_order.clone();
-        let lp2 = last_pct.clone();
-        let act = last_activity.clone();
-        let dig2 = pull_digest.clone();
+        let st2 = st.clone();
+        let app2 = app.clone();
+        let mid2 = model_id.to_string();
         tokio::spawn(async move {
-            while let Ok(Some(line)) = reader.next_line().await {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    act.store(now_millis(), Ordering::Relaxed);
-                    crate::common::utils::logger::write_log("INFO", "DOCKER", &format!("[{}] {}", mid2, trimmed));
-                    app_c2
-                        .emit("model-log", serde_json::json!({
-                            "model_id": &mid2, "line": format!("[docker pull] {}", trimmed), "source": "stdout",
-                        })).ok();
-
-                    // 捕获 manifest digest（如 `Digest: sha256:abcd...`），供随后 tag 修正
-                    if let Some(d) = trimmed.strip_prefix("Digest:") {
-                        let d = d.trim().to_string();
-                        if d.starts_with("sha256:") && d.len() > "sha256:".len() {
-                            *dig2.lock().unwrap_or_else(|e| e.into_inner()) = Some(d);
-                        }
-                    }
-
-                    // "<sha>: <状态>" 形式行；sha 为空（纯文本行）则跳过进度统计
-                    let (sha, rest) = match trimmed.split_once(':') {
-                        Some((s, r)) => (s.trim().to_string(), r.trim_start()),
-                        None => (String::new(), ""),
-                    };
-
-                    // 层开始：登记总层数并按出现顺序分配槽位
-                    if trimmed.contains("Pulling fs layer") || trimmed.contains("Already exists") {
-                        let idx = total2.fetch_add(1, Ordering::Relaxed);
-                        if !sha.is_empty() {
-                            order2.lock().unwrap_or_else(|e| e.into_inner()).entry(sha.clone()).or_insert(idx);
-                        }
-                    }
-
-                    // 层完成：按完成数跳一格（单调不回落）
-                    if trimmed.contains("Pull complete") || trimmed.contains("Already exists") {
-                        let done = done2.fetch_add(1, Ordering::Relaxed) + 1;
-                        let total = total2.load(Ordering::Relaxed);
-                        if total > 0 {
-                            // 层完成 ≠ pull 完成（进程还需 digest 校验/收尾），估算封顶 99%，
-                            // 仅当 pull 进程成功退出时才发 100%，避免「100% 实际仍在 pull」。
-                            let pct = ((done as f64 / total as f64) * 99.0) as u8;
-                            let prev = lp2.fetch_max(pct, Ordering::Relaxed);
-                            if pct > prev {
-                                app_c2.emit("model-pull-progress", serde_json::json!({
-                                    "model_id": &mid2, "image": "", "progress": pct,
-                                })).ok();
-                            }
-                        }
-                    }
-
-                    // 下载/解压过程行（含 当前/总 字节）：在所在槽位内按字节插值 → 进度连续移动
-                    if rest.starts_with("Downloading") || rest.starts_with("Extracting") {
-                        if let Some(p) = parse_pull_percent(trimmed) {
-                            if p > 0 {
-                                let total = total2.load(Ordering::Relaxed);
-                                let idx = order2.lock().unwrap_or_else(|e| e.into_inner()).get(&sha).copied().unwrap_or(0);
-                                if total > 0 && idx < total {
-                                    let pct = (((idx as f64) + (p as f64 / 100.0)) / (total as f64) * 99.0) as u8;
-                                    let prev = lp2.fetch_max(pct.min(99), Ordering::Relaxed);
-                                    if pct > prev {
-                                        app_c2.emit("model-pull-progress", serde_json::json!({
-                                            "model_id": &mid2, "image": "", "progress": pct.min(99),
-                                        })).ok();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            pump_pull_stream(stdout, "stdout", |line, source| st2.on_line(&app2, &mid2, line, source)).await;
         });
     }
 
-    // stderr：逐行转发（错误信息走 stderr）
+    // stderr：错误信息走 stderr（PTY 模式下子进程 stderr 也接在 PTY 上，走 stdout 通道）
     if let Some(stderr) = child.stderr.take() {
-        let mut reader = BufReader::new(stderr).lines();
-        let app_c3 = app_c.clone();
-        let mid3 = mid.clone();
-        let act3 = last_activity.clone();
+        let st3 = st.clone();
+        let app3 = app.clone();
+        let mid3 = model_id.to_string();
         tokio::spawn(async move {
-            while let Ok(Some(line)) = reader.next_line().await {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    act3.store(now_millis(), Ordering::Relaxed);
-                    crate::common::utils::logger::write_log("WARN", "DOCKER", &format!("[{}] {}", mid3, trimmed));
-                    app_c3
-                        .emit("model-log", serde_json::json!({
-                            "model_id": &mid3, "line": format!("[docker pull] {}", trimmed), "source": "stderr",
-                        })).ok();
-                }
-            }
+            pump_pull_stream(stderr, "stderr", |line, source| st3.on_line(&app3, &mid3, line, source)).await;
         });
     }
 
     // 闲置超时熔断：仅当连续 timeout 无任何输出（进度停滞/卡死）才终止；
-    // 进度在动则永远等待
+    // 进度在动则永远等待（PTY 模式下 docker 持续重绘进度行，天然形成心跳）
     tokio::select! {
         status = child.wait() => {
             let status = status.map_err(|e| AppError::msg(format!("docker pull 等待失败: {}", e)))?;
             let ok = status.success();
-            emit_progress(if ok { 100 } else { 0 });
+            st.report(app, model_id, image, if ok { 100 } else { 0 });
             if ok {
                 // 镜像加速源/registry 交互可能导致镜像以 <none>:<none>（untagged）
                 // 形式落盘——tag 丢失后 docker image inspect <image> 永远失败，
                 // 会造成每次启动都误判「镜像缺失」重新拉取。这里兜底把 tag 修正
                 // 为与 vllm_image 一致的名称，保证后续 inspect / docker run 可用。
-                let digest = pull_digest.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let digest = st.pull_digest();
                 ensure_image_tag(app, model_id, image, digest.as_deref()).await?;
             }
             Ok(ok)
@@ -1678,8 +1955,7 @@ async fn pull_image(
         _ = async {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                let idle = now_millis().saturating_sub(last_activity.load(Ordering::Relaxed));
-                if idle >= timeout.as_millis() as u64 {
+                if st.idle_ms() >= timeout.as_millis() as u64 {
                     break;
                 }
             }
@@ -1687,7 +1963,7 @@ async fn pull_image(
             // 终止 pull 进程（kill 整棵进程树，含 docker CLI 派生的下载子进程）
             let _ = child.start_kill();
             let _ = child.wait().await;
-            emit_progress(0);
+            st.report(app, model_id, image, 0);
             Err(AppError::msg(format!(
                 "镜像拉取连续 {} 分钟无任何输出，判定卡死已终止（下载进度在动时不会超时）",
                 timeout.as_secs() / 60
@@ -1842,56 +2118,6 @@ fn split_image_repo_tag(image: &str) -> (&str, Option<&str>) {
         Some((repo, tag)) if !tag.contains('/') => (repo, Some(tag)),
         _ => (image, None),
     }
-}
-
-/// 解析 docker pull 进度行中的下载百分比。
-/// 支持 `123.4MB/512.3MB`、`45KB/2.3MB(KB/MB/GB)` 形式（单位必须一致才计算，
-/// 不一致时返回 0，避免误跳进度）。
-fn parse_pull_percent(raw: &str) -> Option<u8> {
-    let line = raw.replace('\r', "").replace('\n', "");
-    let slash = line.find('/')?;
-    let before = &line[..slash];
-    let after = &line[slash + 1..];
-
-    let parse_amt = |s: &str| -> Option<(f64, u32)> {
-        let s = s.trim();
-        if s.is_empty() {
-            return None;
-        }
-        let mut num_end = 0;
-        for (i, c) in s.char_indices() {
-            if c.is_ascii_digit() || c == '.' {
-                num_end = i + c.len_utf8();
-            } else {
-                break;
-            }
-        }
-        if num_end == 0 {
-            return None;
-        }
-        let num: f64 = s[..num_end].parse().ok()?;
-        let rest = s[num_end..].trim();
-        // 单位：KB/MB/GB/TB（取首字母大写，按指数换算）
-        let unit = rest.chars().next()?;
-        let exp = match unit.to_ascii_uppercase() {
-            'K' => 1u32,
-            'M' => 2u32,
-            'G' => 3u32,
-            'T' => 4u32,
-            _ => return None,
-        };
-        Some((num, exp))
-    };
-
-    // 取 "/" 前最后一个数字段，"/" 后第一个数字段
-    let bf = before.split_whitespace().last()?;
-    let (num_b, exp_b) = parse_amt(bf)?;
-    let (num_a, exp_a) = parse_amt(after)?;
-    if exp_a != exp_b || num_a <= 0.0 {
-        return Some(0);
-    }
-    let pct = ((num_b / num_a) * 100.0).round() as u8;
-    Some(pct.min(99))
 }
 
 // ===== 多机互联（2+ 台 DGX Spark 集群）=====

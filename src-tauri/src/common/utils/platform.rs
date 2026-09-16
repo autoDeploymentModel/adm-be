@@ -39,6 +39,16 @@ pub fn docker_cmd_tokio() -> tokio::process::Command {
     }
 }
 
+/// docker 命令行（shell 形式，免密 sudo 可用时为 `sudo -n docker`）。
+/// 供需要经 shell 包装执行的场景使用（如 `script -c` 给 docker 分配 PTY）。
+pub fn docker_shell_prefix() -> &'static str {
+    if sudo_available() {
+        "sudo -n docker"
+    } else {
+        "docker"
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub fn create_hidden_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
     let mut cmd = std::process::Command::new(program);
