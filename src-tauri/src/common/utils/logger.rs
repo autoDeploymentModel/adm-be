@@ -2,6 +2,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use chrono::Local;
+use tauri::Emitter;
 use crate::common::error::AppError;
 
 const MAX_LOG_DAYS: i64 = 7;
@@ -47,6 +48,24 @@ pub fn write_log(level: &str, tag: &str, message: &str) {
             let _ = file.write_all(line.as_bytes());
         }
     }
+}
+
+/// 统一的「模型/容器日志」出口：**先落盘**到当日日志文件（统一格式
+/// `[时间] [级别] [标签] 内容`，即设置页「运行日志」读到的内容），再发 `model-log` 事件。
+/// 页面日志栏移除后本地文件是唯一权威来源，故模型/容器输出一律走这里（不要只 emit）。
+pub fn model_log(
+    app: &tauri::AppHandle,
+    model_id: &str,
+    level: &str,
+    tag: &str,
+    line: &str,
+    source: &str,
+) {
+    write_log(level, tag, line);
+    let _ = app.emit(
+        "model-log",
+        serde_json::json!({ "model_id": model_id, "line": line, "source": source }),
+    );
 }
 
 pub fn read_log(date: &str) -> Result<String, AppError> {

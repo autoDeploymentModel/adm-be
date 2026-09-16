@@ -3668,11 +3668,14 @@ async fn start_comfyui_docker(
         .ok_or_else(|| AppError::msg(format!("模型 {} 缺少镜像配置（ComfyUI 引擎需在远程 model.json 指定 engine_image）", model_id)))?
         .to_string();
     crate::common::utils::logger::write_log("INFO", "DOCKER", &format!("[{}] 使用 ComfyUI 镜像 {}", model_id, image));
-    app.emit("model-log", serde_json::json!({
-        "model_id": model_id,
-        "line": format!("使用镜像 {}（引擎 ComfyUI，模型 engine_image）", image),
-        "source": "stdout",
-    })).ok();
+    crate::common::utils::logger::model_log(
+        app,
+        model_id,
+        "INFO",
+        "DOCKER",
+        &format!("使用镜像 {}（引擎 ComfyUI，模型 engine_image）", image),
+        "stdout",
+    );
     let default_shm = match device.as_deref() {
         Some("dgx-spark-128G") => "16g",
         _ => "8g",
@@ -3697,9 +3700,14 @@ async fn start_comfyui_docker(
                     "镜像 {} 内未找到 ComfyUI（/opt/ComfyUI/main.py 缺失）：请检查 engine_image 指向的镜像（手工脚本 scripts/docker/h3-comfyui/ 构建并推送到 registry 的产物）",
                     image
                 );
-                app.emit("model-log", serde_json::json!({
-                    "model_id": model_id, "line": format!("[ERROR] {}", msg), "source": "stderr",
-                })).ok();
+                crate::common::utils::logger::model_log(
+                    app,
+                    model_id,
+                    "ERROR",
+                    "DOCKER",
+                    &format!("[ERROR] {}", msg),
+                    "stderr",
+                );
                 bail!("{}", msg);
             }
         }
@@ -3721,11 +3729,14 @@ async fn start_comfyui_docker(
     // 附加挂载：ComfyUI 默认读写（权重/输出/输入/用户目录），`:ro` 条目保持只读
     let extra_mounts = resolve_extra_mounts(models_dir, extra_mounts.as_deref().unwrap_or(&[]), false)?;
     if extra_mounts.is_empty() {
-        app.emit("model-log", serde_json::json!({
-            "model_id": model_id,
-            "line": "[警告] 模型清单未配置 vllm_extra_mounts：ComfyUI 权重与产物将落在容器内，容器删除后丢失",
-            "source": "stderr",
-        })).ok();
+        crate::common::utils::logger::model_log(
+            app,
+            model_id,
+            "WARN",
+            "MODEL",
+            "[警告] 模型清单未配置 vllm_extra_mounts：ComfyUI 权重与产物将落在容器内，容器删除后丢失",
+            "stderr",
+        );
     }
 
     // 设置页「额外环境变量」+ 模型清单 vllm_env 注入
@@ -3781,11 +3792,14 @@ async fn start_comfyui_docker(
     }
     cmd.push("--port".to_string());
     cmd.push(port.to_string());
-    app.emit("model-log", serde_json::json!({
-        "model_id": model_id,
-        "line": format!("容器启动命令: {}", cmd.join(" ")),
-        "source": "stdout",
-    })).ok();
+    crate::common::utils::logger::model_log(
+        app,
+        model_id,
+        "INFO",
+        "MODEL",
+        &format!("容器启动命令: {}", cmd.join(" ")),
+        "stdout",
+    );
     args.extend(cmd.iter().cloned());
 
     // 模型清单 vllm_flags（ComfyUI 参数）最后追加，优先级最高
@@ -3818,11 +3832,14 @@ async fn start_comfyui_docker(
     }
 
     dbg_log!("comfyui docker args: {:?}", args);
-    app.emit("model-log", serde_json::json!({
-        "model_id": model_id,
-        "line": format!("[DEBUG] full command: docker {:?}", args),
-        "source": "stdout",
-    })).ok();
+    crate::common::utils::logger::model_log(
+        app,
+        model_id,
+        "INFO",
+        "MODEL",
+        &format!("[DEBUG] full command: docker {:?}", args),
+        "stdout",
+    );
 
     #[cfg(target_os = "windows")]
     let mut child = crate::common::utils::platform::docker_cmd()
@@ -3832,9 +3849,7 @@ async fn start_comfyui_docker(
         .spawn()
         .map_err(|e| {
             let msg = format!("启动 ComfyUI 容器失败: {}", e);
-            app.emit("model-log", serde_json::json!({
-                "model_id": model_id, "line": format!("[ERROR] {}", msg), "source": "stderr",
-            })).ok();
+            crate::common::utils::logger::model_log(app, model_id, "ERROR", "MODEL", &format!("[ERROR] {}", msg), "stderr");
             msg
         })?;
 
@@ -3844,9 +3859,7 @@ async fn start_comfyui_docker(
     )
     .map_err(|e| {
         let msg = format!("启动 ComfyUI 容器失败: {}", e);
-        app.emit("model-log", serde_json::json!({
-            "model_id": model_id, "line": format!("[ERROR] {}", msg), "source": "stderr",
-        })).ok();
+        crate::common::utils::logger::model_log(app, model_id, "ERROR", "MODEL", &format!("[ERROR] {}", msg), "stderr");
         msg
     })?;
 
@@ -3905,12 +3918,7 @@ async fn start_comfyui_docker(
             Some(std::thread::spawn(move || {
                 let reader = BufReader::new(stdout);
                 for line in reader.lines().map_while(Result::ok) {
-                    crate::common::utils::logger::write_log("INFO", "ComfyUI", &line);
-                    app_c
-                        .emit("model-log", serde_json::json!({
-                            "model_id": &mid, "line": line.clone(), "source": "stdout",
-                        }))
-                        .ok();
+                    crate::common::utils::logger::model_log(&app_c, &mid, "INFO", "ComfyUI", &line, "stdout");
                 }
             }))
         } else {
@@ -3923,12 +3931,7 @@ async fn start_comfyui_docker(
             Some(std::thread::spawn(move || {
                 let reader = BufReader::new(stderr);
                 for line in reader.lines().map_while(Result::ok) {
-                    crate::common::utils::logger::write_log("WARN", "ComfyUI", &line);
-                    app_c
-                        .emit("model-log", serde_json::json!({
-                            "model_id": &mid, "line": line, "source": "stderr",
-                        }))
-                        .ok();
+                    crate::common::utils::logger::model_log(&app_c, &mid, "WARN", "ComfyUI", &line, "stderr");
                 }
             }))
         } else {
@@ -3941,18 +3944,24 @@ async fn start_comfyui_docker(
         let exit_status = child.wait();
         match &exit_status {
             Ok(status) => {
-                app_clone2.emit("model-log", serde_json::json!({
-                    "model_id": &model_id_clone2,
-                    "line": format!("[DEBUG] ComfyUI 容器退出 with status: {}", status),
-                    "source": "stdout",
-                })).ok();
+                crate::common::utils::logger::model_log(
+                    &app_clone2,
+                    &model_id_clone2,
+                    "INFO",
+                    "ComfyUI",
+                    &format!("ComfyUI 容器退出，状态: {}", status),
+                    "stdout",
+                );
             }
             Err(e) => {
-                app_clone2.emit("model-log", serde_json::json!({
-                    "model_id": &model_id_clone2,
-                    "line": format!("[ERROR] ComfyUI 容器等待失败: {}", e),
-                    "source": "stderr",
-                })).ok();
+                crate::common::utils::logger::model_log(
+                    &app_clone2,
+                    &model_id_clone2,
+                    "ERROR",
+                    "ComfyUI",
+                    &format!("[ERROR] ComfyUI 容器等待失败: {}", e),
+                    "stderr",
+                );
             }
         }
 

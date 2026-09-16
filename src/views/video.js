@@ -143,27 +143,6 @@ const template = `
     flex: 1;
   }
 
-  .video-log-card { flex: 1; min-height: 160px; }
-
-  .video-log {
-    margin: 0;
-    flex: 1;
-    max-height: 260px;
-    overflow-y: auto;
-    background: var(--c-bg-deep);
-    border: 1px solid var(--c-border-soft);
-    border-radius: 8px;
-    padding: 10px 12px;
-    font-family: Menlo, Monaco, Consolas, monospace;
-    font-size: 12px;
-    line-height: 1.5;
-    color: var(--c-text);
-    white-space: pre-wrap;
-    word-break: break-all;
-  }
-
-  .video-log .stderr { color: #ff7b72; }
-
   .video-inline-btn { margin-left: auto; }
 
   .video-head-btn { margin-left: auto; }
@@ -249,6 +228,11 @@ const template = `
     <div class="video-progress" id="video-progress-wrap" style="display:none;">
       <div class="video-progress-fill" id="video-progress-bar"></div>
     </div>
+    <div class="video-row">
+      <span class="video-label">${_t("日志")}</span>
+      <span class="video-value" id="video-log-hint">${_t("运行日志按统一格式写入本地文件（设置 → 运行日志 可查看）")}</span>
+      <button id="video-open-logs" class="video-btn video-btn-ghost video-btn-sm video-inline-btn">${_t("打开日志目录")}</button>
+    </div>
     <div class="video-mounts" id="video-setup-paths">--</div>
   </div>
 
@@ -275,14 +259,6 @@ const template = `
     </ol>
   </div>
 
-  <div class="video-card video-log-card">
-    <div class="video-card-title">
-      ${_t("日志")}
-      <button id="video-log-clear" class="video-btn video-btn-ghost video-btn-sm">${_t("清空")}</button>
-    </div>
-    <pre class="video-log" id="video-log"></pre>
-  </div>
-
   <div class="video-toast" id="video-toast"></div>
 </div>
 `;
@@ -292,10 +268,6 @@ const S = () => window.__adm_state;
 
 const PORT_KEY = "adm_comfyui_port";
 const DEFAULT_PORT = 8188;
-const LOG_LIMIT = 600;
-
-/** @type {{text: string, source: string}[]} */
-let logLines = [];
 /** 环境就绪状态（镜像 / 权重），由后端 comfyui_setup_status 返回 */
 let setup = /** @type {any} */ ({ image_exists: false, weights_downloaded: false, weights_partial: false, weights_bytes: 0, weights_total_bytes: 0, weights_missing: [], weights_missing_count: 0, weights_dir: "" });
 /** 视图是否已挂载：拉镜/权重下载等长任务在切页后完成时不再回写已移除的 DOM */
@@ -368,24 +340,6 @@ function notify(msg) {
   t.style.display = "block";
   if (toastTimer !== null) clearTimeout(toastTimer);
   toastTimer = setTimeout(function () { t.style.display = "none"; }, 3200);
-}
-
-/** @param {string} line @param {string} source */
-function appendLog(line, source) {
-  logLines.push({ text: line, source: source || "stdout" });
-  if (logLines.length > LOG_LIMIT) logLines = logLines.slice(logLines.length - LOG_LIMIT);
-  renderLog();
-}
-
-function renderLog() {
-  const pre = el("video-log");
-  if (!pre) return;
-  pre.innerHTML = logLines.map(function (l) {
-    const cls = l.source === "stderr" ? ' class="stderr"' : "";
-    const text = String(l.text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    return "<span" + cls + ">" + text + "</span>";
-  }).join("\n");
-  pre.scrollTop = pre.scrollHeight;
 }
 
 function render() {
@@ -701,7 +655,9 @@ export default {
       const dl = S().downloadingModels ? S().downloadingModels[e.model_id] : undefined;
       if (dl !== undefined) { void handleStopDownload(); } else { void handleDownloadWeights(); }
     });
-    el("video-log-clear").addEventListener("click", function () { logLines = []; renderLog(); });
+    el("video-open-logs").addEventListener("click", function () {
+      invoke()("open_log_dir").catch(function (err) { notify(_t("打开日志目录失败: ") + err); });
+    });
     el("video-port-save").addEventListener("click", function () {
       const raw = parseInt(String(el("video-port").value || ""), 10);
       if (!(raw >= 1024 && raw <= 65535)) { notify(_t("端口需在 1024-65535 之间")); return; }
@@ -710,7 +666,6 @@ export default {
       render();
     });
 
-    renderLog();
     render();
     void (async function () {
       await refreshModelList();
@@ -720,7 +675,7 @@ export default {
   },
 
   unmount() {
-    // 服务生命周期由后端持有：切页不停容器；日志保留在模块内，返回本页时继续显示
+    // 服务生命周期由后端持有：切页不停容器（日志已不在页面展示，写入统一本地日志文件）
     mounted = false;
   },
 
@@ -731,11 +686,7 @@ export default {
    */
   handleTauriEvent(type, payload) {
     const p = payload || {};
-    const e = entry();
-    if (type === "model-log") {
-      if (!e || !p.model_id || p.model_id === e.model_id) appendLog(String(p.line || ""), String(p.source || "stdout"));
-      return;
-    }
+    // model-log 事件不再由本页消费（日志栏已移除）：后端 logger::model_log 已落盘到统一日志文件
     if (type === "download-progress") {
       downloadSpeed = Number(p.speed) || 0;
       render();

@@ -362,6 +362,8 @@ const EN = {
   "选择日期": "Date",
   "刷新": "Refresh",
   "打开日志目录": "Open Log Folder",
+  "运行日志按统一格式写入本地文件（设置 → 运行日志 可查看）": "Runtime logs are written to the local log file (see Settings → Runtime log)",
+  "打开日志目录失败: ": "Failed to open log folder: ",
   "暂无日志": "No logs",
   "加载中...": "Loading...",
   "加载失败: ": "Failed to load: ",

@@ -447,6 +447,7 @@ WebUI 内（首次）：
 
 | 日期 | 变更 |
 |---|---|
+| 2026-09-16 | **页内日志栏移除**：「视频生成」页不再显示日志（删除日志卡片/清空按钮/`model-log` 渲染），改为「日志」行提示 + 「打开日志目录」按钮；ComfyUI 启动/停止/拉镜链路统一走 `logger::model_log`（落盘 `<data>/logs/YYYY-MM-DD.log`，统一格式 `[时间][级别][标签]内容`）+ `model-log` 事件，日志以「设置 → 运行日志」/本地文件为准 |
 | 2026-09-16 | **权重完整性按清单逐文件校验**：`comfyui_setup_status` 接收 `model_download_files`，经 HF API（失败退回 `.hfd/manifest`）解析期望清单后逐文件比对大小——「文件已完整但残留陈旧 `.aria2` 控件」不再误判为「已中断」，并能列出缺失文件名；页面显示「已下载 x / 共 y GB · 缺失 n 个文件」（tooltip 列文件名） |
 | 2026-09-16 | **删除 SGLang 备选路径文档**：`AGENTS.md` 的「H3 备选：SGLang 生产路径」条目与本文附录 C（含启用片段）整体移除，Dockerfile/compose 注释与本文对比性描述改为「BF16 方案」；SGLang 引擎支持本身保留（供清单中其他模型如 `Ling-3.0-flash-VL` 使用） |
 | 2026-09-15 | 首版：单机 Docker + SGLang 生产方案（含 model.json 字段、就绪探活、API、量化路线） |
