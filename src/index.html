@@ -703,7 +703,10 @@
               break;
             }
             case "model-pull-progress": {
-              if (mid) { st.startingModelId = mid; st.pullProgress[mid] = p.progress || 0; }
+              // 只更新进度，不置 startingModelId：拉镜（启动前置补拉、权重下载后自动拉取、页内「下载镜像」）
+              // 都走同一事件，若在此置 startingModelId 会让视频页把拉镜误显示成「启动中...」；
+              // 真正的启动由视图在调用 start_model 前自行置位（model_list.js / video.js 均已如此）
+              if (mid) { st.pullProgress[mid] = p.progress || 0; }
               break;
             }
             case "model-started": {

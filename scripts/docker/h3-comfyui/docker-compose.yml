@@ -2,27 +2,30 @@
 #
 # 方案文档：doc/minimax-h3-single-node-deploy-plan.md
 #   主线：底部「视频生成」页（§5，路由 #/video）→ 本 compose 容器 → NVFP4 权重首次自动下载（§6/§7）
-#   互斥：与备选 SGLang 路径（附录 C）不能同时运行（≈44GB + ≈108GB > 121GiB）
+#   互斥：与首页模型列表中的其它模型不能同时驻留（128 GiB 统一内存）
 #
 # 注意：应用内（底部「视频生成」页）启动的容器名为 adm-comfyui-<model_id>
 # （如 adm-comfyui-MiniMax-H3-ComfyUI）；本 compose 仅用于手工/排障路径，
 # 两者不要同时运行（端口 8188 冲突）。
 #
-# 用法（先 export ADM_DATA_DIR，见 h3-switch.sh）：
-#   export ADM_DATA_DIR="$HOME/.local/share/com.adm.be"
+# 用法（数据/权重目录已按应用默认值内置，无需 export；要换位置再覆盖即可）：
 #   docker compose -f scripts/docker/h3-comfyui/docker-compose.yml up -d
+#   覆盖示例：export ADM_DATA_DIR=/data/adm （默认 ${HOME}/.local/share/com.adm.be）
+#             export ADM_COMFYUI_WEIGHTS=/data/weights/MiniMax-H3-ComfyUI
 #
 # 重要：DGX Spark 为 128GB 统一内存，ComfyUI（H3 量化权重 ~44GB）与
-# ADM-BE 的 SGLang 服务（BF16 权重 ~108GB）**不能同时驻留**，请用
-# h3-switch.sh 做互斥切换（切换前会自动停掉另一个）。
+# ADM-BE 里运行中的其它模型（如 SGLang 大模型，BF16 权重 ~108GB）**不能同时驻留**：先 `docker stop`
+# 另一个容器（或在应用「视频生成」页点互斥横幅的一键切换）再起本服务。
 name: adm-h3-comfyui
 
 services:
   comfyui:
-    image: ${ADM_COMFYUI_IMAGE:-adm-comfyui-h3:20260915}
+    # 默认用 registry 上的官方产物（与应用 `engine_image` 一致）；手工构建后可改用本机 tag：
+    #   docker compose ... up -d 前 export ADM_COMFYUI_IMAGE=adm-comfyui-h3:nvfp4-20260915
+    image: ${ADM_COMFYUI_IMAGE:-crpi-2210nfcb9oezh8zh.cn-shenzhen.personal.cr.aliyuncs.com/adm1/comfyui-h3:20260915}
     container_name: adm-comfyui-h3
     restart: "no"
-    # GB10 单卡：把整块 GPU 交给 ComfyUI（与 SGLang 互斥运行）
+    # GB10 单卡：把整块 GPU 交给 ComfyUI（与其它模型互斥运行）
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
@@ -36,15 +39,15 @@ services:
       # 仅本机可访问；如需局域网访问改为 "0.0.0.0:${ADM_COMFYUI_PORT:-8188}:8188"
       - "127.0.0.1:${ADM_COMFYUI_PORT:-8188}:8188"
     volumes:
-      # 注：ADM_DATA_DIR（数据目录）与 ADM_COMFYUI_WEIGHTS（权重目录）由 h3-switch.sh 自动导出
-      # 权重目录与应用内完全一致：<data>/models/MiniMax-H3-ComfyUI/<类型>/
-      # （应用内「下载权重」、download-comfy-h3.sh、ComfyUI 弹窗自助下载三处共用同一目录）
-      - ${ADM_COMFYUI_WEIGHTS:?未设置 ADM_COMFYUI_WEIGHTS：请用 h3-switch.sh 启动，或 export ADM_COMFYUI_WEIGHTS=<ADM_DATA_DIR>/models/MiniMax-H3-ComfyUI}:/opt/ComfyUI/models
-      - ${ADM_DATA_DIR}/comfyui/output:/opt/ComfyUI/output
-      - ${ADM_DATA_DIR}/comfyui/input:/opt/ComfyUI/input
-      - ${ADM_DATA_DIR}/comfyui/user:/opt/ComfyUI/user
-      # 与 SGLang 方案共用同一份参考素材目录（只读）
-      - ${ADM_DATA_DIR}/media:/data/minimax-h3:ro
+      # 数据/权重目录默认与应用的默认数据目录一致（${HOME}/.local/share/com.adm.be），
+      # 可用 ADM_DATA_DIR / ADM_COMFYUI_WEIGHTS 覆盖；权重目录与应用内完全一致，三处共用：
+      # 应用内「下载权重」、download-comfy-h3.sh、ComfyUI 弹窗自助下载
+      - ${ADM_COMFYUI_WEIGHTS:-${ADM_DATA_DIR:-${HOME}/.local/share/com.adm.be}/models/MiniMax-H3-ComfyUI}:/opt/ComfyUI/models
+      - ${ADM_DATA_DIR:-${HOME}/.local/share/com.adm.be}/comfyui/output:/opt/ComfyUI/output
+      - ${ADM_DATA_DIR:-${HOME}/.local/share/com.adm.be}/comfyui/input:/opt/ComfyUI/input
+      - ${ADM_DATA_DIR:-${HOME}/.local/share/com.adm.be}/comfyui/user:/opt/ComfyUI/user
+      # 与应用内 `media:/data/minimax-h3` 挂载共用同一份参考素材目录（只读）
+      - ${ADM_DATA_DIR:-${HOME}/.local/share/com.adm.be}/media:/data/minimax-h3:ro
     shm_size: 16gb
     ipc: host
     # --disable-auto-launch：容器内不尝试拉起浏览器

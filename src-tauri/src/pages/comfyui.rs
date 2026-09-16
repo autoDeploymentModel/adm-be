@@ -124,8 +124,8 @@ pub async fn comfyui_setup_status(
 
 /// 下载（拉取）ComfyUI 镜像：`engine_image` 形如 `<registry>/<ns>/<name>:<tag>`
 /// （手工脚本构建后推送到 registry 的产物）。复用模型下载链路的拉取实现
-/// （多源回退 / 空闲超时 / 自动重试 / `model-pull-progress` 进度事件 / `model-log` 输出），
-/// 成功后才算「环境准备」的镜像就绪。
+/// （`docker_preflight` 预检 / 镜像已存在即跳过 / 空闲超时后自动重试一次 /
+/// `model-pull-progress` 进度事件 / `model-log` 输出），成功后才算「环境准备」的镜像就绪。
 #[tauri::command]
 pub async fn pull_comfyui_image(
     app: tauri::AppHandle,

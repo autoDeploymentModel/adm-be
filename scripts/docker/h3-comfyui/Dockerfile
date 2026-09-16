@@ -1,5 +1,5 @@
 # ADM-BE 专用：ComfyUI（MiniMax-H3）镜像——**方案主线运行时**
-# 方案文档：doc/minimax-h3-single-node-deploy-plan.md（§1–§12；备选 SGLang 见附录 C）
+# 方案文档：doc/minimax-h3-single-node-deploy-plan.md（§1–§12）
 # 目标平台：DGX Spark / GB10（ARM64 + CUDA 13，sm121）
 #
 # 说明：

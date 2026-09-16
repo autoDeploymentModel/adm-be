@@ -1,10 +1,9 @@
-# MiniMax-H3 单机部署方案（DGX Spark GB10 · ARM64 · Docker + ComfyUI 主线 / SGLang 备选）
+# MiniMax-H3 单机部署方案（DGX Spark GB10 · ARM64 · Docker + ComfyUI）
 
 > 目标机型：DGX Spark（GB10，128 GB 统一内存，ARM64 + CUDA 13，sm121）
 > **主方案**：Docker + ComfyUI，权重用 **NVFP4-AWQ 编码器 + 量化 DiT**，**首次打开由 ComfyUI 自动下载**
-> **入口**：底部导航**「视频生成」Tab** —— 镜像构建、权重下载、启动/停止/状态/日志/首次指引全部在该页内（首页模型列表**不出现** ComfyUI 卡片）
-> **备选**：需要 `/v1/videos` 生产 API 时启用 SGLang（附录 C）；两者**内存互斥**，不可同时运行
-> 状态：本方案为**设计稿**；附录 A 列出的 ADM-BE 改动（`engine: comfyui`、视频生成页）**尚未实现**
+> **入口**：底部导航**「视频生成」Tab** —— 镜像下载、权重下载、启动/停止/状态/日志/首次指引全部在该页内（首页模型列表**不出现** ComfyUI 卡片）
+> 状态：**已实现**（附录 A 全部落地；本文件保留为设计与运维参考）
 
 ---
 
@@ -17,7 +16,7 @@
 | 权重获取 | **应用内一键下载**（统一下载清单 `model_download_files` 里 `Comfy-Org/MiniMax-H3/<路径或通配>` 条目，默认 FL2VA+Ref2VA 量化集 **≈67 GB**，走 hf-mirror/代理、断点续传、`.done` 标记）；亦可在 ComfyUI 首次打开模板时用弹窗自助下载（官方默认集 ≈44 GB，仅 FL2VA）；离线预置脚本见 §4.2 |
 | 权重组合 | 文本编码器 `qwen3vl_32b_minimax_h3_nvfp4_awq`（15.69 GB）+ DiT `minimax_h3_fl2va_pruned_int8_convrot`（20.97 GB）+ 双 VAE（5.82 GB）+ turbo 8step LoRA（1.96 GB）；NVFP4 DiT 官方**不存在**（社区 w4a8 见 §7） |
 | 输出能力 | 768p / 24 FPS / 4–15 s，**H.264 视频 + 32 kHz 立体声音频**（原生音视频同出） |
-| 磁盘 / 内存 | ≈67 GB（FL2VA+Ref2VA 量化集；仅 FL2VA ≈44 GB，vs SGLang BF16 288 GB）/ 驻留 ≈44 GB（vs SGLang ≈108 GB） |
+| 磁盘 / 内存 | ≈67 GB（FL2VA+Ref2VA 量化集；仅 FL2VA ≈44 GB）/ 驻留 ≈44 GB |
 | 服务化 | ComfyUI HTTP API：`POST /prompt` → `GET /history/{id}` → `GET /view`；就绪探针 `GET /system_stats`（§8） |
 | 离线 | 镜像本地构建；离线场景用预置脚本 + `HF_HUB_OFFLINE=1` + `--disable-api-nodes`（§10） |
 | 多模态 IR | 本地开源部分 = H3-Base（FL2VA 文/首尾帧、Ref2VA 图/视频/音频参考）；云端 `H3-Context-IR` / `H3-Regenerate-2K` 未开源 → 全离线 768p 上限，用官方三段式提示词替代 |
@@ -26,9 +25,8 @@
 
 | 形态 | 说明 |
 |---|---|
-| **只部署 ComfyUI（本方案）** | 底部「视频生成」页启动/停止；不需要 SGLang 镜像、288 GB HF 权重、模型列表条目；权重由 ComfyUI 自动下载 |
-| 追加 SGLang（附录 C） | 需要 `/v1/videos` 异步任务 API / BF16 50 步 lossless 时启用，仍以首页模型卡片形式存在 |
-| 两者并存 | 必须互斥切换（≈44 GB + ≈108 GB > 121 GiB 可用内存）：「视频生成」页启动时提示停止 SGLang 模型，或 `h3-switch.sh comfyui|sglang` |
+| **本方案（唯一路径）** | 底部「视频生成」页启动/停止；不需要模型列表条目、无需额外 288 GB HF 权重；镜像由手工脚本构建并推送到 registry（应用内只拉取） |
+| 与其它模型并存 | 不可同时驻留两套权重（128 GiB 统一内存）：「视频生成」页启动时提示先停止当前模型，或手工 `docker stop` 另一容器 |
 
 ---
 
@@ -70,9 +68,9 @@
 | 机型 | DGX Spark / GB10（`model_support_devices: ["dgx-spark-128G"]`） | 128 GB 统一内存，Blackwell（NVFP4 硬件前提） |
 | 系统 | ARM64 Linux + NVIDIA 驱动 + CUDA 13（DGX OS） | |
 | Docker | Docker Engine + NVIDIA Container Toolkit（`--gpus all` 可用） | 应用启动前已有 CLI/daemon/GPU 预检 |
-| 磁盘 | 权重 44 GB + 镜像 ~25 GB + 输出/素材；建议 ≥1 TB NVMe | 比 SGLang 方案（288 GB）宽裕得多 |
+| 磁盘 | 权重 44 GB + 镜像 ~25 GB + 输出/素材；建议 ≥1 TB NVMe | 远小于 BF16 方案（288 GB） |
 | 网络 | 首次准备需联网：应用内下载权重（hf-mirror/代理，推荐）或 ComfyUI 弹窗直连 huggingface.co；镜像需联网构建一次；纯离线见 §4.2 路径 C / §10 | |
-| 端口 | 8188（ComfyUI 默认，页面内可配置），不与 SGLang 服务端口（默认 8000）冲突 | 两者不同时运行 |
+| 端口 | 8188（ComfyUI 默认，页面内可配置），与设置页模型服务端口（默认 8000）互不冲突 | 与其它模型不同时运行 |
 
 ---
 
@@ -188,9 +186,9 @@ docker build -t adm-comfyui-h3:nvfp4-20260915 scripts/docker/h3-comfyui
 │ │ 3. 首次建议 480P / 5 s 跑通，再上 768p；低延迟可接 turbo 8step LoRA  │ │
 │ │ 权重目录 <data>/models/MiniMax-H3-ComfyUI  产物 <data>/comfyui/output │ │
 │ └─────────────────────────────────────────────────────────────────────┘ │
-│ ┌ 互斥提示（仅当 SGLang 模型运行中时显示）────────────────────────────┐ │
-│ │ 当前 SGLang 服务（108 GB）占用统一内存，启动 ComfyUI 前需先停止它    │ │
-│ │ [ 停止 SGLang 并启动 ComfyUI ]                                       │ │
+│ ┌ 互斥提示（仅当其它模型运行中时显示）────────────────────────────┐ │
+│ │ 当前模型占用统一内存，启动 ComfyUI 前需先停止它                    │ │
+│ │ [ 停止当前模型并启动 ComfyUI ]                                     │ │
 │ └─────────────────────────────────────────────────────────────────────┘ │
 │ ┌ 日志（model-log 流式，限高滚动，可复制）───────────────────────────┐ │
 │ └─────────────────────────────────────────────────────────────────────┘ │
@@ -205,7 +203,7 @@ docker build -t adm-comfyui-h3:nvfp4-20260915 scripts/docker/h3-comfyui
    │                        GET /system_stats == 200
    │                          ┌── 成功 ──▶ 运行中（按钮：停止 / 重启 / 打开 WebUI）
    │                          └── 失败 ──▶ 启动失败（toast + 日志区高亮，按钮回「启动」）
-   └── 若检测到其它模型运行中（SGLang）──▶ 显示互斥提示条（见 5.2 第三块）
+   └── 若检测到其它模型运行中 ──▶ 显示互斥提示条（见 5.2 第三块）
 ```
 
 页面行为约定：
@@ -217,7 +215,7 @@ docker build -t adm-comfyui-h3:nvfp4-20260915 scripts/docker/h3-comfyui
 5. **首次引导**：权重未就绪（`<data>/models/MiniMax-H3-ComfyUI` 下 diffusion_models/text_encoders 无关键文件）时高亮指引块；就绪后折叠为一行。
 6. **端口**：默认 8188，可在页面内修改（改动写入设置；容器重启生效）。
 7. **不做内嵌 WebUI**：ComfyUI 前端依赖 WebSocket/剪贴板，且未承诺允许被 iframe 嵌套 → 默认用系统浏览器打开（`window.openUrl`）；如需内嵌作为实验开关另议。
-8. **端口持久化（已实现）**：ComfyUI 端口存前端 `localStorage`（键 `adm_comfyui_port`，默认 8188），随 `start_model` 的 `params.port` 下发；与设置页 SGLang 端口互不影响。
+8. **端口持久化（已实现）**：ComfyUI 端口存前端 `localStorage`（键 `adm_comfyui_port`，默认 8188），随 `start_model` 的 `params.port` 下发；与设置页模型服务端口互不影响。
 9. **产物路径**：页内「复制产物路径」按钮从挂载映射（`comfyui/output:/opt/ComfyUI/output`）推导宿主机路径并复制到剪贴板。
 10. **启动前置（已实现）**：`comfyui_setup_status` 提供镜像/权重状态——镜像未就绪时「启动 ComfyUI」禁用（tooltip「需先下载镜像」）；权重未下载不阻塞启动（ComfyUI 界面可用，可走弹窗自助下载）。
 8. **测试页协同**：`support_video` 模型在「测试」页仍走 API 引导文案，可加「前往『视频生成』页」的跳转提示。
@@ -298,9 +296,9 @@ WebUI 内（首次）：
 
 | 项 | 值/预期 | 说明 |
 |---|---|---|
-| 容器就绪 | 秒级（`/system_stats` 200） | 权重懒加载，首次出片才真正加载（比 SGLang 的 12 min 冷加载体验好） |
-| 权重驻留 | ≈44 GB（int8 DiT + NVFP4 编码器 + VAEs） | 统一内存压力远低于 SGLang BF16 ≈108 GB |
-| 单请求耗时 | **待实测**；预期优于 SGLang BF16 基线（权重流量降 ~60%，且可用 4/8 步 turbo） | GB10 去噪受 ~273 GB/s 带宽约束，量化直接减流量 |
+| 容器就绪 | 秒级（`/system_stats` 200） | 权重懒加载，首次出片才真正加载（比 BF16 方案的 12 min 冷加载体验好） |
+| 权重驻留 | ≈44 GB（int8 DiT + NVFP4 编码器 + VAEs） | 统一内存压力远低于 BF16 ≈108 GB |
+| 单请求耗时 | **待实测**；预期优于 BF16 基线（权重流量降 ~60%，且可用 4/8 步 turbo） | GB10 去噪受 ~273 GB/s 带宽约束，量化直接减流量 |
 | 并发 | 1（串行） | 单卡统一内存；批量任务排队 |
 | 实测记录表 | 50 步 / turbo 8 步 / turbo 4 步 × 480P·768P，记录耗时、峰值内存、音频轨是否正确 | 部署后补全 |
 | 可选调优（ComfyUI 原生参数，已确认存在于 CLI） | `--vram-headroom <GB>`（给系统留显存余量，统一内存机型防抢占）、`--cache-ram <activeGB> <inactiveGB>`（RAM 压力缓存）、`--disable-smart-memory`（更激进卸载）、`--use-sage-attention`（需镜像内装 wheel） | 按 GB10 统一内存特性逐项 A/B |
@@ -333,7 +331,7 @@ WebUI 内（首次）：
 | 端口变更 | 页内修改（默认 8188）→ 重启容器 |
 | 镜像更新 | 手工脚本重新构建并 push（新 tag）→ 页内「下载镜像」拉新版本（镜像已存在会自动跳过；需强制刷新先 `docker rmi <image>`）→ 页内「重启」 |
 | 权重清理 | 删除 `<data>/models/MiniMax-H3-ComfyUI/<类型>/<文件>`（页内「下载权重」会续下；ComfyUI 弹窗亦会补下） |
-| 与 SGLang 切换 | 页内互斥提示一键切换，或 `./scripts/docker/h3-comfyui/h3-switch.sh comfyui|sglang|status|stop` |
+| 与其它模型切换 | 页内互斥横幅一键停止当前模型后启动；手工路径 `docker stop adm-comfyui-h3` / `docker compose -f scripts/docker/h3-comfyui/docker-compose.yml down`（`h3-switch.sh` 已删除） |
 
 常见故障：
 
@@ -345,7 +343,7 @@ WebUI 内（首次）：
 | 加载 int8/w4a8 权重报错 | comfy-kitchen 内核不可用（ARM64/sm121 未覆盖） | 换 `fp8_scaled` 或 `bf16` DiT（§12 回退链） |
 | 产物没有声音 | 音频 VAE 未接/未解码 | 检查工作流 audio VAE 节点；`ffprobe` 确认 `aac 2ch 32000Hz` |
 | 出片黑屏（用 int8 VAE 时） | 版本过低 | int8_convrot VAE 需 ComfyUI ≥0.31.0，否则用 fp16 VAE |
-| 启动即 OOM | 与 SGLang 服务同时在跑 | 用页内互斥提示或 `h3-switch.sh` 切换 |
+| 启动即 OOM | 与其它模型同时在跑 | 用页内互斥横幅一键切换，或手工 `docker stop` 另一个容器 |
 | 构建卡在 `failed to resolve source metadata …` / `failed to fetch anonymous token … auth.docker.io … i/o timeout` | Docker Hub 不可达（BuildKit 解析 `FROM`、取 token 由 **daemon** 发起：不吃客户端代理、不读 `registry-mirrors`） | 应用会自动探测加速器前缀并改写 `BASE`（探测不带客户端代理，页内日志可见）；仍失败时在「设置 → Docker 镜像配置」填加速器（保存并重启 Docker）；配了「设置 → 代理」仍失败 → 点该 Tab 的「保存并重启 Docker」让 daemon 也走代理 |
 | 构建报 `unable to access 'https://github.com/comfyanonymous/ComfyUI/' … GnuTLS recv error (-110)` | github.com 被 TLS 重置 | 应用会自动探测并改用可达源（gitee 镜像 / gitcode 镜像 / ghfast、gh-proxy 加速器，页内日志显示实际源）；也可用「设置 → 代理」或手工 `--build-arg COMFYUI_REPO=<源>` |
 | 构建报 `ReadTimeoutError … files.pythonhosted.org` / pip 阶段长时间无进展 | PyPI 官方 CDN 弱网停读（索引可达 ≠ 包体可下） | 应用会自动实测并选用最快的 PyPI 镜像（页内日志显示实测 KB/s）；Dockerfile 已带 `--timeout 60 --retries 10` 且主源失败自动回退官方；仍慢就配「设置 → 代理」，或手工 `--pip-index <镜像>`（build-image.sh）/ `--build-arg PIP_INDEX_URL=<镜像>` |
@@ -357,8 +355,8 @@ WebUI 内（首次）：
 1. **ARM64 生态**：ComfyUI 官方无 ARM64 镜像（社区多为 x86_64）→ 自建镜像；`comfy-kitchen` aarch64 CUDA wheel 存在（0.2.10+）但 **sm121 内核需实测**；SageAttention 无 ARM64 wheel（跳过，用 turbo LoRA 降步数替代）。
 2. **"NVFP4 全量"不成立**：NVFP4 仅覆盖文本编码器（官方）；DiT 为 int8/fp8/bf16（官方）或社区 w4a8（未验证）。页面文案不要写成"全模型 NVFP4"。
 3. **首次自动下载依赖外网**：纯离线必须预置；镜像加速对模板内嵌直链是否生效随版本而定。
-4. **服务化能力弱于 SGLang**：无 OpenAI 风格异步任务对象、无 BF16 lossless 基线；大批量生产建议切 SGLang（附录 C）。
-5. **质量**：turbo 8/4 步与量化会带来画质/音频质量损失；成品建议 50 步或 SGLang 路径。
+4. **服务化能力有限**：仅 ComfyUI HTTP API（`POST /prompt` → `/history` → `/view`），无 OpenAI 风格异步任务对象、无 BF16 lossless 基线；大批量生产需另行评估。
+5. **质量**：turbo 8/4 步与量化会带来画质/音频质量损失；成品建议提高步数。
 6. **许可**：MiniMax H3 Community License（含美/欧/英/韩地区额外申请要求），商用前确认。
 7. **已实现**：ADM-BE 现支持 `vllm` / `sglang` / `comfyui` 三种引擎与底部「视频生成」页（附录 A 全部落地）。仍待办：把 ComfyUI 条目发布到**远程** `model.json`（本地示例已更新 `doc/model.json`），并构建 `adm-comfyui-h3:nvfp4-20260915` 镜像。
 
@@ -378,7 +376,7 @@ WebUI 内（首次）：
 | A.4 ✅ | 底部导航新增 Tab | `src/index.html`：`#video-btn`（「视频生成」→ `#/video`）+ `routes` 注册（位于「首页」之后） |
 | A.5 ✅ | 新视图 `src/views/video.js` | 状态卡（状态/地址/端口/镜像/容器/挂载）、启动/停止/重启/打开 WebUI/复制产物路径、首次指引、互斥横幅、日志区（600 行上限、stderr 标红）；遵守视图约定（`video-*` 前缀、事件只在壳层、状态走 `__adm_state`） |
 | A.6 ✅ | 后端接口复用 | `start_model` / `stop_model` / `get_model_status` + `model-started` / `model-stopped` / `model-log` / `model-pull-progress`；未新增 API 面 |
-| A.7 ✅ | 端口配置 | 前端 `localStorage["adm_comfyui_port"]`（默认 8188）→ `params.port`；与设置页 SGLang 端口隔离 |
+| A.7 ✅ | 端口配置 | 前端 `localStorage["adm_comfyui_port"]`（默认 8188）→ `params.port`；与设置页模型服务端口隔离 |
 | A.8 ✅ | 互斥 | 页内互斥横幅（其它模型运行中时）+ 模型列表侧守卫（ComfyUI 运行中禁止直接启动其它模型）；`exclusive_group` 字段已入模型（当前前端按「已有模型在运行」判断，字段供后续精细化） |
 | A.9 ✅ | 生命周期 | 运行中容器名记录在 `AppState.running_container`，`stop_model` / `cleanup_processes` 按记录名 `stop/rm`；ComfyUI 退出线程同时兜底 `docker rm -f` |
 | A.10a ✅ | 下载清单统一 | `model_download_files` 单字段承载两种条目：`org/name`（整仓）与 `org/name/<仓库内路径或通配>`（hfd `--include`，同仓库合并去重）；`model_download_includes` 字段已废弃删除 |
@@ -434,56 +432,6 @@ WebUI 内（首次）：
 
 > 说明：`vllm_extra_mounts` 的显式 `host:container` 映射与自动建目录**已实现**；`engine_ready_path` / `hidden_in_list` / `exclusive_group` / `engine: comfyui` / 「视频生成」页为**待实现项**（附录 A）。
 
-### C. 备选：SGLang 生产路径（需要 `/v1/videos` 时）
-
-| 项 | 内容 |
-|---|---|
-| 镜像 | `docker build -t adm-sglang-h3:20260915 scripts/docker/h3-sglang`（预装 SGLang diffusion extra，固定 revision `15d2cbcc90fc`） |
-| 权重 | HF 原始目录（统一下载清单：`MiniMaxAI/MiniMax-H3/FL2VA/*` + `.../Ref2VA/*` + `.../model_index.json` ≈288 GB） |
-| 启动命令 | `sglang serve --model-path /models/MiniMax-H3 --host 0.0.0.0 --port 8000 --model-variant fl2va`（应用侧 `engine: sglang` + `engine_command: ["sglang","serve"]`） |
-| 就绪 | `GET /health` 200（warmup 完成后；冷加载 ≈12 min） |
-| API | `POST /v1/videos` → `GET /v1/videos/{id}` → `GET /v1/videos/{id}/content`；输出 MP4 H.264 24fps + AAC 32kHz |
-| 激活模式 | `--model-variant fl2va`（t2va/首尾帧）或 `ref2va`（多模态参考），权重共用、重启切换 |
-| 关键约束 | 单机不加 offload / CFG 并行参数；`engine_command` 模式下设置页 LLM 参数子集自动跳过；FP8/NVFP4/AdaLN 旁路在 GB10 未验证 |
-| 性能基线 | 冷加载 ≈12 min；文本编码 ≈5.5 min/请求；去噪 ≈12.1 s/step（480P）；warm 请求 ≈12 min；单并发 |
-| 互斥 | 与 ComfyUI 不能同时运行（≈108 GB + ≈44 GB > 121 GiB）：页内提示或 `h3-switch.sh` |
-| 历史细节 | 完整 flags/参数表/故障排查见 git 历史（本文件 2026-09-15 首版）与 `scripts/docker/h3-sglang/Dockerfile` |
-
-**启用方式**：把下面片段加回（本地/远程）`model.json`，并按 4.1 构建 `adm-sglang-h3:20260915`。
-该条目**默认不放进样例清单**（避免误下 288 GB 与误占统一内存）；SGLang 引擎本身仍被清单中其他模型（如 `Ling-3.0-flash-VL-fp8`）使用，代码路径保留。
-
-```json
-{
-  "model_id": "MiniMax-H3",
-  "model_download_files": [
-    "MiniMaxAI/MiniMax-H3/model_index.json",
-    "MiniMaxAI/MiniMax-H3/FL2VA/*",
-    "MiniMaxAI/MiniMax-H3/Ref2VA/*"
-  ],
-  "model_support_devices": ["dgx-spark-128G"],
-  "engine": "sglang",
-  "engine_image": "adm-sglang-h3:20260915",
-  "engine_command": ["sglang", "serve"],
-  "engine_ready_probe": true,
-  "vllm_flags": ["--model-variant fl2va"],
-  "vllm_env": [
-    "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
-    "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS=64",
-    "NCCL_DEBUG=WARN",
-    "HF_HUB_OFFLINE=1",
-    "TRANSFORMERS_OFFLINE=1"
-  ],
-  "vllm_extra_mounts": ["media:/data/minimax-h3"],
-  "model_size": "288 GB",
-  "model_type": "视频生成",
-  "model_description": "MiniMax H3 原生音视频生成（768p/24fps + 32kHz 立体声），Docker + SGLang 扩散引擎单机离线服务；--model-variant fl2va 覆盖 t2va/首尾帧；多模态参考输入（图/视频/音频）切 ref2va 后重启；2K 需官方云 API",
-  "support_tools": false,
-  "support_reasoning": false,
-  "support_images": true,
-  "support_video": true
-}
-```
-
 ### D. 来源与版本
 
 | 资料 | 位置 |
@@ -493,12 +441,13 @@ WebUI 内（首次）：
 | 社区低比特 DiT（w4a8，未验证） | `https://huggingface.co/Kijai/MiniMax-H3-experimental` |
 | 量化内核库（int8_convrot / NVFP4 / w4a8） | `https://github.com/Comfy-Org/comfy-kitchen`（PyPI：aarch64 CUDA wheel 自 0.2.10；NVFP4 需 `[cublas]` extra） |
 | 官方工作流模板 | `https://github.com/Comfy-Org/workflow_templates`（`video_minimax_h3_t2v.json` / `_r2v.json`） |
-| 本仓库脚本 | `scripts/docker/h3-comfyui/`（镜像 / compose / 权重预置 / 互斥切换）、`scripts/docker/h3-sglang/`（备选镜像） |
+| 本仓库脚本 | `scripts/docker/h3-comfyui/`（Dockerfile / build-image.sh / compose / 权重预置；compose 的数据与权重目录已内置应用默认值 `$HOME/.local/share/com.adm.be`，可用 `ADM_DATA_DIR` / `ADM_COMFYUI_WEIGHTS` 覆盖）；`h3-switch.sh` 与 `scripts/docker/h3-sglang/` 已删除（互斥改用页内横幅或 `docker stop`） |
 
 变更记录：
 
 | 日期 | 变更 |
 |---|---|
+| 2026-09-16 | **删除 SGLang 备选路径文档**：`AGENTS.md` 的「H3 备选：SGLang 生产路径」条目与本文附录 C（含启用片段）整体移除，Dockerfile/compose 注释与本文对比性描述改为「BF16 方案」；SGLang 引擎支持本身保留（供清单中其他模型如 `Ling-3.0-flash-VL` 使用） |
 | 2026-09-15 | 首版：单机 Docker + SGLang 生产方案（含 model.json 字段、就绪探活、API、量化路线） |
 | 2026-09-15 | 合并 ComfyUI sidecar 为附录 C（原独立文档删除） |
 | 2026-09-15 | 方案改版：主线切换为 **ComfyUI + NVFP4（首次自动下载）**；新增首页 **ComfyUI 启动卡片**设计 |
@@ -514,7 +463,8 @@ WebUI 内（首次）：
 | 2026-09-15 | **构建探测修正**：基础镜像源探测不再注入客户端代理（BuildKit 的 `FROM`/token 解析由 daemon 发起，客户端代理只对 RUN 步骤生效）——避免「配了本地代理 → 误判官方源可达 → 构建再次卡在 `auth.docker.io`」；命中加速器时页内日志会说明原因与 daemon 代理做法 |
 | 2026-09-15 | **一键构建脚本**：新增 `scripts/docker/h3-comfyui/build-image.sh`（与应用侧同款「基础镜像源探测 → 加速器前缀、ComfyUI 源码源回退 + commit 校验、代理注入（本机代理加 `--network=host`）、跨架构 QEMU 提示」，另有 `--save` 导出 tar.gz + sha256、`--dry-run` 预览、构建后自检），可在网络更好的设备上构建后 `docker load` 回 DGX |
 | 2026-09-15 | **x86 宿主跨架构构建**：Dockerfile 新增 `SKIP_RUNTIME_CHECK` 参数（QEMU 模拟下可跳过镜像内自检）；`build-image.sh` 自动识别 x86→arm64（`--platform` + binfmt 检测提示 + 旧版 docker 自动 `DOCKER_BUILDKIT=1`）、新增 `--skip-runtime-check`；§4.1 补 Ubuntu 22.04 / WSL2 构建指引 |
+| 2026-09-15 | **手册路径修复**：`h3-switch.sh` / `scripts/docker/h3-sglang/Dockerfile` 退役删除后，`docker-compose.yml` 不再依赖外部 export——数据/权重目录默认 `${ADM_DATA_DIR:-${HOME}/.local/share/com.adm.be}`、权重默认 `<data>/models/MiniMax-H3-ComfyUI`（仍可用 `ADM_DATA_DIR` / `ADM_COMFYUI_WEIGHTS` 覆盖），镜像默认改为 registry 产物；`download-comfy-h3.sh` 与本文档相关行同步（互斥改用页内横幅或 `docker stop`） |
 | 2026-09-15 | **删除应用内构建流程**：`build_comfyui_image` 命令与内置 Dockerfile/PyPI 源/ComfyUI 源码探测逻辑整体移除（`lib.rs` 注册同步删除），页面按钮固定为「下载镜像」、状态固定「未下载 / 下载中 x% / 已下载」，`comfyui_setup_status` 去掉 `image_source` / `build_dir`；镜像构建只保留手工脚本 `scripts/docker/h3-comfyui/`（Dockerfile + `build-image.sh`），应用侧启动/下载完成后一律走 `docker pull` |
-| 2026-09-15 | **镜像改为 registry 下载**： 指向 registry（如 `crpi-….personal.cr.aliyuncs.com/adm1/comfyui-h3:20260915`）时页内新增「下载镜像」（命令 `pull_comfyui_image`，复用 `model_list::pull_docker_image`：多源回退/空闲超时/自动重试 + `model-pull-progress` 进度 + 页内日志），状态文案改「未下载 / 已下载 / 下载中 x%」；样例清单 `doc/model.json` 同步改为该地址（随后一行进一步删除构建分支，按钮不再有「构建镜像」分支） |
+| 2026-09-15 | **镜像改为 registry 下载**：`engine_image` 指向 registry（如 `crpi-….personal.cr.aliyuncs.com/adm1/comfyui-h3:20260915`）时页内新增「下载镜像」（命令 `pull_comfyui_image`，复用 `model_list::pull_docker_image`：空闲超时/自动重试 + `model-pull-progress` 进度 + 页内日志），状态文案改「未下载 / 已下载 / 下载中 x%」；样例清单 `doc/model.json` 同步改为该地址（随后一行进一步删除构建分支，按钮不再有「构建镜像」分支） |
 | 2026-09-15 | **下载进度修复（断点续传显示 0% 不动）**：hfd 进度改为按**字节**加权折算——已完成文件计全量、进行中文件按已分配块数折真实落盘字节（aria2 `--file-allocation=none` 按段稀疏写盘，文件长度会瞬间逼近全量，只有 `.aria2` 控件存在时不能只看长度），续传时进度从上次中断处继续显示；进度基准在 HF API 不可达时退回 hfd 自带 `.hfd/manifest`；`download-progress` 事件带 `speed`，视频页下载中显示速度；`comfyui_setup_status` 新增 `weights_partial`（目录树里有 `.aria2` 控件即视为未就绪）→ 页面显示「已中断（已下载 xx GB，可继续断点续传）」+「继续下载」 |
 | 2026-09-15 | **pip 源加固（构建卡在 torch 依赖）**：实测确认 pip 同版本下「本地版本标记优先」（`2.14.0+cu130` 胜过镜像里的 `2.14.0`），于是 torch 步骤改为 `--index-url TORCH_INDEX_URL --extra-index-url PIP_INDEX_URL`（轮子固定官方、依赖走镜像，不再回落到 `files.pythonhosted.org`）；所有 pip 安装加 `--timeout 60 --retries 10`，requirements / `comfy-kitchen[cublas]` 主源失败自动回退官方 PyPI；torch 装完校验 `torch.version.cuda` 大版本（不符 → 官方索引重装 → 仍不符则构建失败）；三个 pip 层加 BuildKit cache mount（`--mount=type=cache,target=/root/.cache/pip`，wheel 不进镜像层，失败重试不重下 2 GB+），`build-image.sh` 相应强制 `DOCKER_BUILDKIT=1`；（脚本侧）**实测各 PyPI 源吞吐择优**（官方 + 清华/阿里/腾讯/华为云，`<源>/pip/` 索引页），日志显示实测 KB/s |

@@ -298,6 +298,8 @@ const LOG_LIMIT = 600;
 let logLines = [];
 /** 环境就绪状态（镜像 / 权重），由后端 comfyui_setup_status 返回 */
 let setup = /** @type {any} */ ({ image_exists: false, weights_downloaded: false, weights_partial: false, weights_bytes: 0, weights_dir: "" });
+/** 视图是否已挂载：拉镜/权重下载等长任务在切页后完成时不再回写已移除的 DOM */
+let mounted = false;
 /** 镜像下载（docker pull）进行中：进度取 st.pullProgress[modelId]（model-pull-progress 事件） */
 let pullingImage = false;
 /** 权重下载速度（bytes/s，来自 download-progress 事件，仅用于本页展示） */
@@ -385,13 +387,14 @@ function renderLog() {
 }
 
 function render() {
+  if (!mounted) return;
   const e = entry();
   const st = S();
   const modelId = e ? e.model_id : null;
   const running = !!(modelId && st.runningModelId === modelId);
   const pull = modelId && st.pullProgress ? st.pullProgress[modelId] : undefined;
-  // 拉镜阶段 index.html 也会置 startingModelId（列表页启动按钮的进度用），视频页不把它当「启动中」
-  const starting = !!(modelId && st.startingModelId === modelId) && !pullingImage;
+  // 拉镜（model-pull-progress）不再置 startingModelId（见 index.html），故这里只需看启动流程自身
+  const starting = !!(modelId && st.startingModelId === modelId);
 
   const dot = el("video-state-dot");
   const stateText = el("video-state");
@@ -527,9 +530,7 @@ async function handlePullImage() {
     notify(_t("镜像下载失败: ") + err);
   }
   pullingImage = false;
-  // 拉镜阶段 index.html 会把 startingModelId 置为当前模型（列表页启动按钮的进度用）；
-  // 视频页不用它，不清掉会让状态卡一直显示「启动中...」
-  if (S().startingModelId === e.model_id && !S().runningModelId) S().startingModelId = null;
+  // 拉镜进度只用于本页展示，清掉避免下次拉镜沿用旧百分比
   if (S().pullProgress) delete S().pullProgress[e.model_id];
   await refreshSetup();
   render();
@@ -642,6 +643,7 @@ export default {
   /** @param {HTMLElement} root */
   mount(root) {
     root.innerHTML = template;
+    mounted = true;
 
     el("video-start").addEventListener("click", function () { void handleStart(); });
     el("video-stop").addEventListener("click", function () { void handleStop(); });
@@ -689,6 +691,7 @@ export default {
 
   unmount() {
     // 服务生命周期由后端持有：切页不停容器；日志保留在模块内，返回本页时继续显示
+    mounted = false;
   },
 
   /**
@@ -715,6 +718,10 @@ export default {
     }
     if (type === "download-complete") {
       downloadSpeed = 0;
+      // 权重下完后的自动拉镜失败（后端 pull_image_if_configured 发 image-pull-failed）：页内提示
+      if (p.type === "image-pull-failed") {
+        notify(_t("镜像下载失败: ") + (p.error || p.image || ""));
+      }
       void (async function () {
         await refreshSetup();
         render();

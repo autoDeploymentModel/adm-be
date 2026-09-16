@@ -77,4 +77,5 @@ HF_ENDPOINT="$HF_ENDPOINT" bash "$HFD" "$REPO" --include "${INCLUDES[@]}" --loca
 echo
 echo "[✓] 完成。目录结构："
 find "$DEST" -maxdepth 2 -type f -name '*.safetensors' -printf '  %p  (%s bytes)\n' | sort
-echo "[i] 接下来：./h3-switch.sh comfyui"
+echo "[i] 接下来：在应用「视频生成」页启动 ComfyUI，或手工执行"
+echo "      docker compose -f $(dirname "$0")/docker-compose.yml up -d"
