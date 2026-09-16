@@ -88,7 +88,7 @@
 #   --pip-index https://pypi.tuna.tsinghua.edu.cn/simple
 #   --platform linux/arm64         默认；x86 宿主跨架构需 binfmt/QEMU（脚本会提示安装命令）
 #   --force / --no-verify / --skip-runtime-check / --tag <image:tag> / --base <image> / --ref <tag>
-# 脚本自动完成：基础镜像源探测（官方 → 加速器）、ComfyUI 源码源回退 + commit 校验、代理注入、
+# 脚本自动完成：基础镜像解析（daemon 视角；仅官方 ref，不内置加速器）、ComfyUI 源码源回退 + commit 校验、代理注入、
 # 构建后自检；--save 额外导出 tar.gz + sha256。拷到 DGX 后导入：
 #   gunzip -c adm-comfyui-h3_nvfp4-20260916-linux_arm64.tar.gz | docker load
 ```
@@ -104,14 +104,14 @@
 ```bash
 docker build -t adm-comfyui-h3:nvfp4-20260916 scripts/docker/h3-comfyui
 # --build-arg COMFYUI_REF=v0.30.0 （H3 需 ≥0.30.0；Fun ControlNet 模板需 ≥0.35.0）
-# --build-arg BASE=nvidia/cuda:13.0.0-runtime-ubuntu24.04   # Docker Hub 不可达时用加速器前缀（如 docker.1ms.run/nvidia/cuda:...）
+# --build-arg BASE=nvidia/cuda:13.0.0-runtime-ubuntu24.04   # 基础镜像（默认官方；如你的 daemon 走不通 Docker Hub，可填你自己可达的镜像源前缀）
 # --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple   # 可选：PyPI 源（应用内构建会按吞吐自动择优；留空 = 官方）
 # --build-arg TORCH_INDEX_URL=... / COMFYUI_REPO=...                   # 可选：wheel 源 / ComfyUI 源码仓库
 # --build-arg SKIP_RUNTIME_CHECK=1                                    # 可选：跳过镜像内自检（QEMU 跨架构构建时用）
 # 代理：HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY（应用「设置 → 代理」开启后自动注入）
 ```
 
-> **基础镜像源自动探测（手工脚本构建）**：BuildKit 解析 `FROM`（含到 `auth.docker.io` 取匿名 token）**由 daemon 发起**——既不读 daemon.json 的 `registry-mirrors`，也不吃客户端代理；国内网络会直接卡在 `registry-1.docker.io / auth.docker.io … i/o timeout`。手工脚本 `build-image.sh` 会先用 `docker manifest inspect`（**不带客户端代理**，与 daemon 侧一致）逐个探测候选源（已配置加速器 → 官方源 → 内置加速器），把可达的那个前缀写进 `BASE`（脚本日志显示实际使用的源）；「设置 → 代理」只注入构建内 RUN 步骤（apt/pip/git，本机代理自动加 `--network=host`），想让 daemon 也走代理需在该 Tab 点「保存并重启 Docker」（写 daemon.json `proxies`）。
+> **基础镜像源自动探测（手工脚本构建，2026-09-16 重做）**：BuildKit 解析 `FROM`（含到 `auth.docker.io` 取匿名 token）**由 daemon 发起**——客户端代理（`HTTPS_PROXY` / `--proxy`）不算数，国内网络会直接卡在 `registry-1.docker.io / auth.docker.io … i/o timeout`。**`docker manifest inspect` 不能用来判定可达**：它是 CLI 侧请求、会吃客户端代理，于是出现「探测说官方源可达 → 构建卡在 i/o timeout」（2026-09-16 实测）。现在 `build-image.sh` 全程以 daemon 视角判定：① 本地已有候选镜像 → 直接用（零网络）；② 用同 registry 的 `hello-world` 小镜像试拉（30s 超时；daemon.json 的 `registry-mirrors` / `proxies` 都会自动生效）；③ 选定后先 `docker pull --platform <目标平台> <ref>` 把基础镜像落到本地，BuildKit 解析 `FROM` 直接命中本地、不再回源（跨架构时拉对应架构变体）；④ 构建中若仍遇 registry 不可达（`failed to resolve source metadata` / `dial tcp`），自动换下一个候选源重试。候选默认**只有官方 ref**（脚本不内置任何加速器、也不会改动你的 Docker 配置：只走 daemon 自身网络——系统/全局代理、daemon.json 的 `registry-mirrors` / `proxies`）；确需第三方加速器时显式给出 `--base <前缀>/<ref>` 或 `ADM_BASE_MIRRORS="host1 host2" ./build-image.sh`。全部失败时给出排查指引（daemon 自身网络 / `--base` / 换机器构建）。「设置 → 代理」只注入构建内 RUN 步骤（apt/pip/git，本机代理自动加 `--network=host`），想让 daemon 也走代理需在该 Tab 点「保存并重启 Docker」（写 daemon.json `proxies`）。
 >
 > **源码源自动回退（同类问题）**：`github.com` 在部分网络被 TLS 重置（`GnuTLS recv error (-110)`）；应用会探测 `…/info/refs?service=git-upload-pack` 把可达的 git 源排到最前（官方 → gitee 镜像 → gitcode 镜像 → ghfast / gh-proxy 加速器），Dockerfile 内逐个尝试；克隆完成后用 `COMFYUI_REF_SHA` 校验 commit（`v0.30.0` = `b1693ecb…`，四个备用源与上游一致），不一致直接失败——被篡改/滞后的第三方镜像会被挡住。
 >
@@ -346,7 +346,7 @@ WebUI 内（首次）：
 | 产物没有声音 | 音频 VAE 未接/未解码 | 检查工作流 audio VAE 节点；`ffprobe` 确认 `aac 2ch 32000Hz` |
 | 出片黑屏（用 int8 VAE 时） | 版本过低 | int8_convrot VAE 需 ComfyUI ≥0.31.0，否则用 fp16 VAE |
 | 启动即 OOM | 与其它模型同时在跑 | 用页内互斥横幅一键切换，或手工 `docker stop` 另一个容器 |
-| 构建卡在 `failed to resolve source metadata …` / `failed to fetch anonymous token … auth.docker.io … i/o timeout` | Docker Hub 不可达（BuildKit 解析 `FROM`、取 token 由 **daemon** 发起：不吃客户端代理、不读 `registry-mirrors`） | `build-image.sh` 会自动探测加速器前缀并改写 `BASE`（探测不带客户端代理，脚本日志可见）；仍失败时在「设置 → Docker 镜像配置」填加速器（保存并重启 Docker）；配了「设置 → 代理」仍失败 → 点该 Tab 的「保存并重启 Docker」让 daemon 也走代理 |
+| 构建卡在 `failed to resolve source metadata …` / `failed to fetch anonymous token … auth.docker.io … i/o timeout` | Docker Hub 不可达（BuildKit 解析 `FROM`、取 token 由 **daemon** 发起：不吃客户端代理、不读 `registry-mirrors`） | `build-image.sh` 以 daemon 视角判定并**先把基础镜像 pull 到本地再构建**（`FROM` 命中本地、不再回源），**不会自动改用任何加速器**；若仍不通：让 daemon 自己走上你的全局代理（systemd 环境变量 `HTTP_PROXY`/`HTTPS_PROXY`）或写 daemon.json `proxies`；确需加速器时才显式 `--base <前缀>/nvidia/cuda:...` / `ADM_BASE_MIRRORS="host"`；也可在别的机器 `docker save` 基础镜像后 `docker load` 到本机（脚本优先用本地已有镜像） |
 | 构建报 `unable to access 'https://github.com/comfyanonymous/ComfyUI/' … GnuTLS recv error (-110)` | github.com 被 TLS 重置 | `build-image.sh` 会自动探测并改用可达源（gitee 镜像 / gitcode 镜像 / ghfast、gh-proxy 加速器，脚本日志显示实际源）；也可用「设置 → 代理」或手工 `--build-arg COMFYUI_REPO=<源>` |
 | 构建报 `ReadTimeoutError … files.pythonhosted.org` / pip 阶段长时间无进展 | PyPI 官方 CDN 弱网停读（索引可达 ≠ 包体可下） | `build-image.sh` 会自动实测并选用最快的 PyPI 镜像（脚本日志显示实测 KB/s）；Dockerfile 已带 `--timeout 60 --retries 10` 且主源失败自动回退官方；仍慢就配「设置 → 代理」，或手工 `--pip-index <镜像>`（build-image.sh）/ `--build-arg PIP_INDEX_URL=<镜像>` |
 
@@ -473,3 +473,5 @@ WebUI 内（首次）：
 | 2026-09-15 | **下载进度修复（断点续传显示 0% 不动）**：hfd 进度改为按**字节**加权折算——已完成文件计全量、进行中文件按已分配块数折真实落盘字节（aria2 `--file-allocation=none` 按段稀疏写盘，文件长度会瞬间逼近全量，只有 `.aria2` 控件存在时不能只看长度），续传时进度从上次中断处继续显示；进度基准在 HF API 不可达时退回 hfd 自带 `.hfd/manifest`；`download-progress` 事件带 `speed`，视频页下载中显示速度；`comfyui_setup_status` 新增 `weights_partial`（目录树里有 `.aria2` 控件即视为未就绪）→ 页面显示「已中断（已下载 xx GB，可继续断点续传）」+「继续下载」 |
 | 2026-09-15 | **pip 源加固（构建卡在 torch 依赖）**：实测确认 pip 同版本下「本地版本标记优先」（`2.14.0+cu130` 胜过镜像里的 `2.14.0`），于是 torch 步骤改为 `--index-url TORCH_INDEX_URL --extra-index-url PIP_INDEX_URL`（轮子固定官方、依赖走镜像，不再回落到 `files.pythonhosted.org`）；所有 pip 安装加 `--timeout 60 --retries 10`，requirements / `comfy-kitchen[cublas]` 主源失败自动回退官方 PyPI；torch 装完校验 `torch.version.cuda` 大版本（不符 → 官方索引重装 → 仍不符则构建失败）；三个 pip 层加 BuildKit cache mount（`--mount=type=cache,target=/root/.cache/pip`，wheel 不进镜像层，失败重试不重下 2 GB+），`build-image.sh` 相应强制 `DOCKER_BUILDKIT=1`；（脚本侧）**实测各 PyPI 源吞吐择优**（官方 + 清华/阿里/腾讯/华为云，`<源>/pip/` 索引页），日志显示实测 KB/s |
 | 2026-09-16 | **修复 H3 报 `RuntimeError: Failed to find C compiler`（文本编码器首次执行即失败）**：triton 会对自己的 C 扩展（`triton/backends/nvidia/driver.c`，需 `cuda.h` + `Python.h`）做 JIT 编译，而本镜像原先只有 `python3`、没有任何 C 工具链。Dockerfile apt 步骤补 `gcc` + `libc6-dev` + `python3-dev`（cuda.h 由 triton wheel 自带、libcuda.so.1 由 NVIDIA 运行时挂入，无需 CUDA toolkit），并把「triton JIT 工具链就绪」加为构建期校验锚点（不需要 GPU，QEMU 下同样生效、不随 `SKIP_RUNTIME_CHECK` 跳过）；`build-image.sh` 构建后自检同步加 gcc / Python.h 断言。镜像 tag 升至 `nvfp4-20260916` / registry `comfyui-h3:20260916`（旧 tag 机器上已有缓存镜像不会重拉，必须换 tag）；**已拉过旧镜像的机器需重拉/重建后重启容器** |
+| 2026-09-16 | **不内置镜像加速器（按使用方要求）**：基础镜像候选默认只有**官方 ref**，只走 daemon 自身网络（系统/全局代理、daemon.json 的 `registry-mirrors` / `proxies`）——脚本不新增/修改用户 Docker 配置，也不再把第三方加速器（nju / daocloud / 1ms.run / 1panel）当默认候选；确需时显式给出 `--base <前缀>/<ref>` 或 `ADM_BASE_MIRRORS="host1 host2"`；启动日志会打印 daemon 现有网络配置（`docker info` 的 Proxy / Registry Mirrors）便于排查 |
+| 2026-09-16 | **基础镜像源判定改走 daemon（修复「探测说可达、构建却卡在 `registry-1.docker.io: i/o timeout`」）**：`docker manifest inspect` 是 **CLI 侧**请求、会吃客户端代理（`HTTPS_PROXY` / `--proxy`），而 BuildKit 解析 `FROM` 由 **daemon** 发起，两者结论可能相反。`build-image.sh` 现在：本地已有候选优先（零网络）→ 同 registry 的 `hello-world` 小镜像试拉判可达（daemon 侧，30s 超时，自动享受 daemon.json `registry-mirrors`/`proxies`）→ 选定后 `docker pull --platform <目标平台> <ref>` 预拉基础镜像到本地（BuildKit 解析 `FROM` 命中本地、不再回源，跨架构拉对应架构变体）→ 构建中若仍遇 registry 不可达自动换下一个候选源重试；`--base` 仍可强制指定；全部失败时打印 ①②③ 排查指引 |

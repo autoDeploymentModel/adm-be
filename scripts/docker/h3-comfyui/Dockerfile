@@ -17,22 +17,23 @@
 # 构建（需联网一次）：
 #   docker build -t adm-comfyui-h3:nvfp4-20260916 scripts/docker/h3-comfyui
 # 可选参数（--build-arg）：
-#   BASE=nvidia/cuda:13.0.0-runtime-ubuntu24.04   # 基础镜像；Docker Hub 不可达时用加速器前缀（如 docker.1ms.run/nvidia/cuda:...）
+#   BASE=nvidia/cuda:13.0.0-runtime-ubuntu24.04   # 基础镜像（默认官方 ref，走 daemon 自己的网络；本仓库不内置任何加速器，确需时传你自己可达的镜像源前缀）
 #   COMFYUI_REF=v0.30.0                           # ComfyUI 版本（H3 需 ≥ 0.30.0）
 #   COMFYUI_REPO=https://github.com/comfyanonymous/ComfyUI
 #   COMFYUI_REPO_FALLBACKS="<空格分隔的备用源>"           # 克隆失败时依次回退（缺省含 gitee / gitcode / ghfast / gh-proxy）
 #   COMFYUI_REF_SHA=<commit>                             # 非空时校验克隆结果 commit（防第三方镜像篡改/滞后）；留空跳过
 #   TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130   # PyTorch wheel 索引（须能给出 aarch64 + cu13 轮子）
-#   PIP_INDEX_URL=                                # PyPI 源；留空 = 官方。应用内「构建镜像」会实测各源吞吐择优注入国内镜像
+#   PIP_INDEX_URL=                                # PyPI 源；留空 = 官方（手工脚本 build-image.sh 会实测各源吞吐择优注入，--pip-index 可强制）
 #   SKIP_RUNTIME_CHECK=0                          # 1 = 跳过镜像内自检（跨架构 QEMU 构建时用；到 DGX 实机再验）
-#   HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY（大小写均可）——应用「设置 → 代理」开启后自动注入
+#   HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY（大小写均可）——构建期代理，只影响 RUN 步骤（apt/pip/git）
 #
-# 网络说明（重要）：Docker Hub 不通（registry-1.docker.io / auth.docker.io i/o timeout）时，BuildKit
-# 解析 FROM（含取匿名 token）由 daemon 发起——不读 daemon.json 的 registry-mirrors、也不吃客户端代理
-# （daemon.json `proxies` 才生效）；应用侧「构建镜像」会先用 docker manifest inspect（同样**不带**客户端
-# 代理，避免误判官方源可达）探测候选源（已配置加速器 → 官方源 → 内置加速器），把可达前缀写进 BASE；
-# 客户端代理只经 --build-arg 注入 RUN 步骤（apt/pip/git）。
-# github.com 被 TLS 重置（GnuTLS recv error -110）同理：应用侧会探测 git 源可达性并把可达源排在前面。
+# 网络说明（重要）：BuildKit 解析 FROM（含到 auth.docker.io 取匿名 token）由 **daemon** 发起——客户端代理
+# （HTTP(S)_PROXY / docker CLI 侧配置）不算数；daemon 自身的全局代理（systemd 环境变量）或 daemon.json 的
+# `proxies` 才生效。因此本仓库**不内置任何镜像加速器**：基础镜像用官方 ref，走 daemon 已有网络配置；
+# 确需加速时自己显式指定——`--build-arg BASE=<你可达的镜像源>/nvidia/cuda:...`（脚本侧：`--base` / `ADM_BASE_MIRRORS`）。
+# 手工脚本 scripts/docker/h3-comfyui/build-image.sh 以 daemon 视角判定可达性，并先把基础镜像 pull 到本地
+# 再 docker build（FROM 命中本地、不再回源）；客户端代理只经 --build-arg 注入 RUN 步骤（apt/pip/git）。
+# github.com 被 TLS 重置（GnuTLS recv error -110）同理：脚本会把可达的 git 源排在前面。
 
 ARG BASE=nvidia/cuda:13.0.0-runtime-ubuntu24.04
 FROM ${BASE}
