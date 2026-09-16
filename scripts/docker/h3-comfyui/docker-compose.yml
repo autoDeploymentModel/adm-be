@@ -21,8 +21,8 @@ name: adm-h3-comfyui
 services:
   comfyui:
     # 默认用 registry 上的官方产物（与应用 `engine_image` 一致）；手工构建后可改用本机 tag：
-    #   docker compose ... up -d 前 export ADM_COMFYUI_IMAGE=adm-comfyui-h3:nvfp4-20260915
-    image: ${ADM_COMFYUI_IMAGE:-crpi-2210nfcb9oezh8zh.cn-shenzhen.personal.cr.aliyuncs.com/adm1/comfyui-h3:20260915}
+    #   docker compose ... up -d 前 export ADM_COMFYUI_IMAGE=adm-comfyui-h3:nvfp4-20260916
+    image: ${ADM_COMFYUI_IMAGE:-crpi-2210nfcb9oezh8zh.cn-shenzhen.personal.cr.aliyuncs.com/adm1/comfyui-h3:20260916}
     container_name: adm-comfyui-h3
     restart: "no"
     # GB10 单卡：把整块 GPU 交给 ComfyUI（与其它模型互斥运行）

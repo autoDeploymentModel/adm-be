@@ -256,7 +256,7 @@
             "dgx-spark-128G"
         ],
         "engine": "comfyui",
-        "engine_image": "crpi-2210nfcb9oezh8zh.cn-shenzhen.personal.cr.aliyuncs.com/adm1/comfyui-h3:20260915",
+        "engine_image": "crpi-2210nfcb9oezh8zh.cn-shenzhen.personal.cr.aliyuncs.com/adm1/comfyui-h3:20260916",
         "engine_command": [
             "python3",
             "main.py",

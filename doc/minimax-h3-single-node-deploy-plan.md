@@ -42,7 +42,7 @@
 │                           │                                                   │
 │                           ▼                                                   │
 │              docker run … adm-comfyui-<model_id>（示例 …-MiniMax-H3-ComfyUI） │
-│              镜像 adm-comfyui-h3:nvfp4-20260915（本地构建，comfy-kitchen[cublas]）│
+│              镜像 adm-comfyui-h3:nvfp4-20260916（手工脚本构建，comfy-kitchen[cublas] + gcc）│
 │              命令 python3 main.py --listen 0.0.0.0 --port 8188               │
 │                          --disable-auto-launch --disable-api-nodes           │
 │              挂载 <data>/comfyui/{models,output,input,user} + media:ro        │
@@ -90,7 +90,7 @@
 #   --force / --no-verify / --skip-runtime-check / --tag <image:tag> / --base <image> / --ref <tag>
 # 脚本自动完成：基础镜像源探测（官方 → 加速器）、ComfyUI 源码源回退 + commit 校验、代理注入、
 # 构建后自检；--save 额外导出 tar.gz + sha256。拷到 DGX 后导入：
-#   gunzip -c adm-comfyui-h3_nvfp4-20260915-linux_arm64.tar.gz | docker load
+#   gunzip -c adm-comfyui-h3_nvfp4-20260916-linux_arm64.tar.gz | docker load
 ```
 
 > **在 x86 宿主上构建（Ubuntu 22.04 / WSL2 / x86 Docker Desktop）**：目标 `linux/arm64` 属**跨架构构建**，需 QEMU/binfmt——
@@ -102,7 +102,7 @@
 手工等价命令：
 
 ```bash
-docker build -t adm-comfyui-h3:nvfp4-20260915 scripts/docker/h3-comfyui
+docker build -t adm-comfyui-h3:nvfp4-20260916 scripts/docker/h3-comfyui
 # --build-arg COMFYUI_REF=v0.30.0 （H3 需 ≥0.30.0；Fun ControlNet 模板需 ≥0.35.0）
 # --build-arg BASE=nvidia/cuda:13.0.0-runtime-ubuntu24.04   # Docker Hub 不可达时用加速器前缀（如 docker.1ms.run/nvidia/cuda:...）
 # --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple   # 可选：PyPI 源（应用内构建会按吞吐自动择优；留空 = 官方）
@@ -125,6 +125,7 @@ docker build -t adm-comfyui-h3:nvfp4-20260915 scripts/docker/h3-comfyui
 | ComfyUI | `COMFYUI_REF` 固定 tag | H3 支持自 v0.30.0 起 |
 | `comfy-kitchen` | **`pip install "comfy-kitchen[cublas]"`** | NVFP4（Blackwell）与 int8_convrot 内核；plain wheel 不带 cublas 路径 |
 | 构建期校验 | `torch.cuda.is_available()` 且 `comfy_kitchen.list_backends()` 含 `cuda` | 避免"装上了但量化跑不了" |
+| **运行时编译工具链** | **`gcc` + `libc6-dev` + `python3-dev`（必须留在最终镜像里）** | torch 部分算子（`torch._native` 的 `bmm_outer_product` 等）首次执行时走 triton 内核，triton 会 JIT 编译自己的 C 扩展（`triton/backends/nvidia/driver.c`，含 `cuda.h` / `Python.h`）——缺 C 编译器就报 `RuntimeError: Failed to find C compiler…`，H3 文本编码器直接失败（2026-09-16 实机复现） |
 | 其他 | ffmpeg、libgl1、libglib2.0-0、libsndfile1 | H3 音视频输出 |
 
 > ARM64 风险（务必现场验证）：`comfy-kitchen` 自 0.2.10 起提供 `manylinux_2_28_aarch64` CUDA wheel，但 **sm121 内核覆盖需实测**；不可用时按 §12 回退（fp8_scaled / bf16 / 换基础镜像）。
@@ -242,7 +243,7 @@ docker run -d --name adm-comfyui-h3 --gpus all --ipc host --shm-size 16g \
   -v <data>/comfyui/user:/opt/ComfyUI/user \
   -v <data>/media:/data/minimax-h3:ro \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-  adm-comfyui-h3:nvfp4-20260915 \
+  adm-comfyui-h3:nvfp4-20260916 \
   python3 main.py --listen 0.0.0.0 --port 8188 --disable-auto-launch --disable-api-nodes
 ```
 
@@ -359,7 +360,7 @@ WebUI 内（首次）：
 4. **服务化能力有限**：仅 ComfyUI HTTP API（`POST /prompt` → `/history` → `/view`），无 OpenAI 风格异步任务对象、无 BF16 lossless 基线；大批量生产需另行评估。
 5. **质量**：turbo 8/4 步与量化会带来画质/音频质量损失；成品建议提高步数。
 6. **许可**：MiniMax H3 Community License（含美/欧/英/韩地区额外申请要求），商用前确认。
-7. **已实现**：ADM-BE 现支持 `vllm` / `sglang` / `comfyui` 三种引擎与底部「视频生成」页（附录 A 全部落地）。仍待办：把 ComfyUI 条目发布到**远程** `model.json`（本地示例已更新 `doc/model.json`），并构建 `adm-comfyui-h3:nvfp4-20260915` 镜像。
+7. **已实现**：ADM-BE 现支持 `vllm` / `sglang` / `comfyui` 三种引擎与底部「视频生成」页（附录 A 全部落地）。仍待办：把 ComfyUI 条目发布到**远程** `model.json`（本地示例已更新 `doc/model.json`），并构建 `adm-comfyui-h3:nvfp4-20260916` 镜像。
 
 ---
 
@@ -404,7 +405,7 @@ WebUI 内（首次）：
     ],
     "model_support_devices": ["dgx-spark-128G"],
     "engine": "comfyui",
-    "engine_image": "crpi-2210nfcb9oezh8zh.cn-shenzhen.personal.cr.aliyuncs.com/adm1/comfyui-h3:20260915",
+    "engine_image": "crpi-2210nfcb9oezh8zh.cn-shenzhen.personal.cr.aliyuncs.com/adm1/comfyui-h3:20260916",
     "engine_command": ["python3", "main.py", "--listen", "0.0.0.0", "--port", "8188",
                        "--disable-auto-launch", "--disable-api-nodes"],
     "engine_ready_probe": true,
@@ -471,3 +472,4 @@ WebUI 内（首次）：
 | 2026-09-15 | **镜像改为 registry 下载**：`engine_image` 指向 registry（如 `crpi-….personal.cr.aliyuncs.com/adm1/comfyui-h3:20260915`）时页内新增「下载镜像」（命令 `pull_comfyui_image`，复用 `model_list::pull_docker_image`：空闲超时/自动重试 + `model-pull-progress` 进度 + 页内日志），状态文案改「未下载 / 已下载 / 下载中 x%」；样例清单 `doc/model.json` 同步改为该地址（随后一行进一步删除构建分支，按钮不再有「构建镜像」分支） |
 | 2026-09-15 | **下载进度修复（断点续传显示 0% 不动）**：hfd 进度改为按**字节**加权折算——已完成文件计全量、进行中文件按已分配块数折真实落盘字节（aria2 `--file-allocation=none` 按段稀疏写盘，文件长度会瞬间逼近全量，只有 `.aria2` 控件存在时不能只看长度），续传时进度从上次中断处继续显示；进度基准在 HF API 不可达时退回 hfd 自带 `.hfd/manifest`；`download-progress` 事件带 `speed`，视频页下载中显示速度；`comfyui_setup_status` 新增 `weights_partial`（目录树里有 `.aria2` 控件即视为未就绪）→ 页面显示「已中断（已下载 xx GB，可继续断点续传）」+「继续下载」 |
 | 2026-09-15 | **pip 源加固（构建卡在 torch 依赖）**：实测确认 pip 同版本下「本地版本标记优先」（`2.14.0+cu130` 胜过镜像里的 `2.14.0`），于是 torch 步骤改为 `--index-url TORCH_INDEX_URL --extra-index-url PIP_INDEX_URL`（轮子固定官方、依赖走镜像，不再回落到 `files.pythonhosted.org`）；所有 pip 安装加 `--timeout 60 --retries 10`，requirements / `comfy-kitchen[cublas]` 主源失败自动回退官方 PyPI；torch 装完校验 `torch.version.cuda` 大版本（不符 → 官方索引重装 → 仍不符则构建失败）；三个 pip 层加 BuildKit cache mount（`--mount=type=cache,target=/root/.cache/pip`，wheel 不进镜像层，失败重试不重下 2 GB+），`build-image.sh` 相应强制 `DOCKER_BUILDKIT=1`；（脚本侧）**实测各 PyPI 源吞吐择优**（官方 + 清华/阿里/腾讯/华为云，`<源>/pip/` 索引页），日志显示实测 KB/s |
+| 2026-09-16 | **修复 H3 报 `RuntimeError: Failed to find C compiler`（文本编码器首次执行即失败）**：triton 会对自己的 C 扩展（`triton/backends/nvidia/driver.c`，需 `cuda.h` + `Python.h`）做 JIT 编译，而本镜像原先只有 `python3`、没有任何 C 工具链。Dockerfile apt 步骤补 `gcc` + `libc6-dev` + `python3-dev`（cuda.h 由 triton wheel 自带、libcuda.so.1 由 NVIDIA 运行时挂入，无需 CUDA toolkit），并把「triton JIT 工具链就绪」加为构建期校验锚点（不需要 GPU，QEMU 下同样生效、不随 `SKIP_RUNTIME_CHECK` 跳过）；`build-image.sh` 构建后自检同步加 gcc / Python.h 断言。镜像 tag 升至 `nvfp4-20260916` / registry `comfyui-h3:20260916`（旧 tag 机器上已有缓存镜像不会重拉，必须换 tag）；**已拉过旧镜像的机器需重拉/重建后重启容器** |

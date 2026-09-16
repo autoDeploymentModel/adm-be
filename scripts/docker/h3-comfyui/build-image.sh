@@ -16,7 +16,7 @@
 # 典型流程：
 #   1) 在（网络更好的）设备上： ./build-image.sh --save
 #   2) 把生成的 *.tar.gz 拷到 DGX
-#   3) 在 DGX 上：              gunzip -c adm-comfyui-h3_nvfp4-20260915-linux_arm64.tar.gz | docker load
+#   3) 在 DGX 上：              gunzip -c adm-comfyui-h3_nvfp4-20260916-linux_arm64.tar.gz | docker load
 #   4) 应用「视频生成」页 → 启动（engine_image 需与 --tag 一致，默认值已对齐 model.json）
 #   注：权重不在此脚本范围（≈44–67 GB），仍由应用「下载权重」或 download-comfy-h3.sh 落盘到 DGX。
 #
@@ -24,7 +24,7 @@
 #   ./build-image.sh [选项]
 #
 # 选项：
-#   -t, --tag <image:tag>   镜像名（默认 adm-comfyui-h3:nvfp4-20260915，须与 model.json engine_image 一致）
+#   -t, --tag <image:tag>   镜像名（默认 adm-comfyui-h3:nvfp4-20260916，须与 model.json engine_image 一致）
 #       --ref <tag>         ComfyUI 版本（默认 v0.30.0；H3 需 ≥ 0.30.0）
 #       --ref-sha <sha>     commit 校验值（默认内置 v0.30.0 上游 SHA；传空串 = 跳过校验）
 #       --base <image>      强制基础镜像（跳过探测）
@@ -40,7 +40,7 @@
 #   -h, --help              显示本帮助
 set -euo pipefail
 
-DEFAULT_TAG="adm-comfyui-h3:nvfp4-20260915"
+DEFAULT_TAG="adm-comfyui-h3:nvfp4-20260916"
 DEFAULT_REF="v0.30.0"
 # v0.30.0 上游 commit（已与 gitee/gitcode/ghfast/gh-proxy 四源核对一致）
 DEFAULT_REF_SHA="b1693ecba9f5b65f8c80ab36b195ab963ec92413"
@@ -88,7 +88,7 @@ usage() {
   cat <<'USAGE'
 用法：build-image.sh [选项]
 
-  -t, --tag <image:tag>   镜像名（默认 adm-comfyui-h3:nvfp4-20260915）
+  -t, --tag <image:tag>   镜像名（默认 adm-comfyui-h3:nvfp4-20260916）
       --ref <tag>         ComfyUI 版本（默认 v0.30.0）
       --ref-sha <sha>     commit 校验值（默认内置 v0.30.0 上游 SHA；传空串 = 跳过校验）
       --base <image>      强制基础镜像（跳过探测）
@@ -488,11 +488,13 @@ fi
 
 # ---------- 构建后自检（可选） ----------
 if [ "$DO_VERIFY" -eq 1 ]; then
-  log "自检：容器内导入 torch / comfy_kitchen ..."
-  if docker run --rm --entrypoint python3 "$TAG" -c "import importlib.util as u, torch; print('torch', torch.__version__, '| comfy-kitchen:', 'ok' if u.find_spec('comfy_kitchen') else 'missing')"; then
-    log "自检通过（GPU 相关检查请到 DGX 实机做）"
-  else
+  log "自检：容器内确认 triton JIT 工具链（gcc / Python.h）+ 导入 torch / comfy_kitchen ..."
+  if ! docker run --rm --entrypoint bash "$TAG" -c "command -v gcc >/dev/null || { echo '缺少 gcc：triton JIT 无法编译 cuda_utils（H3 文本编码器会报 Failed to find C compiler）' >&2; exit 1; }; python3 -c \"import os,sysconfig; hdr=os.path.join(sysconfig.get_paths()['include'],'Python.h'); assert os.path.exists(hdr), '缺少 Python.h（python3-dev）：'+hdr; print('triton JIT 工具链 OK：gcc +', hdr)\""; then
+    warn "自检未通过：triton JIT 工具链缺失（见上面输出）——检查 Dockerfile 的 apt 步骤是否装了 gcc / libc6-dev / python3-dev"
+  elif ! docker run --rm --entrypoint python3 "$TAG" -c "import importlib.util as u, torch; print('torch', torch.__version__, '| comfy-kitchen:', 'ok' if u.find_spec('comfy_kitchen') else 'missing')"; then
     warn "自检未通过：请查看上面输出（跨架构构建可能受 QEMU 影响，可加 --no-verify 跳过）"
+  else
+    log "自检通过（GPU 相关检查请到 DGX 实机做）"
   fi
 fi
 

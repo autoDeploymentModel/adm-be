@@ -10,12 +10,12 @@
 # - 三个 pip 层用 BuildKit cache mount 缓存 wheel（`--mount=type=cache,target=/root/.cache/pip`，不进镜像层）：
 #   弱网构建失败后重试不必重下 2 GB+；需 BuildKit（Docker 23+ 默认；classic builder 不支持该语法）。
 #
-# ⚠️ 本文件是「Dockerfile 单一真源」：ADM-BE 应用内「视频生成」页的「构建镜像」按钮
-#    通过 include_str! 内嵌本文件（src-tauri/src/pages/comfyui.rs），运行时写到
-#    <data>/build/comfyui/Dockerfile 再执行 docker build。修改本文件后需重新编译应用。
+# ⚠️ 本文件是本镜像的「单一真源」：应用内「视频生成」页只负责 `docker pull <engine_image>`
+#    （`pull_comfyui_image`），镜像本身由 scripts/docker/h3-comfyui/build-image.sh 构建并推送到 registry。
+#    修改本文件后需重新构建镜像（并 bump tag，见 build-image.sh --tag）。
 #
 # 构建（需联网一次）：
-#   docker build -t adm-comfyui-h3:nvfp4-20260915 scripts/docker/h3-comfyui
+#   docker build -t adm-comfyui-h3:nvfp4-20260916 scripts/docker/h3-comfyui
 # 可选参数（--build-arg）：
 #   BASE=nvidia/cuda:13.0.0-runtime-ubuntu24.04   # 基础镜像；Docker Hub 不可达时用加速器前缀（如 docker.1ms.run/nvidia/cuda:...）
 #   COMFYUI_REF=v0.30.0                           # ComfyUI 版本（H3 需 ≥ 0.30.0）
@@ -70,9 +70,17 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TRANSFORMERS_OFFLINE=1 \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
+# gcc / libc6-dev / python3-dev 是**运行时硬依赖**（不是构建期可选项）：
+#   torch 的部分算子在**首次执行**时会路由到 triton 内核（如 `torch._native` 的 bmm_outer_product，
+#   ComfyUI 文本编码器 precompute_freqs_cis 就会命中），triton 于是 JIT 编译自己的 C 扩展
+#   `triton/backends/nvidia/driver.c`（含 `cuda.h` / `Python.h`）——需要 ① C 编译器 gcc
+#   ② Python.h（python3-dev）③ 标准库头（libc6-dev）。缺任一项，H3 文本编码器一跑就报：
+#   `RuntimeError: Failed to find C compiler. Please specify via CC environment variable or set triton.knobs.build.impl.`
+#   （cuda.h 由 triton wheel 自带 triton/backends/nvidia/include，libcuda.so.1 由 NVIDIA 运行时挂进容器，无需装 CUDA toolkit）
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        python3 python3-pip python3-venv git curl ca-certificates \
+        python3 python3-pip python3-venv python3-dev \
+        gcc libc6-dev git curl ca-certificates \
         ffmpeg libgl1 libglib2.0-0 libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -164,8 +172,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     [ "$ok" = "1" ] || { echo "[pip] comfy-kitchen 安装失败（所有 PyPI 源）" >&2; exit 1; }
 
 # 构建期校验锚点（失败即镜像不可用）：
-#   1) torch 能看到 GPU；2) comfy-kitchen 后端可用（H3 的 int8_convrot / NVFP4 权重必需）
-# 跨架构构建（x86 宿主 QEMU 模拟 arm64）时该检查可能受模拟影响，可加 --build-arg SKIP_RUNTIME_CHECK=1 跳过，到目标机实机再验
+#   1) triton JIT 工具链就绪（gcc + Python.h；不需要 GPU，QEMU 下同样有效，故不受 SKIP_RUNTIME_CHECK 影响）
+#   2) torch 能看到 GPU；3) comfy-kitchen 后端可用（H3 的 int8_convrot / NVFP4 权重必需）
+# 跨架构构建（x86 宿主 QEMU 模拟 arm64）时 GPU 检查可能受模拟影响，可加 --build-arg SKIP_RUNTIME_CHECK=1 跳过，到目标机实机再验
+RUN python3 -c "import os, shutil, sysconfig; cc = shutil.which('gcc') or shutil.which('clang'); assert cc, '缺少 C 编译器（gcc/clang）：triton JIT 无法编译 cuda_utils'; hdr = os.path.join(sysconfig.get_paths()['include'], 'Python.h'); assert os.path.exists(hdr), '缺少 Python.h（python3-dev）：' + hdr; print('[verify] triton JIT 工具链就绪：cc =', cc, '| Python.h =', hdr)"
+
 RUN if [ "$SKIP_RUNTIME_CHECK" = "1" ]; then \
         echo "[verify] 跳过镜像内自检（SKIP_RUNTIME_CHECK=1）：请在 DGX 实机验证 torch / comfy-kitchen"; \
     else \
