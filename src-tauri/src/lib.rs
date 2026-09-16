@@ -203,7 +203,7 @@ pub fn run() {
             dgx_deploy::dgx_deploy_run,
             // comfyui.rs
             pages::comfyui::comfyui_setup_status,
-            pages::comfyui::build_comfyui_image,
+            pages::comfyui::pull_comfyui_image,
             // test_ui.rs
             test_ui::start_test_ui,
             test_ui::stop_test_ui,

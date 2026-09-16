@@ -514,20 +514,7 @@ async fn finish_model_download(
     }
     // 镜像名必须由后端重新拉取远程清单解析（与启动流程一致），不能依赖前端卡片透传——
     // 远程配置更新后旧卡片透传值为空，会导致镜像被静默跳过，最终启动时才报「镜像尚未下载」。
-    // ComfyUI（engine=comfyui）镜像为「视频生成」页本地构建产物，跳过 registry 拉取校验。
-    if resolve_engine_is_comfyui(model_id).await {
-        let msg = format!(
-            "[Docker] 模型 {} 为 ComfyUI 本地构建镜像，跳过镜像拉取（缺失时请在「视频生成」页点击「构建镜像」）",
-            model_id
-        );
-        crate::common::utils::logger::write_log("INFO", "DOWNLOAD", &msg);
-        app.emit(
-            "model-log",
-            serde_json::json!({ "model_id": model_id, "line": msg, "source": "stdout" }),
-        )
-        .ok();
-        return;
-    }
+    // ComfyUI 镜像同样由 registry 拉取（应用内不再提供构建流程）。
     let resolved_image = resolve_engine_image(model_id, vllm_image.as_deref()).await;
     if let Some(image) = resolved_image {
         pull_image_if_configured(app, model_id, Some(&image)).await;
@@ -571,7 +558,7 @@ async fn finish_model_download(
 ///    （wget/aria2 进度条行内含 `\r`，跳过避免刷屏）；
 /// 4. 每 2s 轮询模型目录 + HF API 文件清单（同样按模式过滤）折算进度/速度；
 /// 5. 取消：cancel_flag 置位 → 杀整个进程组（bash + aria2c/wget），发 download-cancelled；
-/// 6. 全部成功：finish_model_download 写 .done + 发完成事件（ComfyUI 引擎跳过镜像拉取）。
+/// 6. 全部成功：finish_model_download 写 .done + 发完成事件 + 拉取镜像（与 URL 清单路径共用）。
 async fn hfd_download_repos(
     app: &tauri::AppHandle,
     model_id: &str,
@@ -1256,18 +1243,6 @@ fn spawn_ready_probe(app: tauri::AppHandle, model_id: String, port: u16, ready_p
     });
 }
 
-/// 远程清单中该模型是否声明 `engine: "comfyui"`（本地构建镜像，需跳过 registry 拉取校验）。
-async fn resolve_engine_is_comfyui(model_id: &str) -> bool {
-    match fetch_model_list().await {
-        Ok(list) => list
-            .iter()
-            .find(|m| m.model_id == model_id)
-            .map(|m| m.engine.trim().eq_ignore_ascii_case("comfyui"))
-            .unwrap_or(false),
-        Err(_) => false,
-    }
-}
-
 /// 模型下载完成后拉取 vLLM 镜像（如果模型清单指定了 vllm_image）：
 /// - 配置缺字段（None / 空串）→ 直接跳过（启动时会被拒绝）
 /// - 镜像已存在 → 跳过拉取，秒级返回
@@ -1330,10 +1305,10 @@ async fn check_docker_env(
     pull_docker_image(app, model_id, image).await
 }
 
-/// 拉取镜像（仅由 `download_model` 在模型文件下完后调用）：
+/// 拉取镜像（`download_model` 在模型文件下完后调用，或「视频生成」页「下载镜像」直接调用）：
 /// CLI/daemon/GPU 预检 → 镜像存在则跳过 → 否则 `docker pull`（多源回退/超时见 pull_image）。
 /// 成功返回实际可用镜像名（可能是镜像源前缀版本），拉取失败返回错误。
-async fn pull_docker_image(
+pub(crate) async fn pull_docker_image(
     app: &tauri::AppHandle,
     model_id: &str,
     image: &str,
@@ -3704,15 +3679,10 @@ async fn start_comfyui_docker(
     };
     let shm_size = if vllm_args.shm_size.is_empty() { default_shm.to_string() } else { vllm_args.shm_size.clone() };
 
-    // ===== 启动前 Docker 环境预检（CLI / daemon / GPU runtime）+ 本地镜像校验 =====
-    // ComfyUI 镜像为「视频生成」页构建的本地产物（官方无 ARM64 镜像），不做 registry 拉取
-    docker_preflight(app, model_id).await?;
-    if !docker_image_exists(app, model_id, &image).await? {
-        bail!(
-            "镜像 {} 不存在：请在「视频生成」页点击「构建镜像」完成本地构建后重试",
-            image
-        );
-    }
+    // ===== 启动前 Docker 环境预检（CLI / daemon / GPU runtime）+ 镜像就绪 =====
+    // ComfyUI 镜像由手工脚本构建并推送到 registry（应用内不再提供构建流程），
+    // 缺失时当场拉取（对齐其它引擎，进度经 model-pull-progress 驱动页内显示）
+    pull_docker_image(app, model_id, &image).await?;
 
     // 镜像内 ComfyUI 预检（--entrypoint bash 绕开镜像 ENTRYPOINT，无需 GPU）
     {
@@ -3724,7 +3694,7 @@ async fn start_comfyui_docker(
             let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
             if stdout.contains("COMFY_MISSING") {
                 let msg = format!(
-                    "镜像 {} 内未找到 ComfyUI（/opt/ComfyUI/main.py 缺失）：请按 scripts/docker/h3-comfyui/Dockerfile 构建镜像后重试",
+                    "镜像 {} 内未找到 ComfyUI（/opt/ComfyUI/main.py 缺失）：请检查 engine_image 指向的镜像（手工脚本 scripts/docker/h3-comfyui/ 构建并推送到 registry 的产物）",
                     image
                 );
                 app.emit("model-log", serde_json::json!({

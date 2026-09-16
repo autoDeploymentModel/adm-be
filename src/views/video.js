@@ -239,7 +239,7 @@ const template = `
     <div class="video-row">
       <span class="video-label">${_t("镜像")}</span>
       <span class="video-value" id="video-image-state">--</span>
-      <button id="video-build-image" class="video-btn video-btn-ghost video-btn-sm video-inline-btn">${_t("构建镜像")}</button>
+      <button id="video-pull-image" class="video-btn video-btn-ghost video-btn-sm video-inline-btn">${_t("下载镜像")}</button>
     </div>
     <div class="video-row">
       <span class="video-label">${_t("权重")}</span>
@@ -297,8 +297,9 @@ const LOG_LIMIT = 600;
 /** @type {{text: string, source: string}[]} */
 let logLines = [];
 /** 环境就绪状态（镜像 / 权重），由后端 comfyui_setup_status 返回 */
-let setup = /** @type {any} */ ({ image_exists: false, weights_downloaded: false, weights_partial: false, weights_bytes: 0, build_dir: "", weights_dir: "" });
-let buildingImage = false;
+let setup = /** @type {any} */ ({ image_exists: false, weights_downloaded: false, weights_partial: false, weights_bytes: 0, weights_dir: "" });
+/** 镜像下载（docker pull）进行中：进度取 st.pullProgress[modelId]（model-pull-progress 事件） */
+let pullingImage = false;
 /** 权重下载速度（bytes/s，来自 download-progress 事件，仅用于本页展示） */
 let downloadSpeed = 0;
 /** @type {number | null} */
@@ -388,8 +389,9 @@ function render() {
   const st = S();
   const modelId = e ? e.model_id : null;
   const running = !!(modelId && st.runningModelId === modelId);
-  const starting = !!(modelId && st.startingModelId === modelId);
   const pull = modelId && st.pullProgress ? st.pullProgress[modelId] : undefined;
+  // 拉镜阶段 index.html 也会置 startingModelId（列表页启动按钮的进度用），视频页不把它当「启动中」
+  const starting = !!(modelId && st.startingModelId === modelId) && !pullingImage;
 
   const dot = el("video-state-dot");
   const stateText = el("video-state");
@@ -426,7 +428,7 @@ function render() {
   const downloading = dlProgress !== undefined;
   const imageState = el("video-image-state");
   const weightsState = el("video-weights-state");
-  const buildBtn = el("video-build-image");
+  const buildBtn = el("video-pull-image");
   const weightsBtn = el("video-download-weights");
   const progressWrap = el("video-progress-wrap");
   if (!e) {
@@ -436,11 +438,13 @@ function render() {
     weightsBtn.disabled = true;
     progressWrap.style.display = "none";
   } else {
-    imageState.textContent = buildingImage
-      ? _t("构建中...")
-      : (setup.image_exists ? _t("已构建") : _t("未构建"));
-    buildBtn.disabled = buildingImage || !!setup.image_exists;
-    buildBtn.textContent = setup.image_exists ? _t("已构建") : _t("构建镜像");
+    if (pullingImage) {
+      imageState.textContent = _t("下载中...") + (pull !== undefined && pull > 0 ? " " + pull + "%" : "");
+    } else {
+      imageState.textContent = setup.image_exists ? _t("已下载") : _t("未下载");
+    }
+    buildBtn.disabled = pullingImage || !!setup.image_exists;
+    buildBtn.textContent = setup.image_exists ? _t("已下载") : (pullingImage ? _t("下载中...") : _t("下载镜像"));
     if (downloading) {
       const speed = formatSpeed(downloadSpeed);
       weightsState.textContent = _t("下载中") + " " + dlProgress + "%" + (speed ? " · " + speed : "");
@@ -462,13 +466,11 @@ function render() {
       }
       progressWrap.style.display = "none";
     }
-    el("video-setup-paths").textContent =
-      _t("权重目录") + ": " + (setup.weights_dir || "--") + "\n" +
-      _t("构建目录") + ": " + (setup.build_dir || "--");
+    el("video-setup-paths").textContent = _t("权重目录") + ": " + (setup.weights_dir || "--");
   }
 
-  el("video-start").disabled = !e || running || starting || !setup.image_exists;
-  el("video-start").title = !setup.image_exists ? _t("需先构建镜像") : "";
+  el("video-start").disabled = !e || running || starting || pullingImage || !setup.image_exists;
+  el("video-start").title = !setup.image_exists ? _t("需先下载镜像") : "";
   el("video-stop").disabled = !running;
   el("video-restart").disabled = !running;
   el("video-open").disabled = !running;
@@ -510,21 +512,25 @@ async function refreshSetup() {
   }
 }
 
-/** 构建本地镜像（后端写入内置 Dockerfile + docker build，日志走 model-log） */
-async function handleBuildImage() {
+/** 下载镜像（后端 pull_comfyui_image；进度走 model-pull-progress 事件） */
+async function handlePullImage() {
   const e = entry();
-  if (!e || buildingImage) return;
+  if (!e || pullingImage) return;
   const image = e.engine_image || e.vllm_image || "";
   if (!image) { notify(_t("未配置 engine_image")); return; }
-  buildingImage = true;
+  pullingImage = true;
   render();
   try {
-    await invoke()("build_comfyui_image", { modelId: e.model_id, image: image, comfyuiRef: null });
-    notify(_t("镜像构建完成"));
+    await invoke()("pull_comfyui_image", { modelId: e.model_id, image: image });
+    notify(_t("镜像下载完成"));
   } catch (err) {
-    notify(_t("构建失败: ") + err);
+    notify(_t("镜像下载失败: ") + err);
   }
-  buildingImage = false;
+  pullingImage = false;
+  // 拉镜阶段 index.html 会把 startingModelId 置为当前模型（列表页启动按钮的进度用）；
+  // 视频页不用它，不清掉会让状态卡一直显示「启动中...」
+  if (S().startingModelId === e.model_id && !S().runningModelId) S().startingModelId = null;
+  if (S().pullProgress) delete S().pullProgress[e.model_id];
   await refreshSetup();
   render();
 }
@@ -656,7 +662,7 @@ export default {
         notify(_t("状态已刷新"));
       })();
     });
-    el("video-build-image").addEventListener("click", function () { void handleBuildImage(); });
+    el("video-pull-image").addEventListener("click", function () { void handlePullImage(); });
     el("video-download-weights").addEventListener("click", function () {
       const e = entry();
       if (!e) return;
