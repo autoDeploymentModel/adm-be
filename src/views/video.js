@@ -410,8 +410,9 @@ function render() {
     } else {
       imageState.textContent = setup.image_exists ? _t("已下载") : _t("未下载");
     }
-    buildBtn.disabled = pullingImage || !!setup.image_exists;
+    buildBtn.disabled = pullingImage || !!setup.image_exists || downloading;
     buildBtn.textContent = setup.image_exists ? _t("已下载") : (pullingImage ? _t("下载中...") : _t("下载镜像"));
+    buildBtn.title = downloading ? _t("权重下载中，请等下载完成后再下载镜像") : "";
     if (downloading) {
       const speed = formatSpeed(downloadSpeed);
       weightsState.textContent = _t("下载中") + " " + dlProgress + "%" + (speed ? " · " + speed : "");
@@ -441,9 +442,9 @@ function render() {
             "）：\n" + missingList.join("\n")
           : "";
         weightsState.title = tip;
-        weightsBtn.title = tip;
+        weightsBtn.title = pullingImage ? _t("镜像下载中，请等下载完成后再下载权重") : tip;
         weightsBtn.textContent = setup.weights_partial ? _t("继续下载") : _t("下载权重");
-        weightsBtn.disabled = false;
+        weightsBtn.disabled = pullingImage;
       }
       // 拉镜进行中时保留进度条（与上面的拉镜百分比共用）
       if (!pullingImage) progressWrap.style.display = "none";
@@ -497,10 +498,21 @@ async function refreshSetup() {
   }
 }
 
+/** 该模型权重是否正在下载（download-progress / download-complete 事件维护 st.downloadingModels） */
+function isWeightsDownloading(modelId) {
+  const dl = S().downloadingModels || {};
+  return !!modelId && dl[modelId] !== undefined;
+}
+
 /** 下载镜像（后端 pull_comfyui_image；进度走 model-pull-progress 事件） */
 async function handlePullImage() {
   const e = entry();
   if (!e || pullingImage) return;
+  // 镜像与权重不允许一起下载（后端同样拒绝，这里提前提示并保持按钮禁用）
+  if (isWeightsDownloading(e.model_id)) {
+    notify(_t("权重下载中，请等下载完成后再下载镜像"));
+    return;
+  }
   const image = e.engine_image || e.vllm_image || "";
   if (!image) { notify(_t("未配置 engine_image")); return; }
   pullingImage = true;
@@ -522,6 +534,11 @@ async function handlePullImage() {
 async function handleDownloadWeights() {
   const e = entry();
   if (!e) return;
+  // 镜像与权重不允许一起下载（后端同样拒绝，这里提前提示并保持按钮禁用）
+  if (pullingImage) {
+    notify(_t("镜像下载中，请等下载完成后再下载权重"));
+    return;
+  }
   const files = e.model_download_files || [];
   if (!files.length) { notify(_t("模型清单未配置 model_download_files")); return; }
   S().downloadingModels[e.model_id] = 0;

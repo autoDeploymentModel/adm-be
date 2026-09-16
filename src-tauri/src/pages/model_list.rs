@@ -334,6 +334,18 @@ pub async fn download_model(
         }
     }
 
+    // 镜像与权重不允许同时下载：该模型正在拉镜时拒绝启动权重下载
+    {
+        let state = app.state::<AppState>();
+        let pulling = state.pulling_images.lock().map_err(|e| e.to_string())?;
+        if pulling.contains(&model_id) {
+            bail!(
+                "模型 {} 正在下载镜像，镜像与权重不允许同时下载；请等镜像下载完成后再下载权重",
+                model_id
+            );
+        }
+    }
+
     // 下载清单校验提前到取消标志插入之前：清单缺失直接失败，
     // 不在 download_cancel 表中留下无下载对应的死条目
     if model_files.as_ref().map(|f| f.is_empty()).unwrap_or(true) {
@@ -492,6 +504,12 @@ pub async fn download_model(
     );
 }
 
+/// 权重下载完成后进入「拉镜阶段」时写入 `downloading_phase` 的哨兵值。
+/// 该阶段拉镜是权重下载流水线的最后一步（权重已落盘），允许；
+/// 其余阶段的 `downloading_progress` 条目 = 权重仍在下载 → 拉镜被拒
+/// （镜像与权重不允许同时下载）。
+pub(crate) const PULL_IMAGE_PHASE: &str = "<pull-image>";
+
 /// 下载成功收尾（URL 清单与 hfd.sh 仓库下载两条路径共用）：
 /// 写 .done 标记（scan_local_models 排除）→ 立刻发 download-complete(all)
 /// （前端立即显示「已下载」+ 启动按钮可点）→ 进入镜像拉取阶段（downloading_phase 记
@@ -510,7 +528,7 @@ async fn finish_model_download(
     )
     .ok();
     if let Ok(mut map) = app.state::<AppState>().downloading_phase.lock() {
-        map.insert(model_id.to_string(), "<pull-image>".to_string());
+        map.insert(model_id.to_string(), PULL_IMAGE_PHASE.to_string());
     }
     // 镜像名必须由后端重新拉取远程清单解析（与启动流程一致），不能依赖前端卡片透传——
     // 远程配置更新后旧卡片透传值为空，会导致镜像被静默跳过，最终启动时才报「镜像尚未下载」。
@@ -1305,10 +1323,84 @@ async fn check_docker_env(
     pull_docker_image(app, model_id, image).await
 }
 
+/// 拉镜占位守卫（镜像 / 权重互斥的单一真源）：
+/// - 该模型正在下载权重（且不在「权重已下完 → 进入拉镜阶段」的内部交接）时拒绝；
+/// - 已在拉镜则该次调用拒绝（挡住重复点击 / 并发调用）；
+/// - Drop 时释放，异常路径也不会留下死占位。
+struct ImagePullGuard {
+    app: tauri::AppHandle,
+    model_id: String,
+}
+
+impl ImagePullGuard {
+    fn acquire(app: &tauri::AppHandle, model_id: &str) -> Result<Self, AppError> {
+        {
+            let state = app.state::<AppState>();
+            let phase = state
+                .downloading_phase
+                .lock()
+                .map_err(|e| e.to_string())?
+                .get(model_id)
+                .cloned();
+            let downloading = state
+                .downloading_progress
+                .lock()
+                .map_err(|e| e.to_string())?
+                .contains_key(model_id);
+            // `downloading_progress` 有条目 = 权重下载未收尾；只有 `<pull-image>` 阶段
+            // （权重已落盘、紧接着拉镜）允许，其余阶段一律拒绝
+            if downloading && phase.as_deref() != Some(PULL_IMAGE_PHASE) {
+                bail!(
+                    "模型 {} 正在下载权重，镜像与权重不允许同时下载；请等权重下载完成后再下载镜像",
+                    model_id
+                );
+            }
+        }
+        {
+            let state = app.state::<AppState>();
+            let inserted = state
+                .pulling_images
+                .lock()
+                .map_err(|e| e.to_string())?
+                .insert(model_id.to_string());
+            if !inserted {
+                bail!("模型 {} 正在下载镜像，请勿重复点击", model_id);
+            }
+        }
+        Ok(Self {
+            app: app.clone(),
+            model_id: model_id.to_string(),
+        })
+    }
+}
+
+impl Drop for ImagePullGuard {
+    fn drop(&mut self) {
+        self.app
+            .state::<AppState>()
+            .pulling_images
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.model_id);
+    }
+}
+
 /// 拉取镜像（`download_model` 在模型文件下完后调用，或「视频生成」页「下载镜像」直接调用）：
 /// CLI/daemon/GPU 预检 → 镜像存在则跳过 → 否则 `docker pull`（多源回退/超时见 pull_image）。
 /// 成功返回实际可用镜像名（可能是镜像源前缀版本），拉取失败返回错误。
+///
+/// 入口带互斥守卫：镜像与权重不允许同时下载（同一 model_id 串行），并挡住重复点击。
 pub(crate) async fn pull_docker_image(
+    app: &tauri::AppHandle,
+    model_id: &str,
+    image: &str,
+) -> Result<String, AppError> {
+    let _guard = ImagePullGuard::acquire(app, model_id)?;
+    pull_docker_image_inner(app, model_id, image).await
+}
+
+/// `pull_docker_image` 的执行体（互斥守卫由调用方持有）
+async fn pull_docker_image_inner(
     app: &tauri::AppHandle,
     model_id: &str,
     image: &str,

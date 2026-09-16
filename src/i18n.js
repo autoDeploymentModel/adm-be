@@ -437,6 +437,8 @@ const EN = {
   "已请求停止下载": "Stop requested",
   "模型清单未配置 model_download_files": "model_download_files is not configured in the model manifest",
   "未配置 engine_image": "engine_image is not configured",
+  "权重下载中，请等下载完成后再下载镜像": "Weights are downloading — wait for it to finish before downloading the image",
+  "镜像下载中，请等下载完成后再下载权重": "The image is downloading — wait for it to finish before downloading weights",
   "权重目录": "Weights dir",
 
   // ===== test.js =====
