@@ -62,13 +62,44 @@ COMFYUI_SOURCES=(
 )
 # PyPI 源候选（官方 + 常见国内镜像）：torch 的依赖 / ComfyUI requirements / comfy-kitchen 都走选出的源。
 # 官方源可达 ≠ 可下：未托管在 PyTorch 索引的包会回落到 files.pythonhosted.org，弱网下长时间停读。
+# 想换/去掉某个镜像：ADM_PYPI_MIRRORS="url1 url2"（整表覆盖）或 --pip-index <url>（直接指定，不探测）。
 PYPI_SOURCES=(
   "https://pypi.org/simple"
   "https://pypi.tuna.tsinghua.edu.cn/simple"
+  "https://repo.huaweicloud.com/repository/pypi/simple"
   "https://mirrors.aliyun.com/pypi/simple"
   "https://mirrors.cloud.tencent.com/pypi/simple"
-  "https://repo.huaweicloud.com/repository/pypi/simple"
+  "https://mirrors.ustc.edu.cn/pypi/simple"
+  "https://mirror.nju.edu.cn/pypi/web/simple"
+  "https://mirrors.bfsu.edu.cn/pypi/web/simple"
+  "https://mirrors.sustech.edu.cn/pypi/web/simple"
+  "https://mirrors.163.com/pypi/simple"
 )
+if [ -n "${ADM_PYPI_MIRRORS:-}" ]; then
+  PYPI_SOURCES=()
+  for mirror in $(printf '%s' "$ADM_PYPI_MIRRORS" | tr ',' ' '); do
+    if [ -n "$mirror" ]; then PYPI_SOURCES+=("${mirror%/}"); fi
+  done
+  [ "${#PYPI_SOURCES[@]}" -gt 0 ] || die "ADM_PYPI_MIRRORS 解析后为空"
+fi
+# 只想排除某几个源（不用整表覆盖）：ADM_PYPI_EXCLUDE="aliyun tencent"（子串匹配 URL）
+if [ -n "${ADM_PYPI_EXCLUDE:-}" ]; then
+  PYPI_FILTERED=()
+  for src in "${PYPI_SOURCES[@]}"; do
+    drop=0
+    for pattern in $(printf '%s' "$ADM_PYPI_EXCLUDE" | tr ',' ' '); do
+      case "$src" in
+        *"$pattern"*)
+          drop=1
+          break
+          ;;
+      esac
+    done
+    if [ "$drop" -eq 0 ]; then PYPI_FILTERED+=("$src"); fi
+  done
+  [ "${#PYPI_FILTERED[@]}" -gt 0 ] || die "ADM_PYPI_EXCLUDE 把所有候选源都排除了：${ADM_PYPI_EXCLUDE}"
+  PYPI_SOURCES=("${PYPI_FILTERED[@]}")
+fi
 
 SELF="$0"
 if [ -n "${BASH_SOURCE:-}" ]; then
@@ -93,7 +124,7 @@ usage() {
       --ref <tag>         ComfyUI 版本（默认 v0.30.0）
       --ref-sha <sha>     commit 校验值（默认内置 v0.30.0 上游 SHA；传空串 = 跳过校验）
       --proxy <url>       构建期代理（默认取 $HTTPS_PROXY / $https_proxy）
-      --pip-index <url>   强制 PyPI 源（默认按吞吐自动择优：官方 / 清华 / 阿里 / 腾讯 / 华为云）
+      --pip-index <url>   强制 PyPI 源（默认按吞吐自动择优，见下方 ADM_PYPI_MIRRORS）
       --torch-index <url> PyTorch wheel 源（默认官方 cu130）
       --platform <p>      目标平台（默认 linux/arm64）
       --save [路径]       构建后导出 tar.gz（默认当前目录）
@@ -114,6 +145,15 @@ usage() {
       （全局代理 / daemon.json 的 registry-mirrors、proxies）；脚本不会改你的 Docker 配置，
       也不内置加速器——确需时用 --base <你的加速器前缀>/<ref> 或环境变量：
         ADM_BASE_MIRRORS="host1 host2" ./build-image.sh
+
+      PyPI 源默认在 官方 + 国内镜像（清华 / 华为云 / 阿里 / 腾讯 / 中科大 / 南大 /
+      北外 / 南科大 / 网易）里按**真实大 wheel 下载吞吐**择优（先取 numpy 前 6 MB 实测），
+      不去指定名单、也不要某个源时用环境变量整表覆盖（逗号或空格分隔；第一个命中即候选）：
+        ADM_PYPI_MIRRORS="https://pypi.tuna.tsinghua.edu.cn/simple" ./build-image.sh
+        ADM_PYPI_MIRRORS="https://repo.huaweicloud.com/repository/pypi/simple https://mirrors.ustc.edu.cn/pypi/simple" ./build-image.sh
+      只想从默认名单里剔除某几个源（子串匹配）：
+        ADM_PYPI_EXCLUDE="aliyun tencent" ./build-image.sh
+      只要某个源直接指定（不探测、不比较）：--pip-index <url>
 USAGE
 }
 
@@ -264,6 +304,28 @@ if [ "$DRY_RUN" -eq 0 ]; then
   else
     logerr "daemon 未显示代理 / 镜像加速配置（docker info）——若 daemon 拉不到镜像，请让 daemon 自身走上你的全局代理（systemd 环境变量 HTTP_PROXY/HTTPS_PROXY）或写 daemon.json proxies；本脚本不会替你修改 Docker 配置"
   fi
+  # Buildx 状态目录预检：历史上用 sudo 跑过一次 docker build，就会把
+  # ~/.docker/buildx/activity/<context> 留成 root 属主 0600 → 之后普通用户构建直接
+  # "open .../buildx/activity/desktop-linux: permission denied"（报错与构建内容无关，极易误判）。
+  # 该文件可安全删除（buildx 会重建），只有在父目录也不可写时才需要用户 sudo chown。
+  BUILDX_DIR="${DOCKER_CONFIG:-$HOME/.docker}/buildx"
+  if [ -d "$BUILDX_DIR" ]; then
+    for entry in "$BUILDX_DIR"/activity/*; do
+      [ -e "$entry" ] || continue
+      if [ ! -w "$entry" ]; then
+        if rm -f "$entry" 2>/dev/null; then
+          warn "已清理 buildx 活动文件（历史 sudo 构建留下的不可写文件）：${entry}"
+        else
+          die "buildx 活动文件不可写，普通用户无法构建：${entry}
+  修复：sudo chown -R $(id -un):$(id -gn) \"$BUILDX_DIR\""
+        fi
+      fi
+    done
+    if [ -d "$BUILDX_DIR/activity" ] && [ ! -w "$BUILDX_DIR/activity" ]; then
+      die "buildx 活动目录不可写，普通用户无法构建：${BUILDX_DIR}/activity
+  修复：sudo chown -R $(id -un):$(id -gn) \"$BUILDX_DIR\""
+    fi
+  fi
 fi
 
 is_docker_desktop() {
@@ -389,9 +451,54 @@ log "ComfyUI 源码源：${CHOSEN_REPO}（候选回退 ${FALLBACK_COUNT} 个）"
 # ---------- PyPI 源按吞吐择优（torch 依赖 / requirements / comfy-kitchen 都走它） ----------
 # 官方源可达 ≠ 可下：未托管在 PyTorch 索引的包会回落到 files.pythonhosted.org
 # （实测 8.7 KB/s → pip Read timed out，整层构建失败），故按实测吞吐而非可达性选源。
+# 索引页只有几 KB，测不出真实下载能力（镜像索引页都很快，大 wheel 才会暴露限速）；
+# 而且很多镜像（如阿里云）是「前几 MB 突发飞快、之后掉到几百 KB/s」，只测开头会误判为最快。
+# 故改为：取该源上一个真实大 wheel，跳过前 2 MB、量随后 16 MB 的持续吞吐。
+PROBE_PKG="${ADM_PYPI_PROBE_PKG:-scipy}"
+PROBE_SKIP_BYTES=2097152
+PROBE_WINDOW_BYTES=16777216
+case "$TARGET_ARCH" in
+  arm64) PROBE_TAG="aarch64" ;;
+  amd64) PROBE_TAG="x86_64" ;;
+  *) PROBE_TAG="" ;;
+esac
+
 probe_pypi_speed() {
   command -v curl >/dev/null 2>&1 || return 2
-  curl -fsS -m 8 -o /dev/null -w '%{speed_download}' "$1/pip/" 2>/dev/null
+  probe_src="$1"
+  idx="$(curl -fsS -m 10 "$probe_src/${PROBE_PKG}/" 2>/dev/null || true)"
+  url=""
+  if [ -n "$idx" ]; then
+    for cand in $(printf '%s' "$idx" | tr '"' '\n' | grep -E '^https?://' | grep '\.whl'); do
+      case "$cand" in
+        *"$PROBE_TAG"*)
+          url="$cand"
+          break
+          ;;
+      esac
+    done
+    if [ -z "$url" ]; then
+      url="$(printf '%s' "$idx" | tr '"' '\n' | grep -E '^https?://.*\.whl' | head -n 1)"
+    fi
+  fi
+  if [ -n "$url" ]; then
+    last=$((PROBE_SKIP_BYTES + PROBE_WINDOW_BYTES - 1))
+    bps="$(curl -fsS -m 30 -r "${PROBE_SKIP_BYTES}-${last}" -o /dev/null -w '%{speed_download}' "$url" 2>/dev/null || true)"
+    case "$bps" in
+      '' | 0 | 0.0)
+        # 文件比窗口小（range 越界）时退回从头测 8 MB
+        bps="$(curl -fsS -m 20 -r 0-8388607 -o /dev/null -w '%{speed_download}' "$url" 2>/dev/null || true)"
+        ;;
+    esac
+    case "$bps" in
+      '' | 0 | 0.0) ;;
+      *)
+        printf '%s\n' "$bps"
+        return 0
+        ;;
+    esac
+  fi
+  curl -fsS -m 8 -o /dev/null -w '%{speed_download}' "$probe_src/${PROBE_PKG}/" 2>/dev/null
 }
 
 PIP_INDEX_CHOSEN="$OPT_PIP_INDEX"
@@ -399,10 +506,19 @@ if [ -n "$PIP_INDEX_CHOSEN" ]; then
   log "PyPI 源（--pip-index 指定）：${PIP_INDEX_CHOSEN}"
 else
   if command -v curl >/dev/null 2>&1; then
-    logerr "探测 PyPI 源（按吞吐择优）..."
-    best_bps=0
+    logerr "探测 PyPI 源（并发实测持续吞吐：跳过前 2 MB 突发，量随后 16 MB）..."
+    PROBE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/adm-pypi-probe.XXXXXX")"
+    probe_i=0
     for src in "${PYPI_SOURCES[@]}"; do
-      bps="$(probe_pypi_speed "$src" || true)"
+      probe_i=$((probe_i + 1))
+      (bps="$(probe_pypi_speed "$src" || true)"; printf '%s\n' "$bps" >"$PROBE_DIR/$probe_i") &
+    done
+    wait
+    best_bps=0
+    probe_i=0
+    for src in "${PYPI_SOURCES[@]}"; do
+      probe_i=$((probe_i + 1))
+      bps="$(cat "$PROBE_DIR/$probe_i" 2>/dev/null || true)"
       case "$bps" in '' | *[!0-9.]* | 0 | 0.0) continue ;; esac
       bps_int="${bps%%.*}"
       [ -n "$bps_int" ] || continue
@@ -412,6 +528,7 @@ else
         PIP_INDEX_CHOSEN="$src"
       fi
     done
+    rm -rf "$PROBE_DIR"
   fi
   if [ -n "$PIP_INDEX_CHOSEN" ] && [ "$PIP_INDEX_CHOSEN" = "${PYPI_SOURCES[0]}" ]; then
     log "PyPI 源：${PIP_INDEX_CHOSEN}（官方源实测最优）"
@@ -496,7 +613,9 @@ make_build_cmd() {
   if [ "${DOCKER_BUILDKIT:-1}" != "0" ]; then
     BUILD_CMD+=(--progress=plain)
   fi
-  BUILD_CMD+=("${platform_args[@]}" "${proxy_args[@]}" "${build_args[@]}" --build-arg "BASE=$1" "$SCRIPT_DIR")
+  # 注意：bash 3.2（macOS 自带）配合 set -u 时展开空数组会报 unbound variable，
+  # 故 platform_args / proxy_args 用 ${arr[@]+"${arr[@]}"} 形式（可能为空）。
+  BUILD_CMD+=(${platform_args[@]+"${platform_args[@]}"} ${proxy_args[@]+"${proxy_args[@]}"} "${build_args[@]}" --build-arg "BASE=$1" "$SCRIPT_DIR")
 }
 
 # ---------- 已存在则跳过 ----------
