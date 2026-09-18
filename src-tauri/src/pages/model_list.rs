@@ -2736,7 +2736,19 @@ fn push_sglang_args(args: &mut Vec<String>, vllm_args: &VllmArgs, ctx_size: Opti
     }
 }
 
-/// 把模型清单 vllm_flags 拼接为 `--key value` 追加到 args（每条 `--key value` 或 `--flag`，start_vllm_docker 同规则）。
+/// 模型清单 flag 值的 argv 拆分：多值参数（如 `--cudagraph-capture-sizes 1 2 3 4 6 8 12`）
+/// 按空白拆为多个 token；JSON 值（`{`/`[` 开头，如 `--speculative-config {...}`）保持整体传递
+/// （值内可含空格）。多机与单机（start_vllm_docker / ComfyUI / SGLang）路径共用同一规则。
+fn split_flag_value(value: &str) -> Vec<&str> {
+    if value.starts_with('{') || value.starts_with('[') {
+        vec![value]
+    } else {
+        value.split_whitespace().collect()
+    }
+}
+
+/// 把模型清单 vllm_flags 拼接为 `--key value` 追加到 args（每条 `--key value` 或 `--flag`，
+/// 多值按空白拆分；start_vllm_docker / ComfyUI / SGLang 同规则）。
 fn push_vllm_flags(args: &mut Vec<String>, vllm_flags: &Option<Vec<String>>) {
     let flags = vllm_flags.as_deref().unwrap_or(&[]);
     if flags.is_empty() {
@@ -2757,7 +2769,7 @@ fn push_vllm_flags(args: &mut Vec<String>, vllm_flags: &Option<Vec<String>>) {
         }
         args.push(format!("--{}", k));
         if !v.is_empty() {
-            args.push(v.to_string());
+            args.extend(split_flag_value(v).into_iter().map(str::to_string));
         }
     }
 }
@@ -3761,6 +3773,7 @@ async fn start_multi_node(
             let lw = std::sync::Arc::clone(&log_writer_stdout);
             Some(std::thread::spawn(move || {
                 let reader = BufReader::new(stdout);
+                let mut warmup_started = false;
                 for line in reader.lines().map_while(Result::ok) {
                     crate::common::utils::logger::write_log("INFO", engine_tag, &line);
                     if let Ok(mut w) = lw.lock() {
@@ -3781,6 +3794,16 @@ async fn start_multi_node(
                         app_c.emit("model-started", serde_json::json!({
                             "model_id": &mid, "port": port,
                         })).ok();
+                        // 就绪后自动预热（仅首次命中就绪信号）：首轮 JIT 编译前移，失败不影响启动
+                        if !warmup_started {
+                            warmup_started = true;
+                            crate::common::utils::warmup::spawn(
+                                app_c.clone(),
+                                mid.clone(),
+                                port,
+                                if is_sglang { "SGLang" } else { "vLLM" },
+                            );
+                        }
                     }
                 }
             }))
@@ -4135,8 +4158,10 @@ async fn start_comfyui_docker(
             args.push(format!("--{}", k));
             applied.push(format!("--{}", k));
             if !v.is_empty() {
-                args.push(v.to_string());
-                applied.push(v.to_string());
+                for tok in split_flag_value(v) {
+                    args.push(tok.to_string());
+                    applied.push(tok.to_string());
+                }
             }
         }
         if !applied.is_empty() {
@@ -4532,8 +4557,10 @@ async fn start_vllm_docker(
             args.push(format!("--{}", k));
             applied.push(format!("--{}", k));
             if !v.is_empty() {
-                args.push(v.to_string());
-                applied.push(v.to_string());
+                for tok in split_flag_value(v) {
+                    args.push(tok.to_string());
+                    applied.push(tok.to_string());
+                }
             }
         }
         if !applied.is_empty() {
@@ -4635,8 +4662,10 @@ async fn start_vllm_docker(
         let stdout_handle = if let Some(stdout) = child.stdout.take() {
             let app_c = app_clone.clone();
             let mid = model_id_clone.clone();
+            let warmup_enabled = engine_command.is_empty();
             Some(std::thread::spawn(move || {
                 let reader = BufReader::new(stdout);
+                let mut warmup_started = false;
                 for line in reader.lines().map_while(Result::ok) {
                     crate::common::utils::logger::write_log("INFO", "vLLM", &line);
                     app_c
@@ -4651,6 +4680,12 @@ async fn start_vllm_docker(
                                 "model_id": &mid, "port": port,
                             }))
                             .ok();
+                        // 就绪后自动预热（仅首次命中）：首轮 JIT 编译前移，失败不影响启动；
+                        // engine_command 自定义入口（非标准 vLLM 服务）跳过
+                        if warmup_enabled && !warmup_started {
+                            warmup_started = true;
+                            crate::common::utils::warmup::spawn(app_c.clone(), mid.clone(), port, "vLLM");
+                        }
                     }
                 }
             }))
@@ -4931,8 +4966,10 @@ async fn start_sglang_docker(
             args.push(format!("--{}", k));
             applied.push(format!("--{}", k));
             if !v.is_empty() {
-                args.push(v.to_string());
-                applied.push(v.to_string());
+                for tok in split_flag_value(v) {
+                    args.push(tok.to_string());
+                    applied.push(tok.to_string());
+                }
             }
         }
         if !applied.is_empty() {
@@ -5034,8 +5071,10 @@ async fn start_sglang_docker(
         let stdout_handle = if let Some(stdout) = child.stdout.take() {
             let app_c = app_clone.clone();
             let mid = model_id_clone.clone();
+            let warmup_enabled = engine_command.is_empty();
             Some(std::thread::spawn(move || {
                 let reader = BufReader::new(stdout);
+                let mut warmup_started = false;
                 for line in reader.lines().map_while(Result::ok) {
                     crate::common::utils::logger::write_log("INFO", "SGLang", &line);
                     app_c
@@ -5051,6 +5090,12 @@ async fn start_sglang_docker(
                                 "model_id": &mid, "port": port,
                             }))
                             .ok();
+                        // 就绪后自动预热（仅首次命中）：首轮 JIT 编译前移，失败不影响启动；
+                        // engine_command 自定义入口（如扩散服务）跳过
+                        if warmup_enabled && !warmup_started {
+                            warmup_started = true;
+                            crate::common::utils::warmup::spawn(app_c.clone(), mid.clone(), port, "SGLang");
+                        }
                     }
                 }
             }))
