@@ -369,6 +369,25 @@ pub async fn open_log_dir() -> Result<(), AppError> {
     Ok(())
 }
 
+/// 注销当前用户会话（DGX 直连配置完成后让 docker 组权限生效）
+#[tauri::command]
+pub async fn logout_current_user() -> Result<(), AppError> {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("shutdown")
+            .args(["/l"])
+            .spawn();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // 注意：/bin/sh 为 dash 时无 $UID 内置变量（会展开为空导致参数缺失），故用 $(id -u)
+        let _ = tokio::process::Command::new("sh")
+            .args(["-c", "gnome-session-quit --logout --no-prompt 2>/dev/null || qdbus org.kde.ksmserver /KSMServer logout 0 0 0 2>/dev/null || loginctl terminate-user $(id -u) 2>/dev/null"])
+            .spawn();
+    }
+    Ok(())
+}
+
 /// 获取当前系统用户名（DGX直连配置本机行 SSH 用户名自动回填）
 #[tauri::command]
 pub async fn get_local_username() -> Result<String, AppError> {
@@ -408,9 +427,9 @@ pub async fn fix_docker_permission() -> Result<String, AppError> {
                 // 权限修复成功，自动注销当前桌面会话（让 docker 组生效）
                 // GNOME: gnome-session-quit --logout --no-prompt
                 // KDE: qdbus org.kde.ksmserver /KSMServer logout 0 0 0
-                // 兜底: loginctl terminate-user $UID
+                // 兜底: loginctl terminate-user $(id -u)（dash 无 $UID，必须用 id -u）
                 let _ = tokio::process::Command::new("sh")
-                    .args(["-c", "gnome-session-quit --logout --no-prompt 2>/dev/null || qdbus org.kde.ksmserver /KSMServer logout 0 0 0 2>/dev/null || loginctl terminate-user $UID 2>/dev/null"])
+                    .args(["-c", "gnome-session-quit --logout --no-prompt 2>/dev/null || qdbus org.kde.ksmserver /KSMServer logout 0 0 0 2>/dev/null || loginctl terminate-user $(id -u) 2>/dev/null"])
                     .spawn();
                 return Ok("PERMISSION_FIXED".to_string());
             }

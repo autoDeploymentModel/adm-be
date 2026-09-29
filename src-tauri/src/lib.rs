@@ -199,6 +199,7 @@ pub fn run() {
             settings::sync_model_to_remote,
             settings::get_app_data_dir,
             settings::get_local_username,
+            settings::logout_current_user,
             // dgx_deploy.rs
             dgx_deploy::dgx_deploy_run,
             // comfyui.rs
