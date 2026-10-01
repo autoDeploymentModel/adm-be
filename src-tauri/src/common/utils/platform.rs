@@ -117,17 +117,6 @@ fn probe_perm_local_sync(
     Some((p, s))
 }
 
-/// 执行 `sh -c` 并返回 stdout（trim）。失败返回 None。
-#[cfg(not(target_os = "windows"))]
-fn sh_out(cmd: &str) -> Option<String> {
-    std::process::Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-}
-
 #[cfg(not(target_os = "windows"))]
 fn current_user() -> String {
     std::env::var("USER")
