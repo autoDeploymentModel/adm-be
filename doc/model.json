@@ -236,6 +236,47 @@
         "support_images": true
     },
     {
+        "model_id": "Qwen3.8-Flash-Next-Uncensored",
+        "model_download_files": [
+            "lychee888/Qwen3.8-Flash-Next-Uncensored-NVFP4-FP8PLE"
+        ],
+        "model_support_devices": [
+            "dgx-spark-128G"
+        ],
+        "engine": "vllm",
+        "vllm_image": "vllm-qwen38-fn-ple:20260828",
+        "vllm_flags": [
+            "--enable-prefix-caching",
+            "--max-model-len 600000",
+            "--enable-expert-parallel",
+            "--all2all-backend allgather_reducescatter",
+            "--load-format safetensors",
+            "--safetensors-load-strategy lazy",
+            "--max-num-seqs 8",
+            "--max-num-batched-tokens 8192",
+            "--gpu-memory-utilization 0.86",
+            "--enable-chunked-prefill",
+            "--speculative-config {\"method\":\"mtp\",\"num_speculative_tokens\":3}",
+            "--compilation-config {\"mode\":0,\"cudagraph_mode\":\"FULL_DECODE_ONLY\"}",
+            "--reasoning-parser qwen3",
+            "--enable-auto-tool-choice",
+            "--tool-call-parser qwen3_coder",
+            "--hf-overrides {\"text_config\":{\"rope_parameters\":{\"mrope_interleaved\":true,\"mrope_section\":[11,11,10],\"rope_type\":\"yarn\",\"rope_theta\":600000,\"partial_rotary_factor\":0.25,\"factor\":4.0,\"original_max_position_embeddings\":262144}}}"
+        ],
+        "vllm_env": [
+            "PLE_FORCE_FP8=1",
+            "HF_HUB_OFFLINE=1",
+            "TRANSFORMERS_OFFLINE=1",
+            "VLLM_ALLOW_LONG_MAX_MODEL_LEN=1"
+        ],
+        "model_size": "124 GB",
+        "model_type": "多模态",
+        "model_description": "Qwen3.8-Flash-Next NVFP4 去对齐版（abliterated），PLE n-gram 表 FP8 量化（123 GiB，比 RadixArk 版小 47 GiB），支持对话/推理/工具调用",
+        "support_tools": true,
+        "support_reasoning": true,
+        "support_images": true
+    },
+    {
         "model_id": "Ling-3.0-flash-VL-fp8",
         "model_download_files": [
             "inclusionAI/Ling-3.0-flash-VL-fp8"
