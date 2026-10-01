@@ -102,6 +102,12 @@ pub fn run() {
             {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
+                    // 预热 docker 调用方式缓存：解析过程是阻塞探测（sh/stat/sudo/docker info/sg），
+                    // 放阻塞线程池执行一次，后续 docker_cmd*() 就是缓存命中，不阻塞 async 运行时
+                    let _ = tauri::async_runtime::spawn_blocking(
+                        crate::common::utils::platform::warm_docker_mode,
+                    )
+                    .await;
                     // 延迟 3 秒：等待桌面会话与 polkit 认证代理就绪（与更新检查一致）
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     crate::common::utils::platform::startup_ensure_docker_permission(handle).await;

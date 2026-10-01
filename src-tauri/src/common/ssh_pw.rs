@@ -53,6 +53,22 @@ pub async fn ssh_pw_run(
     cmd: &str,
     timeout: Duration,
 ) -> Result<(bool, String, String), AppError> {
+    ssh_pw_run_stdin(host, port, user, pass, cmd, None, timeout).await
+}
+
+/// 同 `ssh_pw_run`，但可把 `stdin_data` 经 SSH 通道 stdin 送入远端命令。
+///
+/// 用于「远端 sudo 需要密码」的场景：`sudo -S -p '' sh -c <脚本>` 从 stdin 读密码，
+/// 密码因此不进远端命令行参数（否则远端 `ps` 能看到）。数据送完即发 EOF。
+pub async fn ssh_pw_run_stdin(
+    host: &str,
+    port: u16,
+    user: &str,
+    pass: &str,
+    cmd: &str,
+    stdin_data: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<(bool, String, String), AppError> {
     let host = host.trim();
     let user = user.trim();
     if host.is_empty() {
@@ -102,6 +118,18 @@ pub async fn ssh_pw_run(
             .exec(true, cmd)
             .await
             .map_err(|e| AppError::msg(format!("SSH 执行命令失败: {}", e)))?;
+
+        // 可选的 stdin 数据（如 sudo 密码）：写入后立即 EOF，调用方脚本才不会被卡住
+        if let Some(data) = stdin_data {
+            channel
+                .data_bytes(data.to_vec())
+                .await
+                .map_err(|e| AppError::msg(format!("SSH stdin 写入失败: {}", e)))?;
+            channel
+                .eof()
+                .await
+                .map_err(|e| AppError::msg(format!("SSH stdin 关闭失败: {}", e)))?;
+        }
 
         let mut stdout = String::new();
         let mut stderr = String::new();

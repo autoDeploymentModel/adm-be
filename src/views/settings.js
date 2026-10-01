@@ -713,13 +713,13 @@ async function startZdDeploy() {
   const st = document.getElementById("zd-status");
   if (st) st.textContent = "";
   try {
-    await invoke()("dgx_deploy_run", {
+    const res = String((await invoke()("dgx_deploy_run", {
       bAddr: bAddr, bPort: bPort, bUser: bUser, bPass: bPass, aUser: aUser, aPass: aPass
-    });
+    })) || "");
     // 成功兜底：部署期间用户可能已切页，此时 dgx-zero-deploy 事件不再转发到本视图，
-    // 由 promise resolve 补做按钮复位与注销提示（showLogoutPrompt 直接挂 body，不依赖本视图 DOM）
+    // 由 promise resolve 补做按钮复位；仅在本次真的改了 docker 组（LOGOUT_HINT）时才提示注销
     setZdRunning(false);
-    showLogoutPrompt();
+    if (res.indexOf("LOGOUT_HINT") >= 0) showLogoutPrompt();
   } catch (e) {
     // 失败细节已由 dgx-zero-deploy error 事件进入日志/步骤条；此处兜底弹提示
     setZdRunning(false);
@@ -764,7 +764,8 @@ function handleZdEvent(p) {
       if (st) st.textContent = _t("✔ 部署完成！多机互联节点表已就绪，可直接使用");
       zdLog(_t("==== 全部完成 ===="));
       refreshMnNodesFromSettings();
-      showLogoutPrompt();
+      // 仅当本次真的新增了 docker 组成员关系时才提示注销；权限已可用时不再反复要求注销
+      if (detail.indexOf("LOGOUT_HINT") >= 0) showLogoutPrompt();
     }
     return;
   }
@@ -801,9 +802,9 @@ function showLogoutPrompt() {
   overlay.id = "zd-logout-overlay";
   overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:9999;display:flex;justify-content:center;align-items:center;";
   overlay.innerHTML =
-    '<div style="background:var(--c-panel);border:1px solid var(--c-border);border-radius:12px;padding:24px;max-width:420px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.3);">' +
+    '<div style="background:var(--c-panel);border:1px solid var(--c-border);border-radius:12px;padding:24px;max-width:460px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.3);">' +
     '<div style="font-size:16px;font-weight:600;color:var(--c-text-hi);margin-bottom:12px;">' + _t("部署完成") + '</div>' +
-    '<div id="zd-logout-msg" style="font-size:14px;color:var(--c-text-2);line-height:1.6;margin-bottom:20px;">' + _t("Docker 组权限已更新，需要注销当前会话才能生效。注销后请重新登录并启动 ADM-BE。") + '</div>' +
+    '<div id="zd-logout-msg" style="font-size:14px;color:var(--c-text-2);line-height:1.6;margin-bottom:20px;">' + _t("本机 docker 权限已按 socket 实际属组修复，但当前登录会话尚未带上该组身份，需注销重新登录后才能免 sudo 使用。注销后请重新登录并重启 ADM-BE。") + '</div>' +
     '<div style="display:flex;gap:12px;justify-content:flex-end;">' +
     '<button id="zd-logout-later-btn" style="background:var(--c-overlay);color:var(--c-text);border:none;padding:10px 24px;border-radius:8px;font-size:14px;cursor:pointer;">' + _t("稍后手动注销") + '</button>' +
     '<button id="zd-logout-now-btn" style="background:var(--c-accent);color:#fff;border:none;padding:10px 24px;border-radius:8px;font-size:14px;font-weight:500;cursor:pointer;">' + _t("立即注销") + '</button>' +

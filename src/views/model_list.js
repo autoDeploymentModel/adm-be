@@ -819,7 +819,7 @@ function showDockerPermissionDialog() {
       '<div style="font-size:36px;margin-bottom:12px;">🔑</div>' +
       '<div style="font-size:18px;font-weight:600;color:var(--c-text-hi);margin-bottom:12px;">' + _t("Docker 权限不足") + '</div>' +
       '<div id="docker-perm-msg" style="font-size:14px;color:var(--c-text-2);line-height:1.7;margin-bottom:24px;">' +
-        _t("当前用户不在 docker 组，无法启动模型。点击下方按钮，系统会弹出密码框自动修复权限，修复后需重启 ADM-BE 生效。") +
+        _t("当前用户无法访问 docker（不在 docker socket 属组，或会话未带上该组身份）。点击下方按钮，系统会弹出密码框按 socket 实际属组修复；修复后无需注销，ADM-BE 即可直接启动模型。") +
       '</div>' +
       '<div style="display:flex;gap:12px;justify-content:center;">' +
         '<button id="docker-perm-fix-btn" style="background:var(--c-accent);color:#fff;border:none;padding:10px 28px;border-radius:8px;font-size:14px;font-weight:500;cursor:pointer;">' + _t("一键修复") + '</button>' +
@@ -839,9 +839,11 @@ function showDockerPermissionDialog() {
     statusEl.textContent = "";
     try {
       var msg = await invoke()("fix_docker_permission");
-      if (msg === "PERMISSION_FIXED") {
-        // 权限修复成功，系统正在注销登录
-        msgEl.innerHTML = _t("权限修复成功，系统即将自动注销登录，重新登录后即可使用。");
+      if (msg === "PERMISSION_FIXED" || msg === "PERMISSION_FIXED_LOGOUT_HINT") {
+        // PERMISSION_FIXED = 复验通过（无需注销）；LOGOUT_HINT = 已按属组修复但本会话仍未生效（需注销重登）
+        msgEl.innerHTML = msg === "PERMISSION_FIXED"
+          ? _t("权限已修复，无需注销。若希望在终端里也免 sudo，可稍后注销重新登录。请关闭本弹窗后重新点击「启动」。")
+          : _t("已按 docker socket 实际属组修复权限，但本会话仍需注销重新登录才能生效。请注销重登并重启 ADM-BE 后重试。");
         statusEl.style.color = "#4caf50";
         statusEl.textContent = "";
         fixBtn.style.display = "none";
@@ -866,7 +868,7 @@ function showDockerPermissionDialog() {
         var parts = errStr.split("|");
         var user = parts[1] || "";
         var cmd = parts.slice(2).join("|");
-        msgEl.innerHTML = _t("系统不支持自动修复，请在终端手动执行以下命令，然后重新登录后重启 ADM-BE：");
+        msgEl.innerHTML = _t("系统不支持自动修复，请在终端手动执行以下命令（无需注销，重启 ADM-BE 后即可使用）：");
         statusEl.style.color = "var(--c-text-2)";
         statusEl.innerHTML = '<code style="display:block;background:var(--c-bg-deep);padding:12px 16px;border-radius:6px;font-family:monospace;font-size:13px;text-align:left;white-space:pre-wrap;margin-top:8px;">' + escapeHtml(cmd) + '</code>';
         fixBtn.style.display = "none";

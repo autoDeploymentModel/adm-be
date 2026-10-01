@@ -1511,6 +1511,14 @@ pub(crate) async fn docker_preflight(app: &tauri::AppHandle, model_id: &str) -> 
     if !info.status.success() {
         let stderr = String::from_utf8_lossy(&info.stderr).to_string();
         if stderr.contains("permission denied") || stderr.contains("access denied") {
+            // 精确诊断（socket 属组 vs 账号/会话组），定位「加组/注销都不生效」的场景
+            #[cfg(not(target_os = "windows"))]
+            if let Some((p, st)) = crate::common::utils::platform::probe_local_docker_perm().await {
+                log(format!(
+                    "[Docker] 权限诊断：{}",
+                    crate::common::utils::docker_perm::describe(&p, st)
+                ));
+            }
             return Err(AppError::msg("DOCKER_PERMISSION_DENIED".to_string()));
         }
         return Err(AppError::msg(

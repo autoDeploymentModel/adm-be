@@ -726,7 +726,13 @@
               break;
             }
             case "sudo-permission-fixed": {
-              showGlobalToast(t("已加入 docker 组，注销重新登录后重启 ADM-BE 即可免 sudo 执行 docker"));
+              // 后端已按 socket 实际属组修复（可能含 socket 属组/权限对齐）：
+              // verified=true 表示当前会话即可用（无需注销），注销只对终端免 sudo 有意义
+              if (p && p.verified) {
+                showGlobalToast(t("docker 权限已修复，ADM-BE 可直接使用（无需注销）；如需终端里也免 sudo，可注销重新登录"));
+              } else {
+                showGlobalToast(t("docker 权限已修复，注销重新登录后重启 ADM-BE 生效"));
+              }
               break;
             }
           }

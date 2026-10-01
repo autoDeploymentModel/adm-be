@@ -1,4 +1,5 @@
 pub mod platform;
+pub mod docker_perm;
 pub mod log;
 pub mod download;
 pub mod logger;

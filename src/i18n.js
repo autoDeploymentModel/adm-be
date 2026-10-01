@@ -41,7 +41,8 @@ const EN = {
   "该功能即将开放，敬请期待": "This feature is coming soon",
   "当前仅支持 Apple Silicon (M 系列) Mac": "Currently only supported on Apple Silicon (M-series) Macs",
   "未安装": "Not installed",
-  "已加入 docker 组，注销重新登录后重启 ADM-BE 即可免 sudo 执行 docker": "Added to the docker group; after logging out and back in, restart ADM-BE to use docker without sudo",
+  "docker 权限已修复，ADM-BE 可直接使用（无需注销）；如需终端里也免 sudo，可注销重新登录": "Docker permission fixed - ADM-BE works right away (no logout needed). Log out only if you also want sudo-free docker in a terminal",
+  "docker 权限已修复，注销重新登录后重启 ADM-BE 生效": "Docker permission fixed; log out and back in, then restart ADM-BE",
 
   // ===== settings.js =====
   "返回": "Back",
@@ -62,7 +63,8 @@ const EN = {
   "部署中，请勿关闭窗口...": "Deploying, do not close the window...",
   "✔ 部署完成！多机互联节点表已就绪，可直接使用": "✔ Deploy done! Multi-node table is ready",
   "部署完成": "Deployment complete",
-  "Docker 组权限已更新，需要注销当前会话才能生效。注销后请重新登录并启动 ADM-BE。": "Docker group permissions were updated and take effect only after you log out. Log back in, then start ADM-BE again.",
+  "Docker 组权限已更新，需要注销当前会话才能生效。注销后请重新登录并启动 ADM-BE。": "Docker group permissions updated.",
+  "本机 docker 权限已按 socket 实际属组修复，但当前登录会话尚未带上该组身份，需注销重新登录后才能免 sudo 使用。注销后请重新登录并重启 ADM-BE。": "This machine's docker permission was aligned with the socket's real owning group, but the current login session does not carry that group yet - log out and back in (then restart ADM-BE) to use docker without sudo.",
   "立即注销": "Log out now",
   "稍后手动注销": "Log out later myself",
   "正在注销...": "Logging out...",
@@ -379,13 +381,15 @@ const EN = {
 
   // ===== model_list.js - Docker 权限修复 =====
   "Docker 权限不足": "Docker Permission Required",
-  "当前用户不在 docker 组，无法启动模型。点击下方按钮，系统会弹出密码框自动修复权限，修复后需重启 ADM-BE 生效。": "The current user is not in the docker group. Click the button below to fix it via a system password prompt. Restart ADM-BE after fixing.",
+  "当前用户无法访问 docker（不在 docker socket 属组，或会话未带上该组身份）。点击下方按钮，系统会弹出密码框按 socket 实际属组修复；修复后无需注销，ADM-BE 即可直接启动模型。": "The current user cannot access docker (not in the docker socket's owning group, or the login session lacks that group). Click below to fix it via a system password prompt; no logout needed afterwards.",
+  "权限已修复，无需注销。若希望在终端里也免 sudo，可稍后注销重新登录。请关闭本弹窗后重新点击「启动」。": "Fixed - no logout needed. Log out later only if you want sudo-free docker in a terminal. Close this dialog and click Start again.",
+  "已按 docker socket 实际属组修复权限，但本会话仍需注销重新登录才能生效。请注销重登并重启 ADM-BE 后重试。": "Permission was aligned with the docker socket's owning group, but this session still needs a re-login. Log out and back in, restart ADM-BE, then retry.",
   "一键修复": "Auto Fix",
   "修复中...": "Fixing...",
   "已修复，请重启": "Fixed, please restart",
   "修复失败: ": "Fix failed: ",
   "已取消，可重新点击修复": "Cancelled, click fix to retry",
-  "系统不支持自动修复，请在终端手动执行以下命令，然后重新登录后重启 ADM-BE：": "Auto-fix is not supported on this system. Please run the following command in a terminal, then re-login and restart ADM-BE:",
+  "系统不支持自动修复，请在终端手动执行以下命令（无需注销，重启 ADM-BE 后即可使用）：": "Auto-fix is not supported on this system. Run the following commands in a terminal (no logout needed; restart ADM-BE afterwards):",
   "权限修复成功，系统即将自动注销登录，重新登录后即可使用。": "Permission fixed. The system will log out automatically. Please log back in to continue.",
   "清空日志": "Clear Logs",
   "确定清空所有日志吗？": "Are you sure you want to clear all logs?",

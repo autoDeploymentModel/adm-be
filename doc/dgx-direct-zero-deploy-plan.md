@@ -197,12 +197,32 @@ A 本机：ssh -o BatchMode=yes -o ConnectTimeout=5 192.168.177.12 'echo OK'   �
 
 ### Step 6 docker 组（免 sudo 执行 docker）
 ```
-每台设备: sudo -S usermod -aG docker <user>   （A 用 A 密码、B 用 B 密码）
-校验: id -nG <user> | grep -w docker
-提示（日志）: docker 组对当前登录会话不生效，重启/重新登录后免 sudo；部署流程内 docker 命令仍走 sudo -S 兜底
+每台设备先探事实（common/utils/docker_perm.rs PROBE_SCRIPT，本机 sh -c / B 走 SSH 同一脚本）:
+  docker CLI 是否存在 / daemon 是否可达 / socket 路径与「实际属组 + GID」
+  账号视角组（id -nG <user>）vs 会话视角组（id -nG）/ sudo -n 是否可用 / sg <属组> 能否免密取得组身份
+分类 → 结论（只有真需要才动系统）:
+  Ready            daemon 可访问            → 跳过
+  SudoFallback     免密 sudo 可用           → 跳过（应用走 sudo -n docker）
+  SessionStale     账号在组、会话未带上      → 仅当 sg 实测可取组身份（或免密 sudo 可用）才跳过；否则按需修复+复验
+  NotInGroup       账号不在 socket 属组      → 修复
+  SocketMismatch   会话在组内仍被拒（socket 属组/权限与账号所在组不一致，注销无效）→ 修复
+  CliMissing / DaemonDown                   → 明确报错（Step5 应先装好 / 先修 daemon）
+修复（root，A 用 A 密码、B 用 B 密码；**密码经 stdin 送入，不进命令行/进程 argv**）:
+  A: `sh -c "sudo -S -p '' sh -c '<fix_script>'"` + stdin=密码行（local_run_stdin）
+  B: `ssh_pw_run_stdin(..., "sudo -S -p '' sh -c '<fix_script>'", 密码行)`
+    → usermod -aG <socket 实际属组> <user>
+    → socket 属组按账号解析出的数值 GID 对齐 + chmod 660（覆盖同名组重复条目 / GID 不一致）
+    → setfacl 可用时补一条用户 rw ACL 兜底
+    → **不重启 docker**（重启会杀掉运行中的模型容器；socket 属组变更立即生效）
+复验: sg <属组> -c "docker info" → VERIFY_OK/VERIFY_FAIL
+提示: 仅「复验未通过（本会话确实不能免 sudo 用 docker）」时才置 LOGOUT_HINT 并弹注销窗；
+      复验通过一律提示「当前会话无需注销」（新登录会话/终端会自动带上该组）
 ```
-- 回滚：`sudo -S gpasswd -d <user> docker`。
-- 与现有 `fix_docker_permission`（settings.rs:382，pkexec 方案）不冲突：本流程为远端/无桌面场景的自动方案。
+- 回滚：不加组回滚（`usermod -aG` 幂等且权限收紧会破坏用户既有环境）；失败即报错并保留现状。
+- 「免注销」一律以复验结果为准（`VERIFY_OK` / `docker_perm::can_apply_without_logout()`）：`Ready` 或 `sg_ok || sudo_nopass` 为真；仅凭「账号已在组」不算数，复验未过则如实提示需注销重登。
+- 历史实现的两个坑（已修）：① 把「本来就在 docker 组」和「本次刚加入」当同一件事，权限早已可用也反复提示注销；② 只按写死的组名 `docker` 加组，遇到 socket 实际属组不同（重装/GID 不一致）时注销一万次也不生效。
+- 与设置页 `fix_docker_permission` 同源：都走 `docker_perm` 探测 + `platform::pkexec_fix_docker_permission`（差别只是提权方式：远端/无桌面用 `sudo -S`+stdin，本机桌面用 pkexec），修复后不再自动注销会话。
+- 其余步骤（Step1/3/4/5）仍沿用 `echo '<pass>' | sudo -S -p ''` 形态（Step5 依赖调用方代理环境，整段提权会丢掉 `-x <proxy>`），如需统一改 stdin 需逐个核对环境语义。
 
 ### 完成后（可选联动，待审核决策点 ②）
 部署成功 → 自动把多机互联节点表写回：rank0 = { ip: `192.168.177.11`, ssh_user: A 用户名, is_self: true }、rank1 = { ip: `192.168.177.12`, ssh_user: B 用户名, ssh_port: 表单端口 }，`multi_node_args.enabled = true`，保存并刷新节点表 → 用户可直接多机启动模型。**默认建议开启**（一键从零到可用）；如审核认为自动改配置不妥，可改为部署成功后在日志区提示「可前往上方节点表填入光口 IP」。

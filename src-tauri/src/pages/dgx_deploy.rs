@@ -17,8 +17,9 @@
 
 use crate::common::error::AppError;
 use crate::common::ssh::sh_quote;
-use crate::common::ssh_pw::{redact, ssh_pw_run};
+use crate::common::ssh_pw::{redact, ssh_pw_run, ssh_pw_run_stdin};
 use crate::common::types::NodeInfo;
+use crate::common::utils::docker_perm as dp;
 use std::time::Duration;
 use tauri::Emitter;
 
@@ -42,6 +43,8 @@ struct Ctx {
     /// 本部署是否真的应用过 netplan（false = 用户原有已配置/未应用，回滚时不动）
     applied_a: std::sync::atomic::AtomicBool,
     applied_b: std::sync::atomic::AtomicBool,
+    /// Step6：本次是否真的改了账号组（只有真改了才提示「注销重登」，否则不再打扰用户）
+    logout_hint: std::sync::atomic::AtomicBool,
 }
 
 impl Ctx {
@@ -58,13 +61,30 @@ impl Ctx {
 
 /// A 本机执行（非 sudo），返回 (status_success, stdout, stderr)
 async fn local_run(cmd: &str, timeout: Duration) -> Result<(bool, String, String), AppError> {
+    local_run_stdin(cmd, None, timeout).await
+}
+
+/// 同 `local_run`，但可把 `stdin_data` 写入子进程 stdin（如 `sudo -S` 的密码）——
+/// 密码因此不进命令行参数（否则本机 `ps` 能看到）。
+async fn local_run_stdin(
+    cmd: &str,
+    stdin_data: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<(bool, String, String), AppError> {
     let mut child = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(cmd)
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| AppError::msg(format!("本机执行失败（sh 不可用？）: {}", e)))?;
+    if let Some(data) = stdin_data {
+        if let Some(mut si) = child.stdin.take() {
+            // 写完即 drop（EOF），sudo -S 才不会被卡住
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut si, data).await;
+        }
+    }
     let out = tokio::time::timeout(timeout, async {
         let mut stdout = String::new();
         let mut stderr = String::new();
@@ -90,6 +110,35 @@ async fn local_run(cmd: &str, timeout: Duration) -> Result<(bool, String, String
 /// B 远端执行（密码 SSH）
 async fn remote_run(c: &Ctx, cmd: &str, timeout: Duration) -> Result<(bool, String, String), AppError> {
     ssh_pw_run(&c.b_addr, c.b_port, &c.b_user, &c.b_pass, cmd, timeout).await
+}
+
+/// **以 root 执行脚本（密码走 stdin，不进命令行/进程 argv）**：
+/// A 本机经 `sh -c "sudo -S -p '' sh -c <脚本>"` + stdin 写密码；
+/// B 远端经 SSH 通道 stdin 送密码（`ssh_pw_run_stdin`）。
+async fn run_sudo(
+    c: &Ctx,
+    is_a: bool,
+    script: &str,
+    timeout: Duration,
+) -> Result<(bool, String, String), AppError> {
+    let pass = if is_a { &c.a_pass } else { &c.b_pass };
+    let cmd = format!("sudo -S -p '' sh -c {}", sh_quote(script));
+    let mut stdin = pass.as_bytes().to_vec();
+    stdin.push(b'\n');
+    if is_a {
+        local_run_stdin(&cmd, Some(&stdin), timeout).await
+    } else {
+        ssh_pw_run_stdin(
+            &c.b_addr,
+            c.b_port,
+            &c.b_user,
+            &c.b_pass,
+            &cmd,
+            Some(&stdin),
+            timeout,
+        )
+        .await
+    }
 }
 
 /// 无反馈 sudo 包装：`echo '<pass>' | sudo -S -p '' <cmd>`（密码经 sh_quote 防注入）
@@ -151,6 +200,7 @@ pub async fn dgx_deploy_run(
         iface_b: String::new(),
         applied_a: std::sync::atomic::AtomicBool::new(false),
         applied_b: std::sync::atomic::AtomicBool::new(false),
+        logout_hint: std::sync::atomic::AtomicBool::new(false),
     };
 
     c.emit(0, "start", "DGX-Spark 双机直连一键部署开始");
@@ -163,8 +213,10 @@ pub async fn dgx_deploy_run(
     run_step!(&c, 5, "Docker 检测安装", step5_docker)?;
     run_step!(&c, 6, "Docker 组权限", step6_group)?;
     run_step!(&c, 7, "写回多机互联节点表", step7_writeback)?;
-    c.emit(0, "done", "全部完成");
-    Ok("DEPLOY_DONE".to_string())
+    // 只有本次真的改了账号组（且免注销验证未通过）才提示注销：权限已可用时不再反复要求注销
+    let logout_hint = c.logout_hint.load(std::sync::atomic::Ordering::Relaxed);
+    c.emit(0, "done", if logout_hint { "全部完成|LOGOUT_HINT" } else { "全部完成|READY" });
+    Ok(if logout_hint { "DEPLOY_DONE|LOGOUT_HINT" } else { "DEPLOY_DONE|READY" }.to_string())
 }
 
 fn validate_input(
@@ -776,54 +828,138 @@ async fn step5_docker(c: &Ctx) -> Result<(), AppError> {
 
 // ===== Step6 docker 组 =====
 
+/// 探测单台设备（A 本机 / B 远端）的 docker 权限事实（本机与远端复用同一探测脚本）
+async fn probe_perm(c: &Ctx, is_a: bool, who: &str) -> Result<dp::DockerPerm, AppError> {
+    let (ok, out, err) = if is_a {
+        local_run(dp::PROBE_SCRIPT, Duration::from_secs(40)).await?
+    } else {
+        remote_run(c, dp::PROBE_SCRIPT, Duration::from_secs(60)).await?
+    };
+    if !ok || !out.contains("PROBE_END") {
+        return Err(AppError::msg(format!(
+            "{} docker 权限探测失败: {}{}",
+            who,
+            out,
+            err
+        )));
+    }
+    Ok(dp::parse_probe(&out))
+}
+
+/// 设备上执行一条命令（A 本机 / B 远端）
+async fn run_on(c: &Ctx, is_a: bool, cmd: &str, timeout: Duration) -> Result<(bool, String, String), AppError> {
+    if is_a {
+        local_run(cmd, timeout).await
+    } else {
+        remote_run(c, cmd, timeout).await
+    }
+}
+
+/// Step6：按 **docker socket 实际属组** 对齐权限（幂等）。
+///
+/// 只有真的改了账号组、且「免注销机制不可用」时才置 `logout_hint`——
+/// 历史实现无条件提示注销，导致权限早已可用（或本来就正常）时每次部署都要求注销。
 async fn step6_group(c: &Ctx) -> Result<(), AppError> {
-    let user_a = c.a_user.clone();
-    let user_b = c.b_user.clone();
-    for (is_a, who, user) in [(true, "A", &user_a), (false, "B", &user_b)] {
-        let pass = if is_a { &c.a_pass } else { &c.b_pass };
-        // 先判断后执行：已在 docker 组则跳过（usermod 幂等，但无需重复执行）
-        let in_group = format!(
-            "id -nG {u} | grep -qw docker && echo IN_GROUP || echo NOT_IN_GROUP",
-            u = sh_quote(user)
-        );
-        let (ok, out, _) = if is_a {
-            local_run(&in_group, Duration::from_secs(20)).await?
-        } else {
-            remote_run(c, &in_group, Duration::from_secs(20)).await?
-        };
-        if ok && out.contains("IN_GROUP") {
-            c.emit(6, "run", &format!("{}：{} 已在 docker 组，跳过", who, user));
-            continue;
+    let mut logout_hint = false;
+    for (is_a, who, user) in [
+        (true, "A", c.a_user.clone()),
+        (false, "B", c.b_user.clone()),
+    ] {
+        let p = probe_perm(c, is_a, &who).await?;
+        let state = dp::classify(&p);
+        c.emit(6, "run", &format!("{}：{}", who, dp::describe(&p, state)));
+
+        match state {
+            // 已就绪 / 免密 sudo 兜底 → 无需任何改动
+            dp::DockerPermState::Ready | dp::DockerPermState::SudoFallback => continue,
+            // 会话未带组身份：仅当 sg 取组身份 / 免密 sudo 真可用时才算「无需注销」
+            dp::DockerPermState::SessionStale if p.sg_ok || p.sudo_nopass => continue,
+            dp::DockerPermState::CliMissing => {
+                return Err(AppError::msg(format!(
+                    "{} 未检测到 docker（Step5 应先完成安装）",
+                    who
+                )));
+            }
+            dp::DockerPermState::DaemonDown => {
+                return Err(AppError::msg(format!(
+                    "{} docker daemon 未运行（权限修复无意义），请先修复 daemon 后重试",
+                    who
+                )));
+            }
+            // SessionStale（sg/sudo 都不可用）/ NotInGroup / SocketMismatch / Unknown
+            // → 走修复 + 复验
+            _ => {}
         }
-        c.emit(6, "run", &format!("{}：将 {} 加入 docker 组", who, user));
-        let cmd = format!(
-            "echo '{p}' | sudo -S -p '' usermod -aG docker {u} && \
-             (id -nG {u} | grep -qw docker && echo GROUP_OK || echo GROUP_FAIL)",
-            p = sh_quote(pass),
-            u = sh_quote(user)
+
+        let already_in_group = p.account_in_group();
+        c.emit(
+            6,
+            "run",
+            &format!(
+                "{}：按 socket 属组（{}）对齐 {} 的 docker 权限（usermod + socket 属组/权限，不重启 docker）",
+                who,
+                p.effective_group(),
+                user
+            ),
         );
-        let (ok, out, err) = if is_a {
-            local_run(&cmd, Duration::from_secs(30)).await?
-        } else {
-            remote_run(c, &cmd, Duration::from_secs(30)).await?
-        };
+        let script = dp::fix_script(&user, &p);
+        // 密码经 stdin 送入（不进命令行/进程 argv）
+        let (ok, out, err) = run_sudo(c, is_a, &script, Duration::from_secs(60)).await?;
         if !ok || !out.contains("GROUP_OK") {
-            c.emit(6, "rollback", &format!("{} 加入 docker 组失败，移除该成员", who));
-            let undo = format!(
-                "echo '{}' | sudo -S -p '' gpasswd -d {} docker || true",
-                sh_quote(pass),
-                sh_quote(user)
+            let detail = if err.trim().is_empty() { out.clone() } else { err.clone() };
+            return Err(AppError::msg(format!("{} docker 权限修复失败: {}", who, detail)));
+        }
+        // A 为本机：权限变了要作废 docker 调用方式缓存，否则仍按修复前的旧路径调用
+        if is_a {
+            crate::common::utils::platform::invalidate_docker_mode();
+        }
+
+        // 复验：以 socket 属组身份跑一次 `docker info`（成功 = 无需注销即可用）
+        let (vok, vout, _) = run_on(c, is_a, &dp::verify_script(&p), Duration::from_secs(40)).await?;
+        if vok && vout.contains("VERIFY_OK") {
+            c.emit(
+                6,
+                "run",
+                &format!("{}：权限已对齐并验证可免 sudo 使用 —— 当前会话无需注销", who),
             );
-            let _ = if is_a {
-                local_run(&undo, Duration::from_secs(30)).await
-            } else {
-                remote_run(c, &undo, Duration::from_secs(30)).await
-            };
-            c.emit(6, "rollback_done", "");
-            return Err(AppError::msg(format!("{} 加入 docker 组失败: {}", who, err)));
+            if !already_in_group {
+                c.emit(
+                    6,
+                    "run",
+                    &format!(
+                        "{}：本次新增了 {} 组成员关系（之后的登录会话/终端会自动带上该组）",
+                        who,
+                        p.effective_group()
+                    ),
+                );
+            }
+        } else {
+            c.emit(
+                6,
+                "run",
+                &format!(
+                    "{}：已按 socket 属组（{}）对齐，但本会话免 sudo 验证未通过（需注销重登后生效；如仍失败请检查 {} 的属组/权限）",
+                    who,
+                    p.effective_group(),
+                    p.socket_path()
+                ),
+            );
+            // 只有复验未通过才提示注销：权限已可用时不再打扰用户
+            logout_hint = true;
         }
     }
-    c.emit(6, "run", "docker 组已生效（当前登录会话需重启/重新登录后才免 sudo；部署流程内 sudo 兜底不受影响）");
+
+    if logout_hint {
+        c.emit(
+            6,
+            "run",
+            "提示：本会话尚不能免 sudo 使用 docker，需注销重新登录后重启 ADM-BE 生效。",
+        );
+    } else {
+        c.emit(6, "run", "docker 权限已就绪（当前会话即可免 sudo，无需注销）");
+    }
+    c.logout_hint
+        .store(logout_hint, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 

@@ -401,8 +401,15 @@ pub async fn get_local_username() -> Result<String, AppError> {
     Err(AppError::msg("无法获取当前用户名，请在设置中手动填写".to_string()))
 }
 
-/// 将当前用户加入 docker 组（Linux 权限修复）。
-/// 优先用 pkexec 弹出系统原生 GUI 密码框；pkexec 不可用时回退到终端命令提示。
+/// 修复本机 docker 权限（Linux）：按 **socket 实际属组** 对齐（`usermod -aG <socket 属组>` +
+/// socket 属组/权限固化），经 pkexec 弹系统原生密码框执行；不重启 docker（避免杀掉运行中容器）。
+///
+/// 返回：
+/// - `PERMISSION_FIXED`：修复后本会话即可用（应用经 `sg` 取得组身份），**无需注销**
+/// - `PERMISSION_FIXED_LOGOUT_HINT`：修复成功但建议注销重登（仅为在终端里也免 sudo）
+///
+/// 历史行为是修复后自动注销当前桌面会话——那会让应用被会话结束一并杀掉，且用户重新登录后
+/// 再开应用又被提示注销（权限其实早已可用）。这里不再自动注销。
 #[tauri::command]
 pub async fn fix_docker_permission() -> Result<String, AppError> {
     #[cfg(target_os = "windows")]
@@ -412,40 +419,48 @@ pub async fn fix_docker_permission() -> Result<String, AppError> {
 
     #[cfg(not(target_os = "windows"))]
     {
-        let user = std::env::var("USER")
-            .or_else(|_| std::env::var("LOGNAME"))
-            .map_err(|_| AppError::msg("无法获取当前用户名".to_string()))?;
+        use crate::common::utils::docker_perm as dp;
+        use crate::common::utils::platform::{self, PkexecFix};
 
-        // 方案 1：pkexec 弹出 GUI 密码框（GNOME/KDE 桌面默认有 polkit 认证代理）
-        let pkexec_result = tokio::process::Command::new("pkexec")
-            .args(["usermod", "-aG", "docker", &user])
-            .output()
-            .await;
-
-        match pkexec_result {
-            Ok(output) if output.status.success() => {
-                // 权限修复成功，自动注销当前桌面会话（让 docker 组生效）
-                // GNOME: gnome-session-quit --logout --no-prompt
-                // KDE: qdbus org.kde.ksmserver /KSMServer logout 0 0 0
-                // 兜底: loginctl terminate-user $(id -u)（dash 无 $UID，必须用 id -u）
-                let _ = tokio::process::Command::new("sh")
-                    .args(["-c", "gnome-session-quit --logout --no-prompt 2>/dev/null || qdbus org.kde.ksmserver /KSMServer logout 0 0 0 2>/dev/null || loginctl terminate-user $(id -u) 2>/dev/null"])
-                    .spawn();
-                return Ok("PERMISSION_FIXED".to_string());
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                if stderr.contains("Not authorized") || stderr.contains("Request dismissed") || stderr.contains("cancelled") {
-                    return Err(AppError::msg("PKEXEC_CANCELLED".to_string()));
-                }
-            }
-            Err(_) => {}
+        let (p, _state) = platform::probe_local_docker_perm()
+            .await
+            .ok_or_else(|| AppError::msg("docker 权限探测失败（sh/stat 不可用）".to_string()))?;
+        let user = if p.user.trim().is_empty() {
+            std::env::var("USER")
+                .or_else(|_| std::env::var("LOGNAME"))
+                .unwrap_or_default()
+        } else {
+            p.user.clone()
+        };
+        if !dp::valid_user(&user) {
+            return Err(AppError::msg("无法获取当前用户名".to_string()));
         }
+        let grp = p.effective_group();
+        let sock = p.socket_path();
 
-        Err(AppError::msg(format!(
-            "FALLBACK_TERMINAL|{}|请在终端执行以下命令，然后重新登录（注销再登录）后重启 ADM-BE：\n  sudo usermod -aG docker {}\n  sudo systemctl restart docker",
-            user, user
-        )))
+        match platform::pkexec_fix_docker_permission(&user, &p).await {
+            PkexecFix::Ok => {
+                // 复核：只有复探确认「本会话即可用」才算修复成功（否则不能对用户宣称已修复）
+                let need_logout = match platform::probe_local_docker_perm().await {
+                    Some((p2, s2)) => !dp::can_apply_without_logout(&p2, s2),
+                    None => true,
+                };
+                Ok(if need_logout {
+                    "PERMISSION_FIXED_LOGOUT_HINT".to_string()
+                } else {
+                    "PERMISSION_FIXED".to_string()
+                })
+            }
+            PkexecFix::Cancelled => Err(AppError::msg("PKEXEC_CANCELLED".to_string())),
+            PkexecFix::Unavailable => Err(AppError::msg(format!(
+                "FALLBACK_TERMINAL|{}|请在终端执行以下命令（ADM-BE 重启后即免 sudo 执行 docker；终端内如需立刻生效可先执行 `newgrp {grp}`）：\n  sudo usermod -aG {grp} {user}\n  sudo chgrp {grp} {sock}\n  sudo chmod 660 {sock}",
+                user,
+                grp = grp,
+                user = user,
+                sock = sock
+            ))),
+            PkexecFix::Failed(e) => Err(AppError::msg(format!("修复失败：{}", e))),
+        }
     }
 }
 
@@ -535,13 +550,40 @@ pub async fn multi_node_probe(
         });
     }
     if docker == "DOCKER_ERR" {
+        // 精确诊断远端 docker 权限：区分「未安装 / daemon 未运行 / 账号不在 socket 属组 /
+        // socket 属组与账号所在组不一致」，并给出可直接在远端执行的修复命令
+        use crate::common::utils::docker_perm as dp;
+        let mut error = "远端 Docker daemon 不可用或未安装".to_string();
+        let (pok, pout, _) = crate::common::ssh::ssh_run(
+            &ip,
+            &user,
+            if port == 0 { 22 } else { port },
+            key.as_deref(),
+            dp::PROBE_SCRIPT,
+            std::time::Duration::from_secs(20),
+        )
+        .await
+        .unwrap_or((false, String::new(), String::new()));
+        if pok && pout.contains("PROBE_END") {
+            let p = dp::parse_probe(&pout);
+            let st = dp::classify(&p);
+            error = format!("远端 docker 不可用：{}", dp::describe(&p, st));
+            if dp::needs_fix(st) {
+                error.push_str(&format!(
+                    "\n请在远端执行：sudo usermod -aG {grp} {user} && sudo chgrp {grp} {sock} && sudo chmod 660 {sock}（无需注销，远端新会话即生效）",
+                    grp = p.effective_group(),
+                    user = user.trim(),
+                    sock = p.socket_path()
+                ));
+            }
+        }
         return Ok(ProbeResult {
             ok: false,
             gpu,
             docker: String::new(),
             image_ok,
             model_exists,
-            error: "远端 Docker daemon 不可用或未安装".to_string(),
+            error,
         });
     }
     // 检查顺序：SSH → Docker daemon → 镜像 → 模型，任一失败即返回 ok=false
