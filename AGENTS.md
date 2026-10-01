@@ -4,7 +4,7 @@
 - `pnpm tauri dev` — 热重载开发模式
 - `pnpm tauri build` — 生产构建
 - `pnpm tauri clean` — 清理构建产物
-- `pnpm tauri:build:windows` / `:macos` / `:linux` — 跨平台构建
+- `pnpm tauri:build:windows` / `pnpm tauri:build:linux` — 指定平台构建（无 macOS 脚本）
 - `pnpm typecheck` — 前端类型检查（tsc --noEmit，只检查不产出，改完前端必跑）
 
 > 注意：`pnpm typecheck` 依赖 typescript 平台二进制包；若报 "Executable not found"（pnpm 软链断裂），需重建 `node_modules/.pnpm/typescript@<ver>/node_modules/@typescript/typescript-win32-x64` 的 junction 指向 `.pnpm/@typescript+typescript-win32-x64@<ver>` 目录。
@@ -63,12 +63,15 @@
   模型/容器输出必须走它（不要只 `emit`），ComfyUI 启动/停止/拉镜链路已全部改用它。
 
 ## 构建与发布
-- CI：`.github/workflows/build.yml` — 标签触发（`v*`），矩阵构建 3 个平台：
-  - Windows x64（`x64-setup.exe` / NSIS）
-  - Ubuntu x64 与 arm64（各 `.deb`；arm64 用 `ubuntu-24.04-arm` 原生 runner）
-  - Linux 步骤先安装 Tauri 2 系统依赖（webkit2gtk-4.1、ayatana-appindicator3、librsvg2 等）；Windows 自签名，Linux 无签名步骤。
-  - deb 打包必需 `bundle.category` / `shortDescription` 字段（已配于 `tauri.conf.json`）。
-- 发布：`pnpm tauri:build:<平台>` 然后 `pnpm sign:<平台>`。
+- CI：`.github/workflows/build.yml` — 标签触发（`v*`，也可手动 `workflow_dispatch`），同 ref 并发去重（新推送取消旧任务）。**只构建 Linux，矩阵 2 个架构，均产出 `.deb`**：
+  - Ubuntu x64（runner `ubuntu-24.04`，target `x86_64-unknown-linux-gnu`）
+  - Ubuntu arm64（runner `ubuntu-24.04-arm` 原生，target `aarch64-unknown-linux-gnu`）
+  - 任务步骤：checkout（`fetch-depth: 0`）→ rust stable + 矩阵 target → `swatinem/rust-cache`（`src-tauri -> target`）→ pnpm + Node 22 → `pnpm install` → apt 装 Tauri 2 系统依赖（webkit2gtk-4.1-dev、build-essential、curl/wget/file、libxdo-dev、libssl-dev、libayatana-appindicator3-dev、librsvg2-dev、patchelf、libfuse2）→ `tauri-apps/tauri-action@v0` 构建并发布。
+  - 发布走 tauri-action：tag 取 `v__VERSION__`（版本来自 `tauri.conf.json`，非 `package.json`）、release 名 `ADM-BE v__VERSION__`、非草稿非预发布，`--bundles deb` 产物自动挂到该 tag 的 Release。
+  - 无签名步骤。deb 打包必需 `bundle.category` / `shortDescription` 字段（已配于 `tauri.conf.json`）。
+  - **Windows / macOS 不进 CI**：Windows 包仅本地出（`pnpm tauri:build:windows` = NSIS，可选 `pnpm sign:windows`），macOS 无构建脚本。
+- 本地构建：`pnpm tauri:build`（当前平台）、`pnpm tauri:build:windows`、`pnpm tauri:build:linux`。
+- 发布版本号以 `src-tauri/tauri.conf.json` 的 `version` 为准（`package.json` 的 `version` 不参与）。
 - 图标：`python scripts/generate-icons.py` 从 `src-tauri/icons/source.png` 生成。
 
 ## 注意事项
