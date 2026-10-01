@@ -8,9 +8,8 @@
             "dgx-spark-128G"
         ],
         "engine": "vllm",
-        "vllm_image": "eugr/spark-vllm-b12x:nightly-20260908",
+        "vllm_image": "crpi-2210nfcb9oezh8zh.cn-shenzhen.personal.cr.aliyuncs.com/adm1/spark-vllm:20260908",
         "vllm_flags": [
-            "--max-model-len 262144",
             "--trust-remote-code",
             "--kv-cache-dtype fp8",
             "--block-size 256",
@@ -67,9 +66,8 @@
             "dgx-spark-128G"
         ],
         "engine": "vllm",
-        "vllm_image": "eugr/spark-vllm-b12x:nightly-20260908",
+        "vllm_image": "crpi-2210nfcb9oezh8zh.cn-shenzhen.personal.cr.aliyuncs.com/adm1/spark-vllm:20260908",
         "vllm_flags": [
-            "--max-model-len 262144",
             "--trust-remote-code",
             "--kv-cache-dtype fp8",
             "--block-size 256",
@@ -88,8 +86,6 @@
             "--max-cudagraph-capture-size 48",
             "--speculative-config {\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_sample_method\":\"probabilistic\",\"attention_backend\":\"B12X\"}",
             "--hf-overrides {\"dspark_noise_token_id\":128799}",
-            "--default-chat-template-kwargs.thinking true",
-            "--default-chat-template-kwargs.reasoning_effort high",
             "--reasoning-config {\"reasoning_parser\":\"deepseek_v4\",\"reasoning_start_str\":\"\",\"reasoning_end_str\":\"\"}",
             "--compilation-config {\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"custom_ops\":[\"all\"]}"
         ],
@@ -126,7 +122,7 @@
             "dgx-spark-128G"
         ],
         "engine": "vllm",
-        "vllm_image": "crpi-2210nfcb9oezh8zh.cn-shenzhen.personal.cr.aliyuncs.com/adm1/glm5.3-flash:20260918",
+        "vllm_image": "crpi-2210nfcb9oezh8zh.cn-shenzhen.personal.cr.aliyuncs.com/adm1/glm5.3-flash:20260919",
         "vllm_flags": [
             "--served-model-name GLM-5.3-Flash-EXL3",
             "--tool-call-parser glm47",
@@ -135,7 +131,7 @@
             "--enable-prefix-caching",
             "--no-enable-flashinfer-autotune",
             "--quantization exl3",
-            "--max-model-len 850000",
+            "--max-model-len 600000",
             "--gpu-memory-utilization 0.85",
             "--max-num-seqs 4",
             "--max-num-batched-tokens 7168",
@@ -203,7 +199,7 @@
             "dgx-spark-128G"
         ],
         "engine": "vllm",
-        "vllm_image": "vllm-qwen38-fn-ple:20260828",
+        "vllm_image": "crpi-2210nfcb9oezh8zh.cn-shenzhen.personal.cr.aliyuncs.com/adm1/qwen3.8-flash-dgx:20260915",
         "vllm_flags": [
             "--enable-prefix-caching",
             "--max-model-len 600000",
@@ -213,7 +209,7 @@
             "--safetensors-load-strategy lazy",
             "--max-num-seqs 8",
             "--max-num-batched-tokens 8192",
-            "--gpu-memory-utilization 0.86",
+            "--gpu-memory-utilization 0.85",
             "--enable-chunked-prefill",
             "--speculative-config {\"method\":\"mtp\",\"num_speculative_tokens\":3}",
             "--compilation-config {\"mode\":0,\"cudagraph_mode\":\"FULL_DECODE_ONLY\"}",
@@ -244,7 +240,7 @@
             "dgx-spark-128G"
         ],
         "engine": "vllm",
-        "vllm_image": "vllm-qwen38-fn-ple:20260828",
+        "vllm_image": "crpi-2210nfcb9oezh8zh.cn-shenzhen.personal.cr.aliyuncs.com/adm1/qwen3.8-flash-dgx:20260915",
         "vllm_flags": [
             "--enable-prefix-caching",
             "--max-model-len 600000",
@@ -285,7 +281,7 @@
             "dgx-spark-128G"
         ],
         "engine": "sglang",
-        "engine_image": "lmsysorg/sglang:dev-Ling-3.0-flash-VL",
+        "engine_image": "crpi-2210nfcb9oezh8zh.cn-shenzhen.personal.cr.aliyuncs.com/adm1/ling3.0-flash-vl:20260916",
         "vllm_flags": [
             "--tp 2",
             "--context-length 262144",
