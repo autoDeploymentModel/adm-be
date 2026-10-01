@@ -5208,6 +5208,13 @@ async fn start_model_inner(
     engine_ready_probe: Option<bool>,
     engine_ready_path: Option<String>,
 ) -> Result<(), AppError> {
+    // 防重复触发（重复点击 / 并发调用）：两次启动会把同一台机器上的 head 拉起两次，
+    // 两个实例抢分布式 master 端口 → EADDRINUSE 直接崩。此标志在启动流程开始就置位，
+    // 由 StartGuard 在函数任意返回路径（含提前 bail）上解除。
+    if !state.try_begin_start() {
+        bail!("模型正在启动中，请勿重复点击启动（若长时间无响应，请先停止再重试）");
+    }
+    let _start_guard = crate::app_state::StartGuard { state: state.inner() };
     {
         let pid_lock = state.running_process.lock().map_err(|e| e.to_string())?;
         if pid_lock.is_some() {

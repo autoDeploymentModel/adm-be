@@ -278,6 +278,8 @@ let stopping = false;
 let pullingImage = false;
 /** 权重下载速度（bytes/s，来自 download-progress 事件，仅用于本页展示） */
 let downloadSpeed = 0;
+/** 启动（start_model）请求进行中：挡住重复点击（重复启动会在同机拉起两个 head，抢 master 端口） */
+let startBusy = false;
 /** @type {number | null} */
 let toastTimer = null;
 
@@ -580,6 +582,11 @@ async function refreshModelList() {
 }
 
 async function handleStart() {
+  // 防重复点击：启动请求进行中忽略后续点击（后端 start_model 也会拒绝并发启动）
+  if (startBusy) {
+    console.log("[video] ComfyUI 启动进行中，忽略重复点击");
+    return;
+  }
   const e = entry();
   if (!e) { notify(_t("未配置 ComfyUI 条目（检查远程 model.json）")); return; }
   const st = S();
@@ -587,6 +594,7 @@ async function handleStart() {
     notify(_t("请先停止当前模型再启动 ComfyUI"));
     return;
   }
+  startBusy = true;
   const port = getPort();
   st.startingModelId = e.model_id;
   render();
@@ -609,6 +617,8 @@ async function handleStart() {
   } catch (err) {
     S().startingModelId = null;
     notify(_t("启动失败: ") + err);
+  } finally {
+    startBusy = false;
   }
   render();
 }
@@ -650,7 +660,7 @@ export default {
   mount(root) {
     root.innerHTML = template;
     mounted = true;
-
+    startBusy = false;
     el("video-start").addEventListener("click", function () { void handleStart(); });
     el("video-stop").addEventListener("click", function () { void handleStop(); });
     el("video-restart").addEventListener("click", function () { void handleRestart(); });

@@ -535,7 +535,7 @@ const template = `
           <div class="param-group-title">${_t("互联参数")}</div>
           <div class="param-row">
             <div class="param-label">${_t("master 端口")}<div class="param-key">--master-port</div></div>
-            <div class="param-input"><input type="number" id="multi_dist_port" value="6379" min="1" max="65535" style="max-width:160px;"><div class="param-desc">${_t("分布式 master 端口（所有节点通过节点 0 的该端口握手，fork `launch-cluster.sh` 的 MASTER_PORT），不得与模型服务端口冲突")}</div></div>
+            <div class="param-input"><input type="number" id="multi_dist_port" value="9090" min="1" max="65535" style="max-width:160px;"><div class="param-desc">${_t("分布式 master 端口（所有节点通过节点 0 的该端口握手，fork `launch-cluster.sh` 的 MASTER_PORT），不得与模型服务端口冲突")}</div></div>
           </div>
           <div class="param-row" style="align-items:flex-start;">
             <div class="param-label">${_t("额外环境变量")}<div class="param-key">extra_env</div></div>
@@ -939,7 +939,7 @@ function getMultiNodeArgsFromForm() {
     nodes: mnNodes.slice(0, 2).map(function (x) {
       return { ip: x.ip.trim(), ssh_user: x.sshUser.trim(), ssh_port: x.sshPort || 22, is_self: !!x.isSelf, model_dir: x.modelDir.trim() };
     }),
-    dist_init_port: n("multi_dist_port", 6379),
+    dist_init_port: n("multi_dist_port", 9090),
     iface: "",
     ssh_key_path: "",
     extra_env: s("multi_extra_env"),
@@ -1127,7 +1127,7 @@ async function fillMultiNodeArgsForm(m) {
   const set = function (id, val) { const el = document.getElementById(id); if (el) el.value = val; };
   const setB = function (id, val) { const el = document.getElementById(id); if (el) el.checked = !!val; };
   setB("multi_enabled", v.enabled);
-  set("multi_dist_port", v.dist_init_port || 6379);
+  set("multi_dist_port", v.dist_init_port || 9090);
   set("multi_extra_env", v.extra_env || "");
   renderMultiNodeTable();
 }

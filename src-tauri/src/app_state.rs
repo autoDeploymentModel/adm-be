@@ -25,6 +25,20 @@ pub struct AppState {
     /// 全局标识：是否有模型成功启动
     pub model_running: Mutex<bool>,
     pub model_generation: Mutex<u64>,
+    /// 启动进行中标志：挡住重复点击 / 并发触发的 start_model
+    /// （两次启动会把同一台机器上的 head 拉起两次，两个实例抢 master 端口直接崩）
+    pub start_in_progress: Mutex<bool>,
+}
+
+/// 「启动进行中」守卫：start_model 无论正常返回还是中途 bail，Drop 时都会解除标志。
+pub struct StartGuard<'a> {
+    pub state: &'a AppState,
+}
+
+impl Drop for StartGuard<'_> {
+    fn drop(&mut self) {
+        self.state.end_start();
+    }
 }
 
 impl AppState {
@@ -43,7 +57,23 @@ impl AppState {
             config_write_lock: std::sync::Mutex::new(()),
             model_running: Mutex::new(false),
             model_generation: Mutex::new(0),
+            start_in_progress: Mutex::new(false),
         }
+    }
+
+    /// 尝试进入「启动中」状态：已在启动中返回 false（调用方应拒绝本次启动）
+    pub fn try_begin_start(&self) -> bool {
+        let mut g = self.start_in_progress.lock().unwrap_or_else(|e| e.into_inner());
+        if *g {
+            return false;
+        }
+        *g = true;
+        true
+    }
+
+    /// 退出「启动中」状态（启动流程结束 / 失败时调用，正常由 StartGuard Drop 触发）
+    pub fn end_start(&self) {
+        *self.start_in_progress.lock().unwrap_or_else(|e| e.into_inner()) = false;
     }
 
     #[allow(dead_code)]

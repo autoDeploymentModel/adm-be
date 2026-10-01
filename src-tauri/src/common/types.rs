@@ -131,7 +131,9 @@ pub struct Settings {
 }
 
 /// 多机互联配置（DGX Spark 集群）
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+/// 注意：手动实现 Default（不用 derive）——derive 生成的 Default 会把 dist_init_port
+/// 置 0，导致 config.json 缺字段 / dgx 直连写回默认值时校验报「master 端口不能为 0」。
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MultiNodeArgs {
     /// 总开关：false = 走现有单机代码路径
     #[serde(default)]
@@ -139,8 +141,11 @@ pub struct MultiNodeArgs {
     /// 节点清单（按下标即 rank；[0] 必须是本机 is_self=true）
     #[serde(default)]
     pub nodes: Vec<NodeInfo>,
-    /// Ray 分布式引导端口（默认 6379，与 Ray 官方一致，不得与服务端口冲突）
-    #[serde(default = "default_dist_init_port")]
+    /// 分布式 master 端口（所有节点通过节点 0 的该端口握手，对齐 fork `launch-cluster.sh`
+    /// 的 MASTER_PORT；默认 9090，不得与服务端口/常用端口（如 Redis 6379）冲突）。
+    /// 反序列化时显式 0 视为「未设置」→ 回落默认值（旧配置 / 历史 derive Default 遗留），
+    /// 使该不变式只在类型边界维护一次，读取方无需各自兜底。
+    #[serde(default = "default_dist_init_port", deserialize_with = "de_dist_init_port")]
     pub dist_init_port: u16,
     /// 互连网卡（NCCL_SOCKET_IFNAME / GLOO_SOCKET_IFNAME，空 = 自动）
     #[serde(default)]
@@ -153,7 +158,7 @@ pub struct MultiNodeArgs {
     pub extra_env: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NodeInfo {
     pub ip: String,
     pub ssh_user: String,
@@ -169,7 +174,43 @@ pub struct NodeInfo {
 }
 
 fn default_dist_init_port() -> u16 {
-    6379
+    9090
+}
+
+/// `dist_init_port` 反序列化：0 视为「未设置」→ 默认值（字段缺失走 `default_dist_init_port`）
+fn de_dist_init_port<'de, D>(d: D) -> Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match u16::deserialize(d)? {
+        0 => default_dist_init_port(),
+        v => v,
+    })
+}
+
+impl Default for MultiNodeArgs {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            nodes: Vec::new(),
+            dist_init_port: default_dist_init_port(),
+            iface: String::new(),
+            ssh_key_path: String::new(),
+            extra_env: String::new(),
+        }
+    }
+}
+
+impl Default for NodeInfo {
+    fn default() -> Self {
+        Self {
+            ip: String::new(),
+            ssh_user: String::new(),
+            ssh_port: default_ssh_port(),
+            is_self: false,
+            model_dir: String::new(),
+        }
+    }
 }
 fn default_ssh_port() -> u16 {
     22
@@ -278,4 +319,24 @@ pub struct LocalModel {
     pub model_id: String,
     pub files: Vec<String>,
     pub has_done: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 多机 master 端口：字段缺失 / 显式 0 都回落默认值，显式非 0 值原样保留
+    #[test]
+    fn multi_node_dist_init_port_normalized() {
+        let missing: MultiNodeArgs = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing.dist_init_port, 9090);
+
+        let zero: MultiNodeArgs = serde_json::from_str(r#"{"dist_init_port":0}"#).unwrap();
+        assert_eq!(zero.dist_init_port, 9090);
+
+        let custom: MultiNodeArgs = serde_json::from_str(r#"{"dist_init_port":12345}"#).unwrap();
+        assert_eq!(custom.dist_init_port, 12345);
+
+        assert_eq!(MultiNodeArgs::default().dist_init_port, 9090);
+    }
 }

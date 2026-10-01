@@ -595,6 +595,8 @@ async function populateDeviceFilter() {
 
 function renderModelTable() {
   const grid = document.getElementById("model-grid");
+  // 视图未挂载（切页中 / 已卸载）时静默跳过：否则 TypeError 会盖住真实的启动/操作错误
+  if (!grid) return;
   const filteredList = getFilteredModelList();
   const st = S();
 
@@ -878,7 +880,15 @@ function showDockerPermissionDialog() {
   });
 }
 
+// 启动请求进行中标志：挡住重复点击（重复启动会在同一台机器上拉起两个 head，
+// 两个实例抢分布式 master 端口 → EADDRINUSE 直接崩）
+let startBusy = false;
+
 async function handleStart(btn) {
+  if (startBusy) {
+    console.log("[model_list] 启动进行中，忽略重复点击");
+    return;
+  }
   const modelId = btn.dataset.startBtn;
   console.log("[model_list] 启动模型:", modelId);
   // 互斥守卫：ComfyUI 服务（hidden_in_list 条目）运行中时，禁止直接启动模型
@@ -888,6 +898,12 @@ async function handleStart(btn) {
   if (comfyEntry && S().runningModelId === comfyEntry.model_id) {
     showToast(_t("ComfyUI 正在运行，请先在「视频生成」页停止后再启动该模型"));
     return;
+  }
+  // 置位必须在所有早退分支之后：早退在 try/finally 之外，先置位会让本页启动永久卡死
+  startBusy = true;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = _t("启动中...");
   }
   try {
     const settings = await invoke()("load_settings");
@@ -943,6 +959,8 @@ async function handleStart(btn) {
       showToast(_t("启动失败: ") + e);
     }
     renderModelTable();
+  } finally {
+    startBusy = false;
   }
 }
 
@@ -1158,6 +1176,7 @@ export default {
     root.innerHTML = template;
   if (!S().currentDeviceFilter) S().currentDeviceFilter = "all";
   S().startingModelId = S().startingModelId || null;
+  startBusy = false;
 
     // 禁用页面右键（屏蔽浏览器默认菜单，删除弹窗在根容器内一并覆盖）
     var listRoot = document.getElementById("model-list-root");
